@@ -1,0 +1,26 @@
+external/
+references/
+
+# Build output
+out/
+*.test
+
+# Coverage
+/coverage.*
+
+# Dependencies
+vendor/
+
+# IDE
+.vscode/
+
+# Python virtual environments
+venv/
+.venv/
+
+# Debug/diagnostic tools (not part of the main project)
+cmd/bitstreamdump/
+cmd/cabactrace/
+cmd/findcoeff/
+cmd/qptest/
+cmd/spsdump/
