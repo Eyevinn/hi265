@@ -10,6 +10,9 @@ type Frame struct {
 	Cr      []uint8
 	StrideY int // bytes per row for luma
 	StrideC int // bytes per row for chroma
+	// LumaDecoded tracks which luma pixels have been reconstructed,
+	// enabling within-CTU neighbor availability for intra prediction.
+	LumaDecoded []bool
 }
 
 // NewFrame creates a new frame buffer for the given dimensions.
@@ -23,13 +26,14 @@ func NewFrame(width, height int) *Frame {
 	chromaHeight := codedHeight / 2
 
 	return &Frame{
-		Width:   width,
-		Height:  height,
-		Y:       make([]uint8, codedWidth*codedHeight),
-		Cb:      make([]uint8, chromaWidth*chromaHeight),
-		Cr:      make([]uint8, chromaWidth*chromaHeight),
-		StrideY: codedWidth,
-		StrideC: chromaWidth,
+		Width:       width,
+		Height:      height,
+		Y:           make([]uint8, codedWidth*codedHeight),
+		Cb:          make([]uint8, chromaWidth*chromaHeight),
+		Cr:          make([]uint8, chromaWidth*chromaHeight),
+		StrideY:     codedWidth,
+		StrideC:     chromaWidth,
+		LumaDecoded: make([]bool, codedWidth*codedHeight),
 	}
 }
 
@@ -41,6 +45,11 @@ func (f *Frame) SetLumaPixel(x, y int, val uint8) {
 // GetLumaPixel gets a single luma pixel.
 func (f *Frame) GetLumaPixel(x, y int) uint8 {
 	return f.Y[y*f.StrideY+x]
+}
+
+// IsLumaDecoded returns whether the luma pixel at (x, y) has been reconstructed.
+func (f *Frame) IsLumaDecoded(x, y int) bool {
+	return f.LumaDecoded[y*f.StrideY+x]
 }
 
 // SetChromaPixel sets a single chroma pixel on the given component (0=Cb, 1=Cr).
@@ -70,7 +79,9 @@ func (f *Frame) SetLumaBlock(x0, y0, size int, block []int32) {
 			} else if val > 255 {
 				val = 255
 			}
-			f.Y[(y0+y)*f.StrideY+x0+x] = uint8(val)
+			idx := (y0+y)*f.StrideY + x0 + x
+			f.Y[idx] = uint8(val)
+			f.LumaDecoded[idx] = true
 		}
 	}
 }

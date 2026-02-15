@@ -2,46 +2,64 @@
 package pred
 
 // PredictDC performs DC intra prediction for a block of the given size.
-// When no neighboring samples are available (first CTU), the prediction
-// value is 1 << (bitDepth - 1) = 128 for 8-bit.
+// After reference sample substitution, all neighbors are valid.
+// Always sums both left and top (substituted) reference samples.
+// Applies edge filtering for luma (cIdx=0) when size < 32.
 // Returns prediction samples as a flat slice [size*size].
-func PredictDC(size int, neighbors *Neighbors, bitDepth int) []int32 {
+func PredictDC(size int, neighbors *Neighbors, bitDepth int, isLuma bool) []int32 {
 	pred := make([]int32, size*size)
-	var dcVal int32
 
-	if neighbors == nil || (!neighbors.LeftAvail && !neighbors.TopAvail) {
-		// No neighbors: use mid-range value
-		dcVal = int32(1 << (bitDepth - 1))
-	} else {
-		sum := int32(0)
-		count := 0
-		if neighbors.LeftAvail {
-			for i := range size {
-				sum += int32(neighbors.Left[i])
-				count++
-			}
+	if neighbors == nil {
+		dcVal := int32(1 << (bitDepth - 1))
+		for i := range pred {
+			pred[i] = dcVal
 		}
-		if neighbors.TopAvail {
-			for i := range size {
-				sum += int32(neighbors.Top[i])
-				count++
-			}
-		}
-		dcVal = (sum + int32(count/2)) / int32(count)
+		return pred
 	}
 
+	// DC value: average of all left[0..size-1] and top[0..size-1]
+	log2Size := 0
+	for (1 << log2Size) < size {
+		log2Size++
+	}
+
+	sum := int32(0)
+	for i := range size {
+		sum += int32(neighbors.Left[i])
+		sum += int32(neighbors.Top[i])
+	}
+	dcVal := (sum + int32(size)) >> (log2Size + 1)
+
+	// Fill all samples with DC
 	for i := range pred {
 		pred[i] = dcVal
 	}
+
+	// Edge filtering for luma only (size < 32)
+	// HEVC spec 8.4.4.2.4: blend edge samples with reference samples
+	if isLuma && size < 32 {
+		// Top-left corner: blend with left[0] and top[0]
+		pred[0] = (int32(neighbors.Left[0]) + 2*dcVal + int32(neighbors.Top[0]) + 2) >> 2
+		// Top row: blend with top reference
+		for x := 1; x < size; x++ {
+			pred[x] = (int32(neighbors.Top[x]) + 3*dcVal + 2) >> 2
+		}
+		// Left column: blend with left reference
+		for y := 1; y < size; y++ {
+			pred[y*size] = (int32(neighbors.Left[y]) + 3*dcVal + 2) >> 2
+		}
+	}
+
 	return pred
 }
 
 // PredictPlanar performs Planar intra prediction (mode 0) for a block of the given size.
 // When no neighbors are available, falls back to DC-like behavior.
+// After reference sample substitution, all samples in neighbors are valid.
 func PredictPlanar(size int, neighbors *Neighbors, bitDepth int) []int32 {
 	pred := make([]int32, size*size)
 
-	if neighbors == nil || (!neighbors.LeftAvail && !neighbors.TopAvail) {
+	if neighbors == nil {
 		dcVal := int32(1 << (bitDepth - 1))
 		for i := range pred {
 			pred[i] = dcVal
@@ -55,36 +73,14 @@ func PredictPlanar(size int, neighbors *Neighbors, bitDepth int) []int32 {
 	}
 
 	// p[-1][nTbS] (top-right) and p[nTbS][-1] (bottom-left)
-	var topRight, bottomLeft int32
-	if neighbors.TopAvail && len(neighbors.Top) > size {
-		topRight = int32(neighbors.Top[size])
-	} else if neighbors.TopAvail {
-		topRight = int32(neighbors.Top[size-1])
-	} else {
-		topRight = int32(1 << (bitDepth - 1))
-	}
-
-	if neighbors.LeftAvail && len(neighbors.Left) > size {
-		bottomLeft = int32(neighbors.Left[size])
-	} else if neighbors.LeftAvail {
-		bottomLeft = int32(neighbors.Left[size-1])
-	} else {
-		bottomLeft = int32(1 << (bitDepth - 1))
-	}
+	// After substitution, all reference samples are valid
+	topRight := int32(neighbors.Top[size])
+	bottomLeft := int32(neighbors.Left[size])
 
 	for y := range size {
 		for x := range size {
-			var top, left int32
-			if neighbors.TopAvail {
-				top = int32(neighbors.Top[x])
-			} else {
-				top = int32(1 << (bitDepth - 1))
-			}
-			if neighbors.LeftAvail {
-				left = int32(neighbors.Left[y])
-			} else {
-				left = int32(1 << (bitDepth - 1))
-			}
+			top := int32(neighbors.Top[x])
+			left := int32(neighbors.Left[y])
 
 			pred[y*size+x] = ((int32(size)-1-int32(x))*left +
 				(int32(x)+1)*topRight +
@@ -111,17 +107,19 @@ func PredictAngular(mode, size int, neighbors *Neighbors, bitDepth int) []int32 
 	}
 
 	// Intra prediction angle table (spec Table 8-4)
+	// 35 entries indexed by mode 0-34
 	intraPredAngle := [...]int{
-		0, 0, 32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26, -32,
+		0, 0, 32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26,
 		-32, -26, -21, -17, -13, -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32,
 	}
 
 	// Inverse angle table for negative angles
+	// 35 entries indexed by mode 0-34; only used for modes 11-25 (negative angles)
 	invAngle := [...]int{
 		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 		-4096, -1638, -910, -630, -482, -390, -315,
-		-315, -390, -482, -630, -910, -1638, -4096,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		-256, -315, -390, -482, -630, -910, -1638, -4096,
+		0, 0, 0, 0, 0, 0, 0, 0, 0,
 	}
 
 	angle := intraPredAngle[mode]

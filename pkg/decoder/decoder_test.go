@@ -77,3 +77,7 @@ func TestDecodeRed16x16(t *testing.T) {
 func TestDecodeColorGrid32x32(t *testing.T) {
 	testGolden(t, "../../testdata/colorgrid_32x32.265", "../../testdata/golden/colorgrid_32x32.yuv", 32, 32)
 }
+
+func TestDecodeChecker16x16(t *testing.T) {
+	testGolden(t, "../../testdata/checker_16x16.265", "../../testdata/golden/checker_16x16.yuv", 16, 16)
+}

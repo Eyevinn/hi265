@@ -228,19 +228,30 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 			trSize := 1 << tu.Log2TrSize
 
 			// Determine intra prediction mode for this TU
-			lumaMode := cu.IntraLumaMode[0] // Simplified: use first PU's mode
+			lumaMode := cu.IntraLumaMode[0]
+			if cu.PartMode == 1 { // NxN: each PU has its own mode
+				halfCU := 1 << (cu.Log2CbSize - 1)
+				puIdx := 0
+				if tu.X0 >= cu.X0+halfCU {
+					puIdx++
+				}
+				if tu.Y0 >= cu.Y0+halfCU {
+					puIdx += 2
+				}
+				lumaMode = cu.IntraLumaMode[puIdx]
+			}
 
 			// Luma reconstruction
 			lumaNeighbors := getLumaNeighbors(f, tu.X0, tu.Y0, trSize, ctbSize)
-			predSamples := predictIntra(lumaMode, trSize, lumaNeighbors, bitDepth)
+			predSamples := predictIntra(lumaMode, trSize, lumaNeighbors, bitDepth, true)
 
 			var residual []int32
 			if tu.CbfLuma {
 				// Dequantize
 				dequantCoeffs := transform.Dequantize(tu.LumaCoeffs, trSize, sliceQPY)
 				// Inverse transform
-				if trSize == 4 && lumaMode != 0 && lumaMode != 1 {
-					// 4x4 intra luma non-DC/non-planar: use DST
+				if trSize == 4 {
+					// HEVC spec 8.6.4.2: DST for ALL 4x4 intra luma TUs
 					residual = transform.InverseDST(dequantCoeffs)
 				} else {
 					residual = transform.InverseDCT(dequantCoeffs, trSize)
@@ -257,13 +268,14 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 			f.SetLumaBlock(tu.X0, tu.Y0, trSize, recon)
 
 			// Chroma reconstruction
+			// For 4:2:0, minimum chroma TU is 4x4. When luma TU is 4x4,
+			// chroma is only processed once per 8x8 luma area.
+			if tu.Log2TrSize < 3 && (tu.X0%8 != 0 || tu.Y0%8 != 0) {
+				continue
+			}
 			chromaTrSize := trSize / 2
 			if chromaTrSize < 4 {
 				chromaTrSize = 4
-			}
-			chromaLog2TrSize := tu.Log2TrSize - 1
-			if chromaLog2TrSize < 2 {
-				chromaLog2TrSize = 2
 			}
 
 			// Chroma prediction mode
@@ -284,7 +296,7 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 				}
 
 				chromaNeighbors := getChromaNeighbors(f, comp, tu.X0/2, tu.Y0/2, chromaTrSize, ctbSize)
-				chromaPred := predictIntra(chromaMode, chromaTrSize, chromaNeighbors, bitDepth)
+				chromaPred := predictIntra(chromaMode, chromaTrSize, chromaNeighbors, bitDepth, false)
 
 				var chromaResidual []int32
 				hasCbf := (comp == 0 && tu.CbfCb) || (comp == 1 && tu.CbfCr)
@@ -308,12 +320,12 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 }
 
 // predictIntra performs intra prediction for a block.
-func predictIntra(mode, size int, neighbors *pred.Neighbors, bitDepth int) []int32 {
+func predictIntra(mode, size int, neighbors *pred.Neighbors, bitDepth int, isLuma bool) []int32 {
 	switch mode {
 	case 0:
 		return pred.PredictPlanar(size, neighbors, bitDepth)
 	case 1:
-		return pred.PredictDC(size, neighbors, bitDepth)
+		return pred.PredictDC(size, neighbors, bitDepth, isLuma)
 	default:
 		return pred.PredictAngular(mode, size, neighbors, bitDepth)
 	}
@@ -324,14 +336,16 @@ func predictIntra(mode, size int, neighbors *pred.Neighbors, bitDepth int) []int
 // filled from the nearest available sample (not defaulted to 128).
 // ctbSize is needed to check CTU-level availability (raster scan order).
 // getPixel takes (x, y) and returns the pixel value.
-func buildRefSamples(x0, y0, size, picW, picH, ctbSize int, getPixel func(x, y int) uint8) *pred.Neighbors {
+// isDecoded takes (x, y) and returns whether the pixel has been reconstructed.
+func buildRefSamples(x0, y0, size, picW, picH, ctbSize int,
+	getPixel func(x, y int) uint8, isDecoded func(x, y int) bool) *pred.Neighbors {
 	// Current CTU address in raster scan
 	numCtbX := (picW + ctbSize - 1) / ctbSize
 	curCtbX := x0 / ctbSize
 	curCtbY := y0 / ctbSize
 	curAddr := curCtbY*numCtbX + curCtbX
 
-	// isAvailable checks if pixel (px, py) is in a previously decoded CTU
+	// isAvailable checks if pixel (px, py) has been reconstructed
 	isAvailable := func(px, py int) bool {
 		if px < 0 || py < 0 || px >= picW || py >= picH {
 			return false
@@ -339,7 +353,13 @@ func buildRefSamples(x0, y0, size, picW, picH, ctbSize int, getPixel func(x, y i
 		nCtbX := px / ctbSize
 		nCtbY := py / ctbSize
 		nAddr := nCtbY*numCtbX + nCtbX
-		return nAddr < curAddr
+		if nAddr < curAddr {
+			return true // previous CTU, always available
+		}
+		if nAddr == curAddr {
+			return isDecoded(px, py) // same CTU, check if reconstructed
+		}
+		return false
 	}
 
 	// Quick check: any neighbors at all?
@@ -404,9 +424,10 @@ func buildRefSamples(x0, y0, size, picW, picH, ctbSize int, getPixel func(x, y i
 		}
 	}
 
-	// Convert back to Neighbors struct
+	// Convert back to Neighbors struct.
+	// After substitution, all reference samples are valid.
 	n := &pred.Neighbors{
-		TopAvail:  true, // after substitution, all are available
+		TopAvail:  true,
 		LeftAvail: true,
 		Top:       make([]uint8, 2*size),
 		Left:      make([]uint8, 2*size),
@@ -425,17 +446,20 @@ func buildRefSamples(x0, y0, size, picW, picH, ctbSize int, getPixel func(x, y i
 // getLumaNeighbors extracts reference samples from the reconstructed frame
 // for a luma TU at (x0, y0) with the given size.
 func getLumaNeighbors(f *frame.Frame, x0, y0, size, ctbSize int) *pred.Neighbors {
-	return buildRefSamples(x0, y0, size, f.Width, f.Height, ctbSize, func(x, y int) uint8 {
-		return f.GetLumaPixel(x, y)
-	})
+	return buildRefSamples(x0, y0, size, f.Width, f.Height, ctbSize,
+		func(x, y int) uint8 { return f.GetLumaPixel(x, y) },
+		func(x, y int) bool { return f.IsLumaDecoded(x, y) },
+	)
 }
 
 // getChromaNeighbors extracts reference samples from the reconstructed frame
 // for a chroma TU at (x0, y0) with the given size, on component comp (0=Cb, 1=Cr).
 func getChromaNeighbors(f *frame.Frame, comp, x0, y0, size, ctbSize int) *pred.Neighbors {
-	return buildRefSamples(x0, y0, size, f.Width/2, f.Height/2, ctbSize/2, func(x, y int) uint8 {
-		return f.GetChromaPixel(comp, x, y)
-	})
+	// For chroma, use luma decoded status at 2x coordinates (4:2:0)
+	return buildRefSamples(x0, y0, size, f.Width/2, f.Height/2, ctbSize/2,
+		func(x, y int) uint8 { return f.GetChromaPixel(comp, x, y) },
+		func(x, y int) bool { return f.IsLumaDecoded(x*2, y*2) },
+	)
 }
 
 // removeEmulationPreventionBytes removes 0x03 emulation prevention bytes

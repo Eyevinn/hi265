@@ -65,12 +65,13 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 	ctbsY := (p.PicHeight + ctbSize - 1) / ctbSize
 
 	sd := &SliceData{}
+	modeMap := newIntraModeMap(p.PicWidth, p.PicHeight)
 
 	for ctbAddrRS := 0; ctbAddrRS < ctbsX*ctbsY; ctbAddrRS++ {
 		ctbX := (ctbAddrRS % ctbsX) * ctbSize
 		ctbY := (ctbAddrRS / ctbsX) * ctbSize
 
-		cus, err := decodeCodingQuadtree(dec, ctxModels, ctbX, ctbY, p.Log2CtbSize, 0, &p)
+		cus, err := decodeCodingQuadtree(dec, ctxModels, ctbX, ctbY, p.Log2CtbSize, 0, &p, modeMap)
 		if err != nil {
 			return nil, fmt.Errorf("CTU (%d,%d): %w", ctbX, ctbY, err)
 		}
@@ -88,7 +89,7 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 
 // decodeCodingQuadtree recursively splits the CTU into CUs.
 func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
-	x0, y0, log2CbSize, depth int, p *Params) ([]CodingUnit, error) {
+	x0, y0, log2CbSize, depth int, p *Params, modeMap *intraModeMap) ([]CodingUnit, error) {
 
 	split := false
 	if log2CbSize > p.Log2MinCbSize {
@@ -114,7 +115,7 @@ func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 		for _, pos := range positions {
 			if pos[0] < p.PicWidth && pos[1] < p.PicHeight {
 				cus, err := decodeCodingQuadtree(dec, ctx, pos[0], pos[1],
-					newLog2CbSize, depth+1, p)
+					newLog2CbSize, depth+1, p, modeMap)
 				if err != nil {
 					return nil, err
 				}
@@ -125,7 +126,7 @@ func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	}
 
 	// Decode coding unit
-	cu, err := decodeCodingUnit(dec, ctx, x0, y0, log2CbSize, p)
+	cu, err := decodeCodingUnit(dec, ctx, x0, y0, log2CbSize, p, modeMap)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +135,7 @@ func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 
 // decodeCodingUnit decodes a single CU.
 func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
-	x0, y0, log2CbSize int, p *Params) (CodingUnit, error) {
+	x0, y0, log2CbSize int, p *Params, modeMap *intraModeMap) (CodingUnit, error) {
 
 	cu := CodingUnit{
 		X0:         x0,
@@ -160,8 +161,22 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 
 	// Decode intra prediction modes
 	numPU := 1
+	puSize := cbSize
 	if cu.PartMode == 1 {
 		numPU = 4
+		puSize = cbSize / 2
+	}
+
+	// PU positions (raster order within CU)
+	puPositions := make([][2]int, numPU)
+	if numPU == 1 {
+		puPositions[0] = [2]int{x0, y0}
+	} else {
+		half := cbSize / 2
+		puPositions[0] = [2]int{x0, y0}
+		puPositions[1] = [2]int{x0 + half, y0}
+		puPositions[2] = [2]int{x0, y0 + half}
+		puPositions[3] = [2]int{x0 + half, y0 + half}
 	}
 
 	// prev_intra_luma_pred_flag for each PU
@@ -173,6 +188,17 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 
 	// mpm_idx or rem_intra_luma_pred_mode for each PU
 	for i := range numPU {
+		px, py := puPositions[i][0], puPositions[i][1]
+
+		// Derive MPM list from left and above neighbors (HEVC spec 8.4.2)
+		candA := modeMap.get(px-1, py) // left neighbor
+		candB := modeMap.get(px, py-1) // above neighbor
+		mpmList := deriveMPM(candA, candB)
+		if dec.Trace {
+			fmt.Printf("  PU[%d] at (%d,%d) candA=%d candB=%d MPM=%v prev=%v\n",
+				i, px, py, candA, candB, mpmList, prevFlags[i])
+		}
+
 		if prevFlags[i] {
 			// mpm_idx: decoded as truncated unary, max 2
 			mpmIdx := 0
@@ -182,15 +208,11 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 					mpmIdx++
 				}
 			}
-			// For the first CTU with no neighbors, MPM list is {0(Planar), 1(DC), 26(Angular)}
-			mpmList := [3]int{0, 1, 26}
 			cu.IntraLumaMode[i] = mpmList[mpmIdx]
 		} else {
 			// rem_intra_luma_pred_mode: 5 bypass bins
 			rem := int(dec.ReadBypassU(5))
 			// Convert rem to actual mode (skipping MPM entries)
-			mpmList := [3]int{0, 1, 26}
-			// Sort MPM list
 			sorted := sortMPM(mpmList)
 			mode := rem
 			for _, mpm := range sorted {
@@ -200,6 +222,12 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 			}
 			cu.IntraLumaMode[i] = mode
 		}
+
+		if dec.Trace {
+			fmt.Printf("  PU[%d] → mode=%d\n", i, cu.IntraLumaMode[i])
+		}
+		// Store mode in map so subsequent PUs can use it as neighbor
+		modeMap.set(px, py, puSize, cu.IntraLumaMode[i])
 	}
 
 	// intra_chroma_pred_mode
@@ -216,7 +244,7 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 
 	// Decode transform tree
 	tus, err := decodeTransformTree(dec, ctx, x0, y0, x0, y0, log2CbSize, log2CbSize,
-		0, cbSize, true, true, p)
+		0, cbSize, true, true, p, cu.IntraLumaMode, x0, y0)
 	if err != nil {
 		return cu, err
 	}
@@ -228,7 +256,8 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 // decodeTransformTree recursively decodes the transform quadtree.
 func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	x0, y0, xBase, yBase int, log2TrafoSize, log2CbSize int,
-	trafoDepth, cbSize int, cbfCb, cbfCr bool, p *Params) ([]TransformUnit, error) {
+	trafoDepth, cbSize int, cbfCb, cbfCr bool, p *Params,
+	lumaIntraModes [4]int, cuX0, cuY0 int) ([]TransformUnit, error) {
 
 	log2MaxTrafoSize := p.Log2MaxTrafoSize
 	log2MinTrafoSize := p.Log2MinTrafoSize
@@ -245,15 +274,14 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 		split = true
 	}
 
-	// cbf_cb and cbf_cr for this level
-	if trafoDepth == 0 || cbfCb {
-		if trafoDepth > 0 || log2TrafoSize > 2 {
+	// cbf_cb and cbf_cr: only signaled when log2TrafoSize > 2 for 4:2:0
+	// (chroma block must be at least 4x4, which requires luma >= 8x8)
+	if log2TrafoSize > 2 {
+		if trafoDepth == 0 || cbfCb {
 			cbfCbFlag := dec.DecodeDecision(&ctx[context.CtxCbfCb+trafoDepth])
 			cbfCb = cbfCbFlag == 1
 		}
-	}
-	if trafoDepth == 0 || cbfCr {
-		if trafoDepth > 0 || log2TrafoSize > 2 {
+		if trafoDepth == 0 || cbfCr {
 			cbfCrFlag := dec.DecodeDecision(&ctx[context.CtxCbfCr+trafoDepth])
 			cbfCr = cbfCrFlag == 1
 		}
@@ -274,7 +302,7 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 		for _, pos := range positions {
 			tus, err := decodeTransformTree(dec, ctx, pos[0], pos[1], x0, y0,
 				newLog2TrafoSize, log2CbSize, trafoDepth+1, cbSize,
-				cbfCb, cbfCr, p)
+				cbfCb, cbfCr, p, lumaIntraModes, cuX0, cuY0)
 			if err != nil {
 				return nil, err
 			}
@@ -303,8 +331,29 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	// Decode residual coefficients
 	trSize := 1 << log2TrafoSize
 
+	// Compute luma scanIdx based on intra mode
+	// HEVC spec: for 4x4 luma TUs, mode 6-14 → horizontal, mode 22-30 → vertical
+	lumaScanIdx := 0
+	if log2TrafoSize == 2 {
+		// Determine which PU this TU belongs to
+		puIdx := 0
+		halfCb := cbSize / 2
+		if x0 >= cuX0+halfCb {
+			puIdx += 1
+		}
+		if y0 >= cuY0+halfCb {
+			puIdx += 2
+		}
+		lumaMode := lumaIntraModes[puIdx]
+		if lumaMode >= 6 && lumaMode <= 14 {
+			lumaScanIdx = 1
+		} else if lumaMode >= 22 && lumaMode <= 30 {
+			lumaScanIdx = 2
+		}
+	}
+
 	if tu.CbfLuma {
-		coeffs, err := decodeResidualCoding(dec, ctx, log2TrafoSize, true)
+		coeffs, err := decodeResidualCoding(dec, ctx, log2TrafoSize, true, lumaScanIdx)
 		if err != nil {
 			return nil, fmt.Errorf("luma residual: %w", err)
 		}
@@ -320,8 +369,12 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	}
 	chromaTrSize := 1 << chromaLog2TrSize
 
-	if tu.CbfCb {
-		coeffs, err := decodeResidualCoding(dec, ctx, chromaLog2TrSize, false)
+	// For 4:2:0, chroma residuals at log2TrafoSize==2 are only present
+	// for the TU at the base position (top-left of the 8x8 group)
+	parseChroma := log2TrafoSize > 2 || (x0 == xBase && y0 == yBase)
+
+	if parseChroma && tu.CbfCb {
+		coeffs, err := decodeResidualCoding(dec, ctx, chromaLog2TrSize, false, 0)
 		if err != nil {
 			return nil, fmt.Errorf("cb residual: %w", err)
 		}
@@ -330,8 +383,8 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 		tu.CbCoeffs = make([]int32, chromaTrSize*chromaTrSize)
 	}
 
-	if tu.CbfCr {
-		coeffs, err := decodeResidualCoding(dec, ctx, chromaLog2TrSize, false)
+	if parseChroma && tu.CbfCr {
+		coeffs, err := decodeResidualCoding(dec, ctx, chromaLog2TrSize, false, 0)
 		if err != nil {
 			return nil, fmt.Errorf("cr residual: %w", err)
 		}
@@ -346,13 +399,17 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 // decodeResidualCoding decodes a single residual block using CABAC.
 // Returns coefficients in raster scan order.
 func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
-	log2TrafoSize int, isLuma bool) ([]int32, error) {
+	log2TrafoSize int, isLuma bool, scanIdx int) ([]int32, error) {
 
 	trSize := 1 << log2TrafoSize
 
+	startBins := dec.BinCount()
 	// last_sig_coeff_x_prefix and last_sig_coeff_y_prefix
 	lastSigCoeffX := decodeLastSigCoeff(dec, ctx, log2TrafoSize, isLuma, true)
 	lastSigCoeffY := decodeLastSigCoeff(dec, ctx, log2TrafoSize, isLuma, false)
+	if dec.Trace {
+		fmt.Printf("  [residual log2=%d luma=%v] lastSigCoeff=(%d,%d) startBin=%d\n", log2TrafoSize, isLuma, lastSigCoeffX, lastSigCoeffY, startBins)
+	}
 
 	// Convert to sub-block coordinates
 	log2SbSize := 2 // 4x4 sub-blocks
@@ -368,10 +425,9 @@ func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
 	lastSbX := lastSigCoeffX >> log2SbSize
 	lastSbY := lastSigCoeffY >> log2SbSize
 
-	// Scan order: diagonal for intra, otherwise raster
-	// For simplicity, use diagonal scan for all (correct for intra)
-	sbScanOrder := diagonalScanOrder(numSbX, numSbY)
-	coeffScanOrder := diagonalScanOrder(1<<log2SbSize, 1<<log2SbSize)
+	// Scan order depends on scanIdx: 0=diagonal, 1=horizontal, 2=vertical
+	sbScanOrder := scanOrder(numSbX, numSbY, scanIdx)
+	coeffScanOrder := scanOrder(1<<log2SbSize, 1<<log2SbSize, scanIdx)
 
 	// Find lastScanPos and lastSubBlock
 	lastSubBlock := len(sbScanOrder) - 1
@@ -441,7 +497,9 @@ func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
 		for n := startPos; n >= 0; n-- {
 			// sig_coeff_flag
 			if n > 0 || codedSubBlock {
-				sigCtx := getSigCtxInc(n, log2TrafoSize, isLuma, sbX, sbY)
+				cx := coeffScanOrder[n][0]
+				cy := coeffScanOrder[n][1]
+				sigCtx := getSigCtxInc(cx, cy, log2TrafoSize, isLuma, sbX, sbY, scanIdx)
 				flag := dec.DecodeDecision(&ctx[context.CtxSigCoeffFlag+sigCtx])
 				sigFlags[n] = flag == 1
 				if sigFlags[n] {
@@ -460,6 +518,7 @@ func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
 		// Decode coefficient levels
 		// coeff_abs_level_greater1_flag
 		greater1Flags := make([]bool, numCoeffs)
+		greater1Decoded := make([]bool, numCoeffs) // tracks if greater1 was decoded
 		firstGreater1Pos := -1
 		numGreater1InSb := 0
 
@@ -493,6 +552,7 @@ func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
 				greater1Ctx := ctxSet*4 + c1 + chromaOffset
 				flag := dec.DecodeDecision(&ctx[context.CtxCoeffAbsLevelGreater1+greater1Ctx])
 				greater1Flags[n] = flag == 1
+				greater1Decoded[n] = true
 				numGreater1InSb++
 				if greater1Flags[n] {
 					if firstGreater1Pos < 0 {
@@ -542,16 +602,21 @@ func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
 				continue
 			}
 			baseLevel := int32(1)
-			if greater1Flags[n] {
+			if greater1Decoded[n] && greater1Flags[n] {
 				baseLevel = 2
 			}
 			if n == firstGreater1Pos && greater2Flag {
 				baseLevel = 3
 			}
 
-			// Decode coeff_abs_level_remaining
+			// Decode coeff_abs_level_remaining:
+			// - When greater1 was decoded and is set (baseLevel >= 2)
+			// - When greater1 was NOT decoded (bypassed, baseLevel == 1 but actual may be higher)
 			absRemaining := int32(0)
-			if greater1Flags[n] || (n == firstGreater1Pos && greater2Flag) {
+			needRemaining := !greater1Decoded[n] || // bypassed (>=8 sig coeffs)
+				greater1Flags[n] || // greater1=1
+				(n == firstGreater1Pos && greater2Flag) // greater2=1
+			if needRemaining {
 				absRemaining = decodeAbsLevelRemaining(dec, cRiceParam)
 			}
 
@@ -579,10 +644,17 @@ func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
 					val = -val
 				}
 				coeffs[py*trSize+px] = val
+				if dec.Trace {
+					fmt.Printf("  [coeff] scan=%d pos=(%d,%d) raster=%d abs=%d sign=%v → %d\n",
+						n, px, py, py*trSize+px, absLevels[n], signFlags[n], val)
+				}
 			}
 		}
 	}
 
+	if dec.Trace {
+		fmt.Printf("  [residual done] totalBins=%d (consumed %d) bitsRead=%d\n", dec.BinCount(), dec.BinCount()-startBins, dec.BitsRead())
+	}
 	return coeffs, nil
 }
 
@@ -662,59 +734,97 @@ func decodeAbsLevelRemaining(dec *cabac.Decoder, cRiceParam int) int32 {
 
 // getSigCtxInc returns the context index for sig_coeff_flag.
 // Based on HEVC spec 9.3.4.2.6 (Table 9-39).
-func getSigCtxInc(scanPos, log2TrafoSize int, isLuma bool, sbX, sbY int) int {
+func getSigCtxInc(cx, cy, log2TrafoSize int, isLuma bool, sbX, sbY, scanIdx int) int {
 	if log2TrafoSize == 2 {
 		// 4x4 transform: use Table 9-39 context mapping
-		// ctxIdxMap for 4x4 diagonal scan
-		ctxIdxMap := [16]int{
-			0, 1, 4, 5,
-			2, 3, 4, 5,
-			6, 6, 8, 8,
-			7, 7, 8, 8,
+		// Different maps for each scan type
+		ctxIdxMaps := [3][16]int{
+			// scanIdx=0 (diagonal) and scanIdx=1 (horizontal)
+			{0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8},
+			// scanIdx=1 (horizontal) - same as diagonal
+			{0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8},
+			// scanIdx=2 (vertical) - transposed
+			{0, 2, 6, 7, 1, 3, 6, 7, 4, 4, 8, 8, 5, 5, 8, 8},
 		}
+		blkPos := cy*4 + cx
 		if isLuma {
-			return ctxIdxMap[scanPos]
+			return ctxIdxMaps[scanIdx][blkPos]
 		}
-		return ctxIdxMap[scanPos] + 28 // chroma offset
+		return ctxIdxMaps[scanIdx][blkPos] + 28 // chroma offset
 	}
 
-	// For larger blocks (8x8+), context depends on sub-block position and scan position
+	// For larger blocks (8x8+), context depends on sub-block position and scan position within sub-block
+	scanPosInSb := cy*4 + cx // position within 4x4 sub-block
 	if isLuma {
 		if sbX == 0 && sbY == 0 {
-			// DC sub-block: special contexts
-			return min(scanPos, 2)
+			return min(scanPosInSb, 2)
 		}
 		if sbY == 0 {
-			return min(scanPos, 2) + 3
+			return min(scanPosInSb, 2) + 3
 		}
 		if sbX == 0 {
-			return min(scanPos, 2) + 6
+			return min(scanPosInSb, 2) + 6
 		}
-		return min(scanPos, 2) + 21
+		return min(scanPosInSb, 2) + 21
 	}
 
 	// Chroma
 	if sbX == 0 && sbY == 0 {
-		return min(scanPos, 2) + 28
+		return min(scanPosInSb, 2) + 28
 	}
-	return min(scanPos, 2) + 31
+	return min(scanPosInSb, 2) + 31
 }
 
 // diagonalScanOrder generates the HEVC diagonal scan order for an NxN block.
-// HEVC spec Table 6-5: every diagonal goes in the up-right direction (x--, y++).
+// HEVC spec Table 6-5: each diagonal starts from (0, s) and goes up-right (x++, y--).
 func diagonalScanOrder(width, height int) [][2]int {
 	var order [][2]int
 	for s := 0; s < width+height-1; s++ {
-		// Always traverse up-right: start from bottom of diagonal, go x--, y++
-		x := min(s, width-1)
-		y := s - x
-		for x >= 0 && y < height {
+		// Start from left side of diagonal (x=0, y=s), go x++, y--
+		y := min(s, height-1)
+		x := s - y
+		for x < width && y >= 0 {
 			order = append(order, [2]int{x, y})
-			x--
-			y++
+			x++
+			y--
 		}
 	}
 	return order
+}
+
+// horizontalScanOrder generates a row-major scan order for an NxN block.
+func horizontalScanOrder(width, height int) [][2]int {
+	order := make([][2]int, 0, width*height)
+	for y := range height {
+		for x := range width {
+			order = append(order, [2]int{x, y})
+		}
+	}
+	return order
+}
+
+// verticalScanOrder generates a column-major scan order for an NxN block.
+func verticalScanOrder(width, height int) [][2]int {
+	order := make([][2]int, 0, width*height)
+	for x := range width {
+		for y := range height {
+			order = append(order, [2]int{x, y})
+		}
+	}
+	return order
+}
+
+// scanOrder returns the scan order for the given scanIdx.
+// scanIdx: 0=diagonal, 1=horizontal, 2=vertical.
+func scanOrder(width, height, scanIdx int) [][2]int {
+	switch scanIdx {
+	case 1:
+		return horizontalScanOrder(width, height)
+	case 2:
+		return verticalScanOrder(width, height)
+	default:
+		return diagonalScanOrder(width, height)
+	}
 }
 
 // sortMPM sorts a 3-element MPM list in ascending order.
@@ -730,4 +840,71 @@ func sortMPM(mpm [3]int) [3]int {
 		sorted[0], sorted[1] = sorted[1], sorted[0]
 	}
 	return sorted
+}
+
+// intraModeMap tracks decoded intra luma prediction modes at 4x4 PU granularity.
+type intraModeMap struct {
+	modes []int // flat array, indexed as [y/4 * width4 + x/4]
+	width4 int  // picture width in 4-sample units
+}
+
+func newIntraModeMap(picW, picH int) *intraModeMap {
+	w := (picW + 3) / 4
+	h := (picH + 3) / 4
+	modes := make([]int, w*h)
+	for i := range modes {
+		modes[i] = -1 // unavailable
+	}
+	return &intraModeMap{modes: modes, width4: w}
+}
+
+// set stores a mode for all 4x4 blocks within the PU at (x0, y0) of given size.
+func (m *intraModeMap) set(x0, y0, puSize, mode int) {
+	for y := y0 / 4; y < (y0+puSize)/4; y++ {
+		for x := x0 / 4; x < (x0+puSize)/4; x++ {
+			m.modes[y*m.width4+x] = mode
+		}
+	}
+}
+
+// get returns the intra mode at pixel position (x, y), or -1 if unavailable.
+func (m *intraModeMap) get(x, y int) int {
+	bx, by := x/4, y/4
+	if bx < 0 || by < 0 || bx >= m.width4 || by*m.width4+bx >= len(m.modes) {
+		return -1
+	}
+	return m.modes[by*m.width4+bx]
+}
+
+// deriveMPM builds the 3-element MPM list per HEVC spec 8.4.2 (Table 8-3).
+func deriveMPM(candA, candB int) [3]int {
+	// -1 means unavailable → default to DC (mode 1)
+	if candA < 0 {
+		candA = 1
+	}
+	if candB < 0 {
+		candB = 1
+	}
+
+	if candA == candB {
+		if candA < 2 {
+			return [3]int{0, 1, 26} // Planar, DC, Angular26
+		}
+		return [3]int{
+			candA,
+			2 + ((candA - 2 + 29) % 32), // candA - 1 in angular range
+			2 + ((candA - 2 + 1) % 32),  // candA + 1 in angular range
+		}
+	}
+
+	// candA != candB
+	var third int
+	if candA != 0 && candB != 0 {
+		third = 0 // Planar
+	} else if candA != 1 && candB != 1 {
+		third = 1 // DC
+	} else {
+		third = 26 // Angular 26
+	}
+	return [3]int{candA, candB, third}
 }

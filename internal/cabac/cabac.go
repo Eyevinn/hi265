@@ -127,6 +127,9 @@ func (d *Decoder) DecodeTerminate() uint8 {
 	return 0
 }
 
+// BinCount returns the number of CABAC bins decoded so far.
+func (d *Decoder) BinCount() int { return d.binCount }
+
 // BitsRead returns the number of bits consumed from the bitstream so far.
 func (d *Decoder) BitsRead() int {
 	return d.pos*8 - d.bitsLeft
