@@ -219,6 +219,9 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 
 	f := frame.NewFrame(picWidth, picHeight)
 	bitDepth := 8
+	log2CtbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3 +
+		int(sps.Log2DiffMaxMinLumaCodingBlockSize)
+	ctbSize := 1 << log2CtbSize
 
 	for _, cu := range sd.CUs {
 		for _, tu := range cu.TransformUnits {
@@ -228,7 +231,8 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 			lumaMode := cu.IntraLumaMode[0] // Simplified: use first PU's mode
 
 			// Luma reconstruction
-			predSamples := predictIntra(lumaMode, trSize, nil, bitDepth)
+			lumaNeighbors := getLumaNeighbors(f, tu.X0, tu.Y0, trSize, ctbSize)
+			predSamples := predictIntra(lumaMode, trSize, lumaNeighbors, bitDepth)
 
 			var residual []int32
 			if tu.CbfLuma {
@@ -279,7 +283,8 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 					chromaCoeffs = tu.CrCoeffs
 				}
 
-				chromaPred := predictIntra(chromaMode, chromaTrSize, nil, bitDepth)
+				chromaNeighbors := getChromaNeighbors(f, comp, tu.X0/2, tu.Y0/2, chromaTrSize, ctbSize)
+				chromaPred := predictIntra(chromaMode, chromaTrSize, chromaNeighbors, bitDepth)
 
 				var chromaResidual []int32
 				hasCbf := (comp == 0 && tu.CbfCb) || (comp == 1 && tu.CbfCr)
@@ -310,9 +315,127 @@ func predictIntra(mode, size int, neighbors *pred.Neighbors, bitDepth int) []int
 	case 1:
 		return pred.PredictDC(size, neighbors, bitDepth)
 	default:
-		// For other angular modes, fall back to DC for now
-		return pred.PredictDC(size, neighbors, bitDepth)
+		return pred.PredictAngular(mode, size, neighbors, bitDepth)
 	}
+}
+
+// buildRefSamples extracts and substitutes reference samples for intra prediction
+// per HEVC spec section 8.4.4.2.2. When some neighbors are unavailable, they are
+// filled from the nearest available sample (not defaulted to 128).
+// ctbSize is needed to check CTU-level availability (raster scan order).
+// getPixel takes (x, y) and returns the pixel value.
+func buildRefSamples(x0, y0, size, picW, picH, ctbSize int, getPixel func(x, y int) uint8) *pred.Neighbors {
+	// Current CTU address in raster scan
+	numCtbX := (picW + ctbSize - 1) / ctbSize
+	curCtbX := x0 / ctbSize
+	curCtbY := y0 / ctbSize
+	curAddr := curCtbY*numCtbX + curCtbX
+
+	// isAvailable checks if pixel (px, py) is in a previously decoded CTU
+	isAvailable := func(px, py int) bool {
+		if px < 0 || py < 0 || px >= picW || py >= picH {
+			return false
+		}
+		nCtbX := px / ctbSize
+		nCtbY := py / ctbSize
+		nAddr := nCtbY*numCtbX + nCtbX
+		return nAddr < curAddr
+	}
+
+	// Quick check: any neighbors at all?
+	hasAny := isAvailable(x0-1, y0) || isAvailable(x0, y0-1)
+	if !hasAny {
+		return nil
+	}
+
+	// Build raw reference sample array in scan order:
+	// left[2*size-1]..left[0], topLeft, top[0]..top[2*size-1]
+	// Total: 4*size + 1 samples
+	totalSamples := 4*size + 1
+	ref := make([]uint8, totalSamples)
+	avail := make([]bool, totalSamples)
+
+	// Left samples: index 0..2*size-1 maps to left[2*size-1-i] (bottom to top)
+	for i := range 2 * size {
+		y := y0 + 2*size - 1 - i
+		if isAvailable(x0-1, y) {
+			ref[i] = getPixel(x0-1, y)
+			avail[i] = true
+		}
+	}
+
+	// TopLeft: index 2*size
+	tlIdx := 2 * size
+	if isAvailable(x0-1, y0-1) {
+		ref[tlIdx] = getPixel(x0-1, y0-1)
+		avail[tlIdx] = true
+	}
+
+	// Top samples: index 2*size+1..4*size maps to top[0..2*size-1]
+	for i := range 2 * size {
+		x := x0 + i
+		if isAvailable(x, y0-1) {
+			ref[tlIdx+1+i] = getPixel(x, y0-1)
+			avail[tlIdx+1+i] = true
+		}
+	}
+
+	// Reference sample substitution (spec 8.4.4.2.2):
+	// Find first available sample in scan order, then propagate
+	firstAvail := -1
+	for i := range totalSamples {
+		if avail[i] {
+			firstAvail = i
+			break
+		}
+	}
+	if firstAvail < 0 {
+		return nil
+	}
+
+	// Fill all unavailable samples before firstAvail with firstAvail's value
+	for i := range firstAvail {
+		ref[i] = ref[firstAvail]
+	}
+	// Fill unavailable samples after firstAvail with previous sample
+	for i := firstAvail + 1; i < totalSamples; i++ {
+		if !avail[i] {
+			ref[i] = ref[i-1]
+		}
+	}
+
+	// Convert back to Neighbors struct
+	n := &pred.Neighbors{
+		TopAvail:  true, // after substitution, all are available
+		LeftAvail: true,
+		Top:       make([]uint8, 2*size),
+		Left:      make([]uint8, 2*size),
+	}
+
+	// Left: ref[0] = left[2*size-1] (bottommost), ref[2*size-1] = left[0] (topmost)
+	for i := range 2 * size {
+		n.Left[i] = ref[2*size-1-i]
+	}
+	n.TopLeft = ref[tlIdx]
+	copy(n.Top, ref[tlIdx+1:])
+
+	return n
+}
+
+// getLumaNeighbors extracts reference samples from the reconstructed frame
+// for a luma TU at (x0, y0) with the given size.
+func getLumaNeighbors(f *frame.Frame, x0, y0, size, ctbSize int) *pred.Neighbors {
+	return buildRefSamples(x0, y0, size, f.Width, f.Height, ctbSize, func(x, y int) uint8 {
+		return f.GetLumaPixel(x, y)
+	})
+}
+
+// getChromaNeighbors extracts reference samples from the reconstructed frame
+// for a chroma TU at (x0, y0) with the given size, on component comp (0=Cb, 1=Cr).
+func getChromaNeighbors(f *frame.Frame, comp, x0, y0, size, ctbSize int) *pred.Neighbors {
+	return buildRefSamples(x0, y0, size, f.Width/2, f.Height/2, ctbSize/2, func(x, y int) uint8 {
+		return f.GetChromaPixel(comp, x, y)
+	})
 }
 
 // removeEmulationPreventionBytes removes 0x03 emulation prevention bytes
