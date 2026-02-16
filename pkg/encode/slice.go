@@ -6,7 +6,106 @@ import (
 	"github.com/Eyevinn/hi265/internal/pred"
 	"github.com/Eyevinn/hi265/internal/transform"
 	"github.com/Eyevinn/hi265/pkg/frame"
+	"github.com/Eyevinn/mp4ff/hevc"
 )
+
+// idrSliceParams holds the parameters needed to write an IDR slice header
+// when using external SPS/PPS.
+type idrSliceParams struct {
+	width                           int
+	height                          int
+	qp                              int
+	ppsID                           uint32
+	numExtraSliceHeaderBits         uint8
+	outputFlagPresent               bool
+	saoEnabled                      bool
+	deblockingFilterControlPresent  bool
+	deblockingFilterOverrideEnabled bool
+	deblockingFilterDisabled        bool
+	loopFilterAcrossSlicesEnabled   bool
+}
+
+func idrSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) idrSliceParams {
+	qp := 26 + int(pps.InitQpMinus26) // slice_qp_delta = 0
+	return idrSliceParams{
+		width:                           int(sps.PicWidthInLumaSamples),
+		height:                          int(sps.PicHeightInLumaSamples),
+		qp:                              qp,
+		ppsID:                           pps.PicParameterSetID,
+		numExtraSliceHeaderBits:         pps.NumExtraSliceHeaderBits,
+		outputFlagPresent:               pps.OutputFlagPresentFlag,
+		saoEnabled:                      sps.SampleAdaptiveOffsetEnabledFlag,
+		deblockingFilterControlPresent:  pps.DeblockingFilterControlPresentFlag,
+		deblockingFilterOverrideEnabled: pps.DeblockingFilterOverrideEnabledFlag,
+		deblockingFilterDisabled:        pps.DeblockingFilterDisabledFlag,
+		loopFilterAcrossSlicesEnabled:   pps.LoopFilterAcrossSlicesEnabledFlag,
+	}
+}
+
+// encodeIDRSliceWithParams generates an IDR slice RBSP respecting all header fields
+// from external SPS/PPS parameters.
+func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
+	w := NewBitWriter()
+
+	// === Slice header ===
+	w.WriteBit(1)      // first_slice_segment_in_pic_flag = 1
+	w.WriteBit(0)      // no_output_of_prior_pics_flag = 0 (IDR only)
+	w.WriteUE(p.ppsID) // slice_pic_parameter_set_id
+
+	// num_extra_slice_header_bits: skip N zero bits
+	for range p.numExtraSliceHeaderBits {
+		w.WriteBit(0)
+	}
+
+	w.WriteUE(2) // slice_type = 2 (I-slice)
+
+	// pic_output_flag (only if output_flag_present_flag)
+	if p.outputFlagPresent {
+		w.WriteBit(1) // pic_output_flag = 1
+	}
+
+	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set
+
+	// SAO flags
+	if p.saoEnabled {
+		w.WriteBit(0) // slice_sao_luma_flag = 0
+		w.WriteBit(0) // slice_sao_chroma_flag = 0
+	}
+
+	// slice_qp_delta = 0
+	w.WriteSE(0)
+
+	// Deblocking filter syntax
+	if p.deblockingFilterControlPresent {
+		if p.deblockingFilterOverrideEnabled {
+			w.WriteBit(0) // deblocking_filter_override_flag = 0
+		}
+		// Uses PPS default deblocking state (no per-slice override)
+	}
+
+	// slice_loop_filter_across_slices_enabled_flag
+	deblockActive := !p.deblockingFilterDisabled
+	if p.loopFilterAcrossSlicesEnabled && (p.saoEnabled || deblockActive) {
+		w.WriteBit(1) // slice_loop_filter_across_slices_enabled_flag = PPS default (1)
+	}
+
+	// byte_alignment
+	w.WriteBit(1)
+	for w.BitsWritten()%8 != 0 {
+		w.WriteBit(0)
+	}
+
+	headerBytes := w.Bytes()
+
+	// === Slice data (CABAC) ===
+	// IDR encoding only supports 16x16 CUs (CTU = minCb = 16)
+	cabacBytes := encodeIDRSliceData(p.width, p.height, p.qp, y, cb, cr)
+
+	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
+	result = append(result, headerBytes...)
+	result = append(result, cabacBytes...)
+	return result
+}
 
 // encodeIDRSlice generates the IDR slice RBSP (header + CABAC data).
 func encodeIDRSlice(width, height, qp int, y, cb, cr []uint8) []byte {
@@ -41,6 +140,7 @@ func encodeIDRSlice(width, height, qp int, y, cb, cr []uint8) []byte {
 }
 
 // encodeIDRSliceData encodes the CABAC slice data for an IDR I-slice.
+// ctuSize must be 16 (the only supported CU size for IDR encoding).
 func encodeIDRSliceData(width, height, qp int, y, cb, cr []uint8) []byte {
 	enc := cabac.NewEncoder()
 	models := context.InitModels(context.SliceTypeI, qp)
@@ -50,114 +150,14 @@ func encodeIDRSliceData(width, height, qp int, y, cb, cr []uint8) []byte {
 	numCTUy := (height + ctuSize - 1) / ctuSize
 	totalCTUs := numCTUx * numCTUy
 
-	// Reconstruction frame for neighbor prediction
 	reconFrame := frame.NewFrame(width, height)
-
-	// Track intra modes for MPM derivation (keyed by [ctuX/ctuSize, ctuY/ctuSize])
 	lumaModesMap := make(map[[2]int]int)
 
 	ctuIdx := 0
 	for ctuY := 0; ctuY < height; ctuY += ctuSize {
 		for ctuX := 0; ctuX < width; ctuX += ctuSize {
-			// No split_cu_flag (CTU = minCbSize, implicitly no split)
-			// No pred_mode_flag (I-slice, implicitly intra)
-
-			// part_mode: decoded when log2CbSize == log2MinCbSize
-			// bin=1 → 2Nx2N, bin=0 → NxN
-			enc.EncodeDecision(1, &models[context.CtxPartMode])
-
-			// Derive MPM for this CU
-			lumaMode := 1 // DC mode
-
-			mpm := deriveMPM(ctuX, ctuY, ctuSize, width, lumaModesMap)
-
-			// Encode intra luma mode
-			mpmIdx := -1
-			for i, m := range mpm {
-				if m == lumaMode {
-					mpmIdx = i
-					break
-				}
-			}
-
-			if mpmIdx >= 0 {
-				// prev_intra_luma_pred_flag = 1
-				enc.EncodeDecision(1, &models[context.CtxPrevIntraLumaPredFlag])
-				// mpm_idx: TU bypass bins (0, 10, 11)
-				switch mpmIdx {
-				case 0:
-					enc.EncodeBypass(0)
-				case 1:
-					enc.EncodeBypass(1)
-					enc.EncodeBypass(0)
-				case 2:
-					enc.EncodeBypass(1)
-					enc.EncodeBypass(1)
-				}
-			} else {
-				// prev_intra_luma_pred_flag = 0
-				enc.EncodeDecision(0, &models[context.CtxPrevIntraLumaPredFlag])
-				// rem_intra_luma_pred_mode: 5 bypass bins
-				rem := computeRemIntraLumaPredMode(lumaMode, mpm)
-				for k := 4; k >= 0; k-- {
-					enc.EncodeBypass(uint8((rem >> k) & 1))
-				}
-			}
-			lumaModesMap[[2]int{ctuX / ctuSize, ctuY / ctuSize}] = lumaMode
-
-			// intra_chroma_pred_mode = 4 (DM mode)
-			// First bin = 0 means "use DM mode"
-			enc.EncodeDecision(0, &models[context.CtxIntraChromaPredMode])
-
-			// Transform tree (no split, TU = CU = 16x16)
-			// cbf_cb at depth 0
-			cbfCb := hasNonZeroChroma(ctuX, ctuY, ctuSize, width, cb, qp, lumaMode, reconFrame, 0)
-			encBool(enc, &models[context.CtxCbfCb], cbfCb)
-
-			// cbf_cr at depth 0
-			cbfCr := hasNonZeroChroma(ctuX, ctuY, ctuSize, width, cr, qp, lumaMode, reconFrame, 1)
-			encBool(enc, &models[context.CtxCbfCr], cbfCr)
-
-			// Compute luma residual
-			lumaResidual, lumaLevels, cbfLuma := computeLumaResidual(
-				ctuX, ctuY, ctuSize, width, y, qp, lumaMode, reconFrame)
-
-			// cbf_luma at depth 0 (context = !trafoDepth = 1, so ctxIdx = CtxCbfLuma + 1)
-			encBool(enc, &models[context.CtxCbfLuma+1], cbfLuma)
-
-			// Encode residual if any cbf is set
-			if cbfLuma {
-				encodeResidualCoding(enc, models, lumaLevels, 4, true, 0)
-			}
-
-			// Reconstruct luma
-			reconstructLuma(reconFrame, ctuX, ctuY, ctuSize, width, height,
-				lumaMode, lumaResidual, cbfLuma, lumaLevels, qp)
-
-			// Encode and reconstruct chroma
-			chromaTrSize := ctuSize / 2
-			chromaMode := lumaMode // DM mode
-
-			for comp := range 2 {
-				var chromaSrc []uint8
-				if comp == 0 {
-					chromaSrc = cb
-				} else {
-					chromaSrc = cr
-				}
-				hasCbf := (comp == 0 && cbfCb) || (comp == 1 && cbfCr)
-
-				if hasCbf {
-					chromaLevels := computeChromaLevels(ctuX, ctuY, ctuSize, width,
-						chromaSrc, qp, chromaMode, reconFrame, comp)
-					encodeResidualCoding(enc, models, chromaLevels, 3, false, 0) // log2(8)=3
-					reconstructChroma(reconFrame, comp, ctuX/2, ctuY/2, chromaTrSize,
-						width/2, height/2, chromaMode, chromaLevels, qp)
-				} else {
-					reconstructChroma(reconFrame, comp, ctuX/2, ctuY/2, chromaTrSize,
-						width/2, height/2, chromaMode, nil, qp)
-				}
-			}
+			encodeIDRCU(enc, models, ctuX, ctuY, ctuSize, width, height, qp,
+				y, cb, cr, reconFrame, lumaModesMap)
 
 			// end_of_slice_segment_flag
 			ctuIdx++
@@ -170,6 +170,112 @@ func encodeIDRSliceData(width, height, qp int, y, cb, cr []uint8) []byte {
 	}
 
 	return enc.Flush()
+}
+
+// encodeIDRCU encodes a single 16x16 intra CU.
+func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
+	ctuX, ctuY, ctuSize, width, height, qp int,
+	y, cb, cr []uint8, reconFrame *frame.Frame, lumaModesMap map[[2]int]int) {
+
+	// No split_cu_flag (CTU = minCbSize = 16, implicitly no split)
+	// No pred_mode_flag (I-slice, implicitly intra)
+
+	// part_mode: decoded when log2CbSize == log2MinCbSize
+	// bin=1 → 2Nx2N, bin=0 → NxN
+	enc.EncodeDecision(1, &models[context.CtxPartMode])
+
+	// Derive MPM for this CU
+	lumaMode := 1 // DC mode
+
+	mpm := deriveMPM(ctuX, ctuY, ctuSize, width, lumaModesMap)
+
+	// Encode intra luma mode
+	mpmIdx := -1
+	for i, m := range mpm {
+		if m == lumaMode {
+			mpmIdx = i
+			break
+		}
+	}
+
+	if mpmIdx >= 0 {
+		// prev_intra_luma_pred_flag = 1
+		enc.EncodeDecision(1, &models[context.CtxPrevIntraLumaPredFlag])
+		// mpm_idx: TU bypass bins (0, 10, 11)
+		switch mpmIdx {
+		case 0:
+			enc.EncodeBypass(0)
+		case 1:
+			enc.EncodeBypass(1)
+			enc.EncodeBypass(0)
+		case 2:
+			enc.EncodeBypass(1)
+			enc.EncodeBypass(1)
+		}
+	} else {
+		// prev_intra_luma_pred_flag = 0
+		enc.EncodeDecision(0, &models[context.CtxPrevIntraLumaPredFlag])
+		// rem_intra_luma_pred_mode: 5 bypass bins
+		rem := computeRemIntraLumaPredMode(lumaMode, mpm)
+		for k := 4; k >= 0; k-- {
+			enc.EncodeBypass(uint8((rem >> k) & 1))
+		}
+	}
+	lumaModesMap[[2]int{ctuX / ctuSize, ctuY / ctuSize}] = lumaMode
+
+	// intra_chroma_pred_mode = 4 (DM mode)
+	// First bin = 0 means "use DM mode"
+	enc.EncodeDecision(0, &models[context.CtxIntraChromaPredMode])
+
+	// Transform tree (no split, TU = CU = 16x16)
+	// cbf_cb at depth 0
+	cbfCb := hasNonZeroChroma(ctuX, ctuY, ctuSize, width, cb, qp, lumaMode, reconFrame, 0)
+	encBool(enc, &models[context.CtxCbfCb], cbfCb)
+
+	// cbf_cr at depth 0
+	cbfCr := hasNonZeroChroma(ctuX, ctuY, ctuSize, width, cr, qp, lumaMode, reconFrame, 1)
+	encBool(enc, &models[context.CtxCbfCr], cbfCr)
+
+	// Compute luma residual
+	lumaResidual, lumaLevels, cbfLuma := computeLumaResidual(
+		ctuX, ctuY, ctuSize, width, y, qp, lumaMode, reconFrame)
+
+	// cbf_luma at depth 0 (context = !trafoDepth = 1, so ctxIdx = CtxCbfLuma + 1)
+	encBool(enc, &models[context.CtxCbfLuma+1], cbfLuma)
+
+	// Encode residual if any cbf is set
+	if cbfLuma {
+		encodeResidualCoding(enc, models, lumaLevels, 4, true, 0)
+	}
+
+	// Reconstruct luma
+	reconstructLuma(reconFrame, ctuX, ctuY, ctuSize, width, height,
+		lumaMode, lumaResidual, cbfLuma, lumaLevels, qp)
+
+	// Encode and reconstruct chroma
+	chromaTrSize := ctuSize / 2
+	chromaMode := lumaMode // DM mode
+
+	for comp := range 2 {
+		var chromaSrc []uint8
+		if comp == 0 {
+			chromaSrc = cb
+		} else {
+			chromaSrc = cr
+		}
+		hasCbf := (comp == 0 && cbfCb) || (comp == 1 && cbfCr)
+
+		if hasCbf {
+			chromaLevels := computeChromaLevels(ctuX, ctuY, ctuSize, width,
+				chromaSrc, qp, chromaMode, reconFrame, comp)
+			encodeResidualCoding(enc, models, chromaLevels, 3, false, 0) // log2(8)=3
+			reconstructChroma(reconFrame, comp, ctuX/2, ctuY/2, chromaTrSize,
+				width/2, height/2, chromaMode, chromaLevels, qp)
+		} else {
+			reconstructChroma(reconFrame, comp, ctuX/2, ctuY/2, chromaTrSize,
+				width/2, height/2, chromaMode, nil, qp)
+		}
+	}
 }
 
 func encBool(enc *cabac.Encoder, ctx *cabac.CtxState, val bool) {
@@ -524,38 +630,131 @@ func reconstructChroma(f *frame.Frame, comp, cx, cy, chromaTrSize, chromaW, chro
 	f.SetChromaBlock(comp, cx, cy, chromaTrSize, recon)
 }
 
+// pSkipSliceParams holds the parameters needed to write a P-skip slice header.
+type pSkipSliceParams struct {
+	width                             int
+	height                            int
+	qp                                int
+	poc                               int
+	ppsID                             uint32
+	numExtraSliceHeaderBits           uint8
+	outputFlagPresent                 bool
+	log2MaxPicOrderCntLsb             int // log2_max_pic_order_cnt_lsb_minus4 + 4
+	numShortTermRefPicSets            int
+	spsTemporalMvpEnabled             bool
+	saoEnabled                        bool
+	cabacInitPresent                  bool
+	sliceChromaQpOffsetsPresent       bool
+	deblockingFilterControlPresent    bool
+	deblockingFilterOverrideEnabled   bool
+	deblockingFilterDisabled          bool
+	loopFilterAcrossSlicesEnabled     bool
+	log2MinCodingBlockSizeMinus3      int
+	log2DiffMaxMinLumaCodingBlockSize int
+}
+
 // encodePSkipSlice generates a P-skip slice RBSP (header + CABAC data).
+// Uses the default encoder parameters: CTU=16, minCb=16.
 func encodePSkipSlice(width, height, qp, poc int) []byte {
+	return encodePSkipSliceWithParams(pSkipSliceParams{
+		width:                             width,
+		height:                            height,
+		qp:                                qp,
+		poc:                               poc,
+		log2MaxPicOrderCntLsb:             4,
+		log2MinCodingBlockSizeMinus3:      1, // minCb=16
+		log2DiffMaxMinLumaCodingBlockSize: 0, // CTU=16
+	})
+}
+
+// encodePSkipSliceWithParams generates a P-skip slice RBSP respecting all header fields.
+func encodePSkipSliceWithParams(p pSkipSliceParams) []byte {
 	w := NewBitWriter()
 
 	// === Slice header ===
-	w.WriteBit(1) // first_slice_segment_in_pic_flag = 1
-	w.WriteUE(0)  // slice_pic_parameter_set_id = 0
-	w.WriteUE(1)  // slice_type = 1 (P-slice)
+	w.WriteBit(1)      // first_slice_segment_in_pic_flag = 1
+	w.WriteUE(p.ppsID) // slice_pic_parameter_set_id
+	// num_extra_slice_header_bits: skip N zero bits
+	for range p.numExtraSliceHeaderBits {
+		w.WriteBit(0)
+	}
+	w.WriteUE(1) // slice_type = 1 (P-slice)
 
-	// pic_order_cnt_lsb: u(log2_max_pic_order_cnt_lsb) = u(4)
-	w.WriteBits(uint32(poc&0xF), 4)
+	// pic_output_flag (only if output_flag_present_flag)
+	if p.outputFlagPresent {
+		w.WriteBit(1) // pic_output_flag = 1
+	}
 
-	// short_term_ref_pic_set_sps_flag = 0 (inline)
-	w.WriteBit(0)
+	// pic_order_cnt_lsb: u(log2MaxPicOrderCntLsb) bits
+	pocBits := p.log2MaxPicOrderCntLsb
+	pocMask := (1 << pocBits) - 1
+	w.WriteBits(uint32(p.poc&pocMask), pocBits)
 
-	// Inline STRPS: num_short_term_ref_pic_sets=0, so stRpsIdx=0, no inter_ref_pic_set_prediction
-	w.WriteUE(1)  // num_negative_pics = 1
-	w.WriteUE(0)  // num_positive_pics = 0
-	w.WriteUE(0)  // delta_poc_s0_minus1 = 0 (deltaPOC = -1)
-	w.WriteBit(1) // used_by_curr_pic_s0_flag = 1
+	if p.numShortTermRefPicSets > 0 {
+		// short_term_ref_pic_set_sps_flag = 1, use SPS index 0
+		w.WriteBit(1)
+		if p.numShortTermRefPicSets > 1 {
+			// short_term_ref_pic_set_idx: u(ceil(log2(numShortTermRefPicSets)))
+			bits := ceilLog2(p.numShortTermRefPicSets)
+			w.WriteBits(0, bits) // index 0
+		}
+	} else {
+		// short_term_ref_pic_set_sps_flag = 0 (inline)
+		w.WriteBit(0)
+		// Inline STRPS: stRpsIdx=0, no inter_ref_pic_set_prediction
+		w.WriteUE(1)  // num_negative_pics = 1
+		w.WriteUE(0)  // num_positive_pics = 0
+		w.WriteUE(0)  // delta_poc_s0_minus1 = 0 (deltaPOC = -1)
+		w.WriteBit(1) // used_by_curr_pic_s0_flag = 1
+	}
 
-	// SAO disabled → no SAO flags
+	// slice_temporal_mvp_enabled_flag
+	if p.spsTemporalMvpEnabled {
+		w.WriteBit(1) // slice_temporal_mvp_enabled_flag = 1
+	}
+
+	// SAO flags
+	if p.saoEnabled {
+		w.WriteBit(0) // slice_sao_luma_flag = 0
+		w.WriteBit(0) // slice_sao_chroma_flag = 0
+	}
+
 	// num_ref_idx_active_override_flag = 0
 	w.WriteBit(0)
 
-	// cabac_init_flag: not present (cabac_init_present_flag=0 in PPS)
+	// cabac_init_flag (only if cabac_init_present_flag)
+	if p.cabacInitPresent {
+		w.WriteBit(0) // cabac_init_flag = 0
+	}
 
 	// five_minus_max_num_merge_cand = 4 (maxMergeCand = 1)
 	w.WriteUE(4)
 
 	// slice_qp_delta = 0
 	w.WriteSE(0)
+
+	// chroma QP offsets (only if pps_slice_chroma_qp_offsets_present_flag)
+	if p.sliceChromaQpOffsetsPresent {
+		w.WriteSE(0) // slice_cb_qp_offset = 0
+		w.WriteSE(0) // slice_cr_qp_offset = 0
+	}
+
+	// Deblocking filter syntax
+	if p.deblockingFilterControlPresent {
+		if p.deblockingFilterOverrideEnabled {
+			w.WriteBit(0) // deblocking_filter_override_flag = 0
+		}
+		// Uses PPS default deblocking state (no per-slice override)
+	}
+
+	// slice_loop_filter_across_slices_enabled_flag
+	// Present when PPS has loop_filter_across_slices_enabled and
+	// (SAO or deblocking is active in this slice).
+	// With SAO flags=0 and no deblock override, deblocking uses PPS default.
+	deblockActive := !p.deblockingFilterDisabled
+	if p.loopFilterAcrossSlicesEnabled && (p.saoEnabled || deblockActive) {
+		w.WriteBit(1) // slice_loop_filter_across_slices_enabled_flag = PPS default (1)
+	}
 
 	// byte_alignment
 	w.WriteBit(1)
@@ -566,7 +765,11 @@ func encodePSkipSlice(width, height, qp, poc int) []byte {
 	headerBytes := w.Bytes()
 
 	// === Slice data (CABAC) ===
-	cabacBytes := encodePSkipSliceData(width, height, qp)
+	// Derive CTU and min CB sizes from SPS parameters
+	log2MinCbSize := p.log2MinCodingBlockSizeMinus3 + 3
+	ctuLog2 := log2MinCbSize + p.log2DiffMaxMinLumaCodingBlockSize
+	ctuSize := 1 << ctuLog2
+	cabacBytes := encodePSkipSliceData(p.width, p.height, p.qp, ctuSize, log2MinCbSize)
 
 	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
 	result = append(result, headerBytes...)
@@ -575,26 +778,39 @@ func encodePSkipSlice(width, height, qp, poc int) []byte {
 }
 
 // encodePSkipSliceData encodes the CABAC slice data for a P-skip slice.
-func encodePSkipSliceData(width, height, qp int) []byte {
+// log2MinCbSize is the minimum coding block size (log2). When ctuSize > minCbSize,
+// split_cu_flag=0 must be written at each quadtree level before cu_skip_flag.
+func encodePSkipSliceData(width, height, qp, ctuSize, log2MinCbSize int) []byte {
 	enc := cabac.NewEncoder()
 	models := context.InitModels(context.SliceTypeP, qp)
-
-	ctuSize := 16
 	numCTUx := (width + ctuSize - 1) / ctuSize
 	numCTUy := (height + ctuSize - 1) / ctuSize
 	totalCTUs := numCTUx * numCTUy
 
+	log2CtuSize := 0
+	for s := ctuSize; s > 1; s >>= 1 {
+		log2CtuSize++
+	}
+
 	ctuIdx := 0
 	for ctuY := 0; ctuY < height; ctuY += ctuSize {
 		for ctuX := 0; ctuX < width; ctuX += ctuSize {
+			// Write split_cu_flag=0 when CTU > minCB to signal no quadtree split.
+			// Context for split_cu_flag: ctxInc = condL + condA.
+			// For all-skip with no splits, neighbor depths are always 0 (CTU level),
+			// same as current depth, so condL=condA=0, ctxInc=0.
+			if log2CtuSize > log2MinCbSize {
+				enc.EncodeDecision(0, &models[context.CtxSplitCuFlag]) // split_cu_flag = 0
+			}
+
 			// cu_skip_flag = 1
-			// Context: ctxInc from left + above availability
+			// Context: ctxInc from left + above skip CU availability
 			ctxInc := 0
 			if ctuX > 0 {
-				ctxInc++ // left available
+				ctxInc++ // left available and is skip
 			}
 			if ctuY > 0 {
-				ctxInc++ // above available
+				ctxInc++ // above available and is skip
 			}
 			enc.EncodeDecision(1, &models[context.CtxCuSkipFlag+ctxInc])
 
@@ -611,6 +827,17 @@ func encodePSkipSliceData(width, height, qp int) []byte {
 	}
 
 	return enc.Flush()
+}
+
+// ceilLog2 returns ceil(log2(n)) for n >= 1.
+func ceilLog2(n int) int {
+	bits := 0
+	v := n - 1
+	for v > 0 {
+		v >>= 1
+		bits++
+	}
+	return bits
 }
 
 func chromaQPFromLumaQP(qpY int) int {

@@ -2,8 +2,10 @@ package encode
 
 import (
 	"bytes"
+	"fmt"
 
 	"github.com/Eyevinn/hi264/pkg/yuv"
+	"github.com/Eyevinn/mp4ff/hevc"
 )
 
 // EncodeParams holds parameters for HEVC encoding.
@@ -54,6 +56,85 @@ func EncodePSkipFrame(p EncodeParams, poc int) ([]byte, error) {
 	WriteNALU(&buf, naluTrailR, encodePSkipSlice(p.Width, p.Height, qp, poc))
 
 	return buf.Bytes(), nil
+}
+
+// EncodeIDRSliceFromSPSPPS encodes an IDR I-slice compatible with external SPS/PPS.
+// y, cb, cr are raw pixel planes in raster scan order (4:2:0).
+// Returns Annex-B framed IDR_W_RADL NALU.
+func EncodeIDRSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, y, cb, cr []uint8) ([]byte, error) {
+	if err := validateSPSPPSForIDR(sps, pps); err != nil {
+		return nil, err
+	}
+
+	p := idrSliceParamsFromSPSPPS(sps, pps)
+	var buf bytes.Buffer
+	WriteNALU(&buf, naluIDRWRadl, encodeIDRSliceWithParams(p, y, cb, cr))
+	return buf.Bytes(), nil
+}
+
+// EncodePSkipSliceFromSPSPPS encodes a P-skip slice compatible with external SPS/PPS.
+// Returns Annex-B framed TRAIL_R NALU.
+func EncodePSkipSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) ([]byte, error) {
+	if err := validateSPSPPS(sps, pps); err != nil {
+		return nil, err
+	}
+
+	p := pSkipSliceParamsFromSPSPPS(sps, pps, poc)
+	var buf bytes.Buffer
+	WriteNALU(&buf, naluTrailR, encodePSkipSliceWithParams(p))
+	return buf.Bytes(), nil
+}
+
+func validateSPSPPS(sps *hevc.SPS, pps *hevc.PPS) error {
+	if pps.TilesEnabledFlag {
+		return fmt.Errorf("tiles not supported")
+	}
+	if pps.DependentSliceSegmentsEnabledFlag {
+		return fmt.Errorf("dependent slice segments not supported")
+	}
+	if pps.WeightedPredFlag {
+		return fmt.Errorf("weighted prediction not supported")
+	}
+	return nil
+}
+
+func validateSPSPPSForIDR(sps *hevc.SPS, pps *hevc.PPS) error {
+	if err := validateSPSPPS(sps, pps); err != nil {
+		return err
+	}
+	// IDR encoding only supports 16x16 CUs (log2MinCb=4, log2Diff=0 → CTU=16)
+	log2MinCbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3
+	ctuLog2 := log2MinCbSize + int(sps.Log2DiffMaxMinLumaCodingBlockSize)
+	ctuSize := 1 << ctuLog2
+	if ctuSize != 16 {
+		return fmt.Errorf("IDR encoding only supports CTU size 16, got %d", ctuSize)
+	}
+	return nil
+}
+
+func pSkipSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) pSkipSliceParams {
+	qp := 26 + int(pps.InitQpMinus26) // slice_qp_delta = 0
+	return pSkipSliceParams{
+		width:                             int(sps.PicWidthInLumaSamples),
+		height:                            int(sps.PicHeightInLumaSamples),
+		qp:                                qp,
+		poc:                               poc,
+		ppsID:                             pps.PicParameterSetID,
+		numExtraSliceHeaderBits:           pps.NumExtraSliceHeaderBits,
+		outputFlagPresent:                 pps.OutputFlagPresentFlag,
+		log2MaxPicOrderCntLsb:             int(sps.Log2MaxPicOrderCntLsbMinus4) + 4,
+		numShortTermRefPicSets:            int(sps.NumShortTermRefPicSets),
+		spsTemporalMvpEnabled:             sps.SpsTemporalMvpEnabledFlag,
+		saoEnabled:                        sps.SampleAdaptiveOffsetEnabledFlag,
+		cabacInitPresent:                  pps.CabacInitPresentFlag,
+		sliceChromaQpOffsetsPresent:       pps.SliceChromaQpOffsetsPresentFlag,
+		deblockingFilterControlPresent:    pps.DeblockingFilterControlPresentFlag,
+		deblockingFilterOverrideEnabled:   pps.DeblockingFilterOverrideEnabledFlag,
+		deblockingFilterDisabled:          pps.DeblockingFilterDisabledFlag,
+		loopFilterAcrossSlicesEnabled:     pps.LoopFilterAcrossSlicesEnabledFlag,
+		log2MinCodingBlockSizeMinus3:      int(sps.Log2MinLumaCodingBlockSizeMinus3),
+		log2DiffMaxMinLumaCodingBlockSize: int(sps.Log2DiffMaxMinLumaCodingBlockSize),
+	}
 }
 
 // FrameEncoder provides grid-based HEVC encoding using hi264's yuv package.
@@ -114,6 +195,24 @@ func (e *FrameEncoder) EncodePSkipSlice(poc int) ([]byte, error) {
 	var buf bytes.Buffer
 	WriteNALU(&buf, naluTrailR, encodePSkipSlice(e.frameWidth(), e.frameHeight(), e.qp(), poc))
 	return buf.Bytes(), nil
+}
+
+// EncodeIDRSliceFromSPSPPS produces an Annex-B IDR slice compatible with external SPS/PPS.
+func (e *FrameEncoder) EncodeIDRSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) ([]byte, error) {
+	f, err := yuv.BuildFrame(e.Grid, e.Colors)
+	if err != nil {
+		return nil, err
+	}
+	w := e.frameWidth()
+	h := e.frameHeight()
+	f.Width = w
+	f.Height = h
+	return EncodeIDRSliceFromSPSPPS(sps, pps, f.Y, f.Cb, f.Cr)
+}
+
+// EncodePSkipSliceFromSPSPPS produces an Annex-B P-skip slice compatible with external SPS/PPS.
+func (e *FrameEncoder) EncodePSkipSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) ([]byte, error) {
+	return EncodePSkipSliceFromSPSPPS(sps, pps, poc)
 }
 
 // VPSNALUs returns the raw VPS NALU (with 2-byte header, no start code) for MP4.

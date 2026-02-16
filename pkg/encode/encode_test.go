@@ -1,7 +1,11 @@
 package encode
 
 import (
+	"os"
 	"testing"
+
+	"github.com/Eyevinn/mp4ff/avc"
+	"github.com/Eyevinn/mp4ff/hevc"
 
 	"github.com/Eyevinn/hi265/pkg/decoder"
 )
@@ -164,6 +168,368 @@ func TestEncodePSkip(t *testing.T) {
 	}
 }
 
+// TestEncodeIDRFromSPSPPS tests that EncodeIDRSliceFromSPSPPS generates a valid
+// IDR slice by parsing SPS/PPS from an encoder-generated stream, then using the
+// new API to produce a compatible IDR frame.
+func TestEncodeIDRFromSPSPPS(t *testing.T) {
+	width, height := 16, 16
+	qp := 26
+
+	y := makeUniform(width*height, 16)
+	cb := makeUniform(width/2*height/2, 128)
+	cr := makeUniform(width/2*height/2, 128)
+
+	// Encode IDR frame (includes VPS+SPS+PPS+IDR) to get parameter sets
+	idrBytes, err := EncodeIDRFrame(EncodeParams{Width: width, Height: height, QP: qp}, y, cb, cr)
+	if err != nil {
+		t.Fatalf("EncodeIDRFrame: %v", err)
+	}
+
+	// Extract NALUs and parse SPS/PPS
+	nalus := avc.ExtractNalusFromByteStream(idrBytes)
+	spsMap := make(map[uint32]*hevc.SPS)
+	var vpsNALU []byte
+	var spsNALU []byte
+	var ppsNALU []byte
+	var sps *hevc.SPS
+	var pps *hevc.PPS
+
+	for _, nalu := range nalus {
+		if len(nalu) < 2 {
+			continue
+		}
+		naluType := hevc.GetNaluType(nalu[0])
+		switch naluType {
+		case hevc.NALU_VPS:
+			vpsNALU = nalu
+		case hevc.NALU_SPS:
+			spsNALU = nalu
+			sps, err = hevc.ParseSPSNALUnit(nalu)
+			if err != nil {
+				t.Fatalf("ParseSPSNALUnit: %v", err)
+			}
+			spsMap[uint32(sps.SpsID)] = sps
+		case hevc.NALU_PPS:
+			ppsNALU = nalu
+			pps, err = hevc.ParsePPSNALUnit(nalu, spsMap)
+			if err != nil {
+				t.Fatalf("ParsePPSNALUnit: %v", err)
+			}
+		}
+	}
+
+	if sps == nil || pps == nil {
+		t.Fatal("failed to parse SPS/PPS from encoded stream")
+	}
+
+	// Generate IDR slice using external SPS/PPS
+	idrSliceBytes, err := EncodeIDRSliceFromSPSPPS(sps, pps, y, cb, cr)
+	if err != nil {
+		t.Fatalf("EncodeIDRSliceFromSPSPPS: %v", err)
+	}
+
+	// Build stream: VPS+SPS+PPS + new IDR slice
+	idrNalus := avc.ExtractNalusFromByteStream(idrSliceBytes)
+	allNalus := [][]byte{vpsNALU, spsNALU, ppsNALU}
+	allNalus = append(allNalus, idrNalus...)
+
+	dec := decoder.New()
+	frames, err := dec.DecodeNALUs(allNalus)
+	if err != nil {
+		t.Fatalf("DecodeNALUs: %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("expected 1 frame, got %d", len(frames))
+	}
+
+	// Verify decoded pixels match input (±1 for quantization)
+	f := frames[0]
+	for i, v := range f.Y[:width*height] {
+		if abs(int(v)-16) > 1 {
+			t.Fatalf("Y[%d] = %d, want 16 (±1)", i, v)
+		}
+	}
+	for i, v := range f.Cb[:width/2*height/2] {
+		if abs(int(v)-128) > 1 {
+			t.Fatalf("Cb[%d] = %d, want 128 (±1)", i, v)
+		}
+	}
+	for i, v := range f.Cr[:width/2*height/2] {
+		if abs(int(v)-128) > 1 {
+			t.Fatalf("Cr[%d] = %d, want 128 (±1)", i, v)
+		}
+	}
+}
+
+// TestEncodeIDRAndPSkipFromSPSPPS tests the full workflow: encode IDR + P-skip
+// both using external SPS/PPS from an initial encoder stream.
+func TestEncodeIDRAndPSkipFromSPSPPS(t *testing.T) {
+	width, height := 32, 32
+	qp := 26
+
+	y := makeUniform(width*height, 16)
+	cb := makeUniform(width/2*height/2, 128)
+	cr := makeUniform(width/2*height/2, 128)
+
+	// Encode IDR frame to get parameter sets
+	idrBytes, err := EncodeIDRFrame(EncodeParams{Width: width, Height: height, QP: qp}, y, cb, cr)
+	if err != nil {
+		t.Fatalf("EncodeIDRFrame: %v", err)
+	}
+
+	// Extract NALUs and parse SPS/PPS
+	nalus := avc.ExtractNalusFromByteStream(idrBytes)
+	spsMap := make(map[uint32]*hevc.SPS)
+	var vpsNALU []byte
+	var spsNALU []byte
+	var ppsNALU []byte
+	var sps *hevc.SPS
+	var pps *hevc.PPS
+
+	for _, nalu := range nalus {
+		if len(nalu) < 2 {
+			continue
+		}
+		naluType := hevc.GetNaluType(nalu[0])
+		switch naluType {
+		case hevc.NALU_VPS:
+			vpsNALU = nalu
+		case hevc.NALU_SPS:
+			spsNALU = nalu
+			sps, err = hevc.ParseSPSNALUnit(nalu)
+			if err != nil {
+				t.Fatalf("ParseSPSNALUnit: %v", err)
+			}
+			spsMap[uint32(sps.SpsID)] = sps
+		case hevc.NALU_PPS:
+			ppsNALU = nalu
+			pps, err = hevc.ParsePPSNALUnit(nalu, spsMap)
+			if err != nil {
+				t.Fatalf("ParsePPSNALUnit: %v", err)
+			}
+		}
+	}
+
+	// Generate IDR using external SPS/PPS
+	idrSliceBytes, err := EncodeIDRSliceFromSPSPPS(sps, pps, y, cb, cr)
+	if err != nil {
+		t.Fatalf("EncodeIDRSliceFromSPSPPS: %v", err)
+	}
+
+	// Generate P-skip using external SPS/PPS
+	pSkipBytes, err := EncodePSkipSliceFromSPSPPS(sps, pps, 1)
+	if err != nil {
+		t.Fatalf("EncodePSkipSliceFromSPSPPS: %v", err)
+	}
+
+	// Build stream: VPS+SPS+PPS + IDR + P-skip
+	idrNalus := avc.ExtractNalusFromByteStream(idrSliceBytes)
+	pNalus := avc.ExtractNalusFromByteStream(pSkipBytes)
+	allNalus := [][]byte{vpsNALU, spsNALU, ppsNALU}
+	allNalus = append(allNalus, idrNalus...)
+	allNalus = append(allNalus, pNalus...)
+
+	dec := decoder.New()
+	frames, err := dec.DecodeNALUs(allNalus)
+	if err != nil {
+		t.Fatalf("DecodeNALUs: %v", err)
+	}
+	if len(frames) != 2 {
+		t.Fatalf("expected 2 frames, got %d", len(frames))
+	}
+
+	// P-frame should be pixel-exact copy of IDR
+	idrFrame := frames[0]
+	pFrame := frames[1]
+	for i := range width * height {
+		if idrFrame.Y[i] != pFrame.Y[i] {
+			t.Fatalf("P-frame Y[%d] = %d, want %d (IDR)", i, pFrame.Y[i], idrFrame.Y[i])
+		}
+	}
+}
+
+// TestEncodePSkipFromSPSPPS tests that EncodePSkipSliceFromSPSPPS generates a valid
+// P-skip slice by parsing SPS/PPS from an encoder-generated stream, then using the
+// new API to produce a compatible P-skip frame.
+func TestEncodePSkipFromSPSPPS(t *testing.T) {
+	width, height := 16, 16
+	qp := 26
+
+	y := makeUniform(width*height, 16)
+	cb := makeUniform(width/2*height/2, 128)
+	cr := makeUniform(width/2*height/2, 128)
+
+	// Encode IDR frame (includes VPS+SPS+PPS+IDR)
+	idrBytes, err := EncodeIDRFrame(EncodeParams{Width: width, Height: height, QP: qp}, y, cb, cr)
+	if err != nil {
+		t.Fatalf("EncodeIDRFrame: %v", err)
+	}
+
+	// Extract NALUs and parse SPS/PPS
+	nalus := avc.ExtractNalusFromByteStream(idrBytes)
+	spsMap := make(map[uint32]*hevc.SPS)
+	var vpsNALU []byte
+	var spsNALU []byte
+	var ppsNALU []byte
+	var idrNALU []byte
+	var sps *hevc.SPS
+	var pps *hevc.PPS
+
+	for _, nalu := range nalus {
+		if len(nalu) < 2 {
+			continue
+		}
+		naluType := hevc.GetNaluType(nalu[0])
+		switch naluType {
+		case hevc.NALU_VPS:
+			vpsNALU = nalu
+		case hevc.NALU_SPS:
+			spsNALU = nalu
+			sps, err = hevc.ParseSPSNALUnit(nalu)
+			if err != nil {
+				t.Fatalf("ParseSPSNALUnit: %v", err)
+			}
+			spsMap[uint32(sps.SpsID)] = sps
+		case hevc.NALU_PPS:
+			ppsNALU = nalu
+			pps, err = hevc.ParsePPSNALUnit(nalu, spsMap)
+			if err != nil {
+				t.Fatalf("ParsePPSNALUnit: %v", err)
+			}
+		case hevc.NALU_IDR_W_RADL, hevc.NALU_IDR_N_LP:
+			idrNALU = nalu
+		}
+	}
+
+	if sps == nil || pps == nil {
+		t.Fatal("failed to parse SPS/PPS from encoded stream")
+	}
+
+	// Generate P-skip slice using the new API
+	pSkipBytes, err := EncodePSkipSliceFromSPSPPS(sps, pps, 1)
+	if err != nil {
+		t.Fatalf("EncodePSkipSliceFromSPSPPS: %v", err)
+	}
+
+	// Build stream: reuse original VPS+SPS+PPS+IDR, append new P-skip
+	dec := decoder.New()
+	frames, err := dec.DecodeNALUs([][]byte{vpsNALU, spsNALU, ppsNALU, idrNALU})
+	if err != nil {
+		t.Fatalf("DecodeNALUs (IDR): %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("expected 1 IDR frame, got %d", len(frames))
+	}
+
+	// Now decode the P-skip NALU
+	pNalus := avc.ExtractNalusFromByteStream(pSkipBytes)
+	pFrames, err := dec.DecodeNALUs(pNalus)
+	if err != nil {
+		t.Fatalf("DecodeNALUs (P-skip): %v", err)
+	}
+	if len(pFrames) != 1 {
+		t.Fatalf("expected 1 P-skip frame, got %d", len(pFrames))
+	}
+
+	// P-frame should be pixel-exact copy of IDR
+	idrFrame := frames[0]
+	pFrame := pFrames[0]
+	for i := range width * height {
+		if idrFrame.Y[i] != pFrame.Y[i] {
+			t.Fatalf("P-frame Y[%d] = %d, want %d (IDR)", i, pFrame.Y[i], idrFrame.Y[i])
+		}
+	}
+	for i := range width / 2 * height / 2 {
+		if idrFrame.Cb[i] != pFrame.Cb[i] {
+			t.Fatalf("P-frame Cb[%d] = %d, want %d (IDR)", i, pFrame.Cb[i], idrFrame.Cb[i])
+		}
+		if idrFrame.Cr[i] != pFrame.Cr[i] {
+			t.Fatalf("P-frame Cr[%d] = %d, want %d (IDR)", i, pFrame.Cr[i], idrFrame.Cr[i])
+		}
+	}
+}
+
+// TestEncodePSkipFromSPSPPS_x265 tests compatibility with an x265-generated bitstream.
+// It parses SPS/PPS from an existing test bitstream and generates a P-skip slice.
+func TestEncodePSkipFromSPSPPS_x265(t *testing.T) {
+	// Use an x265-generated test bitstream
+	testFiles := []string{
+		"../../testdata/gray_2frames_128x64.265",
+	}
+
+	for _, tf := range testFiles {
+		t.Run(tf, func(t *testing.T) {
+			data, err := readTestFile(tf)
+			if err != nil {
+				t.Skipf("test file not available: %v", err)
+			}
+
+			nalus := avc.ExtractNalusFromByteStream(data)
+			spsMap := make(map[uint32]*hevc.SPS)
+			var sps *hevc.SPS
+			var pps *hevc.PPS
+
+			for _, nalu := range nalus {
+				if len(nalu) < 2 {
+					continue
+				}
+				naluType := hevc.GetNaluType(nalu[0])
+				switch naluType {
+				case hevc.NALU_SPS:
+					sps, err = hevc.ParseSPSNALUnit(nalu)
+					if err != nil {
+						t.Fatalf("ParseSPSNALUnit: %v", err)
+					}
+					spsMap[uint32(sps.SpsID)] = sps
+				case hevc.NALU_PPS:
+					pps, err = hevc.ParsePPSNALUnit(nalu, spsMap)
+					if err != nil {
+						t.Fatalf("ParsePPSNALUnit: %v", err)
+					}
+				}
+			}
+
+			if sps == nil || pps == nil {
+				t.Fatal("failed to parse SPS/PPS from test bitstream")
+			}
+
+			// Generate P-skip slice - should not error
+			_, err = EncodePSkipSliceFromSPSPPS(sps, pps, 2)
+			if err != nil {
+				t.Fatalf("EncodePSkipSliceFromSPSPPS: %v", err)
+			}
+
+			// Concatenate original stream + new P-skip and decode all
+			pSkipBytes, _ := EncodePSkipSliceFromSPSPPS(sps, pps, 2)
+			stream := make([]byte, 0, len(data)+len(pSkipBytes))
+			stream = append(stream, data...)
+			stream = append(stream, pSkipBytes...)
+
+			dec := decoder.New()
+			frames, err := dec.DecodeAnnexB(stream)
+			if err != nil {
+				t.Fatalf("DecodeAnnexB: %v", err)
+			}
+
+			// Should have original frames + 1 P-skip frame
+			if len(frames) < 2 {
+				t.Fatalf("expected at least 2 frames, got %d", len(frames))
+			}
+
+			// Last frame (P-skip) should match previous frame (pixel-exact copy)
+			prev := frames[len(frames)-2]
+			pSkip := frames[len(frames)-1]
+			w := int(sps.PicWidthInLumaSamples)
+			h := int(sps.PicHeightInLumaSamples)
+			for i := range w * h {
+				if prev.Y[i] != pSkip.Y[i] {
+					t.Fatalf("P-skip Y[%d] = %d, want %d (previous frame)", i, pSkip.Y[i], prev.Y[i])
+				}
+			}
+		})
+	}
+}
+
 // TestEncodeTwoColor32x32 tests encoding a 32x32 frame with high-contrast content
 // (left half Y=235, right half Y=16). This exercises multi-CTU encoding with
 // significant residual coefficients. Quantization at QP=26 introduces loss;
@@ -223,6 +589,10 @@ func TestEncodeTwoColor32x32(t *testing.T) {
 				i, diff, expected, actual, maxAllowed)
 		}
 	}
+}
+
+func readTestFile(path string) ([]byte, error) {
+	return os.ReadFile(path)
 }
 
 func makeUniform(n int, val uint8) []uint8 {
