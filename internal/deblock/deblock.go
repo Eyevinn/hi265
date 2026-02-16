@@ -53,9 +53,22 @@ func Apply(f *frame.Frame, cus []slice.CodingUnit, sliceQPY, betaOffset, tcOffse
 	gridH := (picH + 3) / 4
 	edgeFlags := make([]byte, gridW*gridH)
 
+	// Build per-4x4-block QP map
+	qpMap := make([]int, gridW*gridH)
+	for i := range qpMap {
+		qpMap[i] = sliceQPY
+	}
+
 	for _, cu := range cus {
 		cuSize := 1 << cu.Log2CbSize
 		markEdges(edgeFlags, gridW, gridH, cu.X0, cu.Y0, cuSize, cuSize, picW, picH)
+
+		// Fill QP map with per-CU QP
+		for y := cu.Y0 / 4; y < (cu.Y0+cuSize)/4 && y < gridH; y++ {
+			for x := cu.X0 / 4; x < (cu.X0+cuSize)/4 && x < gridW; x++ {
+				qpMap[y*gridW+x] = cu.QpY
+			}
+		}
 
 		for _, tu := range cu.TransformUnits {
 			trSize := 1 << tu.Log2TrSize
@@ -64,10 +77,10 @@ func Apply(f *frame.Frame, cus []slice.CodingUnit, sliceQPY, betaOffset, tcOffse
 	}
 
 	// Pass 1: Filter vertical edges (left-to-right, top-to-bottom)
-	filterEdges(f, edgeFlags, gridW, gridH, sliceQPY, betaOffset, tcOffset, true)
+	filterEdges(f, edgeFlags, gridW, gridH, qpMap, betaOffset, tcOffset, true)
 
 	// Pass 2: Filter horizontal edges (top-to-bottom, left-to-right)
-	filterEdges(f, edgeFlags, gridW, gridH, sliceQPY, betaOffset, tcOffset, false)
+	filterEdges(f, edgeFlags, gridW, gridH, qpMap, betaOffset, tcOffset, false)
 }
 
 // markEdges sets edge flags for a block at (x0,y0) with given width/height.
@@ -87,7 +100,7 @@ func markEdges(edgeFlags []byte, gridW, gridH, x0, y0, w, h, _, _ int) {
 }
 
 // filterEdges filters all edges in one direction.
-func filterEdges(f *frame.Frame, edgeFlags []byte, gridW, gridH, sliceQPY, betaOffset, tcOffset int, vertical bool) {
+func filterEdges(f *frame.Frame, edgeFlags []byte, gridW, gridH int, qpMap []int, betaOffset, tcOffset int, vertical bool) {
 	picW := f.Width
 	picH := f.Height
 
@@ -120,7 +133,16 @@ func filterEdges(f *frame.Frame, edgeFlags []byte, gridW, gridH, sliceQPY, betaO
 			// For I-slice, Bs = 2
 			bs := 2
 
-			qPL := sliceQPY
+			// QP is average of P and Q blocks
+			qpQ := qpMap[gy*gridW+gx]
+			var qpP int
+			if vertical {
+				qpP = qpMap[gy*gridW+(gx-1)]
+			} else {
+				qpP = qpMap[(gy-1)*gridW+gx]
+			}
+			qPL := (qpP + qpQ + 1) >> 1
+
 			betaIdx := clip3(0, 51, qPL+betaOffset)
 			tcIdx := clip3(0, 53, qPL+2*(bs-1)+tcOffset)
 			beta := betaTable[betaIdx]
@@ -163,7 +185,14 @@ func filterEdges(f *frame.Frame, edgeFlags []byte, gridW, gridH, sliceQPY, betaO
 			}
 
 			bs := 2
-			qPL := sliceQPY
+			qpQ := qpMap[gy*gridW+gx]
+			var qpP int
+			if vertical {
+				qpP = qpMap[gy*gridW+(gx-1)]
+			} else {
+				qpP = qpMap[(gy-1)*gridW+gx]
+			}
+			qPL := (qpP + qpQ + 1) >> 1
 			qPC := chromaQPFromLuma(qPL)
 			tcIdx := clip3(0, 53, qPC+2*(bs-1)+tcOffset)
 			tC := tcTable[tcIdx]

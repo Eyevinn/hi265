@@ -162,6 +162,10 @@ func TestDecodeSinCosSao128x64(t *testing.T) {
 	testGolden(t, "../../testdata/sincos_sao_128x64.265", "../../testdata/golden/sincos_sao_128x64.yuv", 128, 64)
 }
 
+func TestDecodeSinCosCRF32_128x64(t *testing.T) {
+	testGolden(t, "../../testdata/sincos_crf32_128x64.265", "../../testdata/golden/sincos_crf32_128x64.yuv", 128, 64)
+}
+
 func TestDecodeGray2Frames128x64(t *testing.T) {
 	testGoldenFrames(t, "../../testdata/gray_2frames_128x64.265", "../../testdata/golden/gray_2frames_128x64.yuv", 128, 64, 2)
 }

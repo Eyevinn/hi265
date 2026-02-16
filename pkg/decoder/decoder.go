@@ -218,6 +218,8 @@ func (d *Decoder) decodeIDR(nalu []byte) (*frame.Frame, error) {
 		TransformSkipEnabled:            pps.TransformSkipEnabledFlag,
 		SaoLuma:                         sliceSaoLuma,
 		SaoChroma:                       sliceSaoChroma,
+		CuQpDeltaEnabled:                pps.CuQpDeltaEnabledFlag,
+		Log2MinCuQpDeltaSize:            log2CtbSize - int(pps.DiffCuQpDeltaDepth),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("decode slice data: %w", err)
@@ -446,6 +448,8 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 		TransformSkipEnabled:            pps.TransformSkipEnabledFlag,
 		SaoLuma:                         sliceSaoLuma,
 		SaoChroma:                       sliceSaoChroma,
+		CuQpDeltaEnabled:                pps.CuQpDeltaEnabledFlag,
+		Log2MinCuQpDeltaSize:            log2CtbSize - int(pps.DiffCuQpDeltaDepth),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("decode P-slice data: %w", err)
@@ -520,7 +524,7 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 
 			var residual []int32
 			if tu.CbfLuma {
-				dequantCoeffs := transform.Dequantize(tu.LumaCoeffs, trSize, sliceQPY)
+				dequantCoeffs := transform.Dequantize(tu.LumaCoeffs, trSize, cu.QpY)
 				if tu.TransformSkipLuma {
 					residual = transform.TransformSkipShift(dequantCoeffs, tu.Log2TrSize, bitDepth)
 				} else if trSize == 4 {
@@ -554,7 +558,7 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 				chromaMode = 34
 			}
 
-			chromaQP := chromaQPFromLumaQP(sliceQPY)
+			chromaQP := chromaQPFromLumaQP(cu.QpY)
 
 			for comp := range 2 {
 				var chromaCoeffs []int32

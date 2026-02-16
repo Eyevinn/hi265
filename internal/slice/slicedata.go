@@ -17,6 +17,7 @@ type CodingUnit struct {
 	PartMode   int // for intra: 0=2Nx2N, 1=NxN
 	SkipFlag   bool
 	MergeIdx   int
+	QpY        int // resolved luma QP for this CU
 	IntraLumaMode  [4]int // up to 4 PUs for NxN
 	IntraChromaMode int
 	// Residual data per TU
@@ -67,7 +68,15 @@ type Params struct {
 	TransformSkipEnabled            bool
 	SaoLuma                         bool
 	SaoChroma                       bool
+	CuQpDeltaEnabled                bool
+	Log2MinCuQpDeltaSize            int // log2CtbSize - DiffCuQpDeltaDepth
 	Trace                           bool
+}
+
+// qpState tracks mutable QP state across the quantization group.
+type qpState struct {
+	currentQP        int  // current QP (starts at sliceQPY)
+	isCuQpDeltaCoded bool // whether cu_qp_delta has been decoded for current QG
 }
 
 // DecodeSliceData decodes the slice data segment using CABAC.
@@ -91,6 +100,8 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 	numCTUs := ctbsX * ctbsY
 	sd.SaoParams = make([]SaoParams, numCTUs)
 
+	qps := &qpState{currentQP: p.SliceQPY}
+
 	for ctbAddrRS := 0; ctbAddrRS < numCTUs; ctbAddrRS++ {
 		ctbX := (ctbAddrRS % ctbsX) * ctbSize
 		ctbY := (ctbAddrRS / ctbsX) * ctbSize
@@ -100,7 +111,7 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 			sd.SaoParams[ctbAddrRS] = decodeSaoParams(dec, ctxModels, ctbX, ctbY, ctbsX, ctbAddrRS, sd.SaoParams, p.SaoLuma, p.SaoChroma)
 		}
 
-		cus, err := decodeCodingQuadtree(dec, ctxModels, ctbX, ctbY, p.Log2CtbSize, 0, &p, modeMap, depthMap)
+		cus, err := decodeCodingQuadtree(dec, ctxModels, ctbX, ctbY, p.Log2CtbSize, 0, &p, modeMap, depthMap, qps)
 		if err != nil {
 			return nil, fmt.Errorf("CTU (%d,%d): %w", ctbX, ctbY, err)
 		}
@@ -227,7 +238,12 @@ func decodeSaoOffsetAbs(dec *cabac.Decoder) int {
 
 // decodeCodingQuadtree recursively splits the CTU into CUs.
 func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
-	x0, y0, log2CbSize, depth int, p *Params, modeMap *intraModeMap, depthMap *cuDepthMap) ([]CodingUnit, error) {
+	x0, y0, log2CbSize, depth int, p *Params, modeMap *intraModeMap, depthMap *cuDepthMap, qps *qpState) ([]CodingUnit, error) {
+
+	// QG boundary reset per HEVC spec 7.3.8.4: at start of coding_quadtree
+	if p.CuQpDeltaEnabled && log2CbSize >= p.Log2MinCuQpDeltaSize {
+		qps.isCuQpDeltaCoded = false
+	}
 
 	split := false
 	if log2CbSize > p.Log2MinCbSize {
@@ -263,7 +279,7 @@ func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 		for _, pos := range positions {
 			if pos[0] < p.PicWidth && pos[1] < p.PicHeight {
 				cus, err := decodeCodingQuadtree(dec, ctx, pos[0], pos[1],
-					newLog2CbSize, depth+1, p, modeMap, depthMap)
+					newLog2CbSize, depth+1, p, modeMap, depthMap, qps)
 				if err != nil {
 					return nil, err
 				}
@@ -278,7 +294,7 @@ func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	depthMap.set(x0, y0, cuSize, depth)
 
 	// Decode coding unit
-	cu, err := decodeCodingUnit(dec, ctx, x0, y0, log2CbSize, p, modeMap)
+	cu, err := decodeCodingUnit(dec, ctx, x0, y0, log2CbSize, p, modeMap, qps)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +303,7 @@ func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 
 // decodeCodingUnit decodes a single CU.
 func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
-	x0, y0, log2CbSize int, p *Params, modeMap *intraModeMap) (CodingUnit, error) {
+	x0, y0, log2CbSize int, p *Params, modeMap *intraModeMap, qps *qpState) (CodingUnit, error) {
 
 	cu := CodingUnit{
 		X0:         x0,
@@ -336,6 +352,7 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 			}
 			// Store mode in map (use DC as placeholder for intra mode map)
 			modeMap.set(x0, y0, cbSize, 1)
+			cu.QpY = qps.currentQP
 			return cu, nil
 		}
 	}
@@ -428,13 +445,17 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 		cu.IntraChromaMode = chromaModes[chromaIdx]
 	}
 
+	// IntraSplitFlag: set when intra CU uses NxN partition mode
+	intraSplitFlag := cu.PartMode == 1 // SIZE_NxN
+
 	// Decode transform tree
 	tus, err := decodeTransformTree(dec, ctx, x0, y0, x0, y0, log2CbSize, log2CbSize,
-		0, cbSize, true, true, p, cu.IntraLumaMode, x0, y0)
+		0, cbSize, true, true, p, cu.IntraLumaMode, x0, y0, qps, intraSplitFlag)
 	if err != nil {
 		return cu, err
 	}
 	cu.TransformUnits = tus
+	cu.QpY = qps.currentQP
 
 	return cu, nil
 }
@@ -443,26 +464,25 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	x0, y0, xBase, yBase int, log2TrafoSize, log2CbSize int,
 	trafoDepth, cbSize int, cbfCb, cbfCr bool, p *Params,
-	lumaIntraModes [4]int, cuX0, cuY0 int) ([]TransformUnit, error) {
+	lumaIntraModes [4]int, cuX0, cuY0 int, qps *qpState, intraSplitFlag bool) ([]TransformUnit, error) {
 
 	log2MaxTrafoSize := p.Log2MaxTrafoSize
 	log2MinTrafoSize := p.Log2MinTrafoSize
 	maxTrafoDepth := p.MaxTransformHierarchyDepthIntra
+	if intraSplitFlag {
+		maxTrafoDepth++
+	}
 
 	split := false
-	if dec.Trace {
-		fmt.Printf("  [TT] check split: log2TrSize=%d max=%d min=%d depth=%d/%d cond=%v,%v,%v,%v\n",
-			log2TrafoSize, log2MaxTrafoSize, log2MinTrafoSize, trafoDepth, maxTrafoDepth,
-			log2TrafoSize <= log2MaxTrafoSize, log2TrafoSize > log2MinTrafoSize,
-			trafoDepth < maxTrafoDepth, log2TrafoSize > 2)
-	}
 	if log2TrafoSize <= log2MaxTrafoSize &&
 		log2TrafoSize > log2MinTrafoSize &&
 		trafoDepth < maxTrafoDepth &&
+		!(intraSplitFlag && trafoDepth == 0) &&
 		log2TrafoSize > 2 {
 		splitFlag := dec.DecodeDecision(&ctx[context.CtxSplitTransformFlag+int(5-log2TrafoSize)])
 		split = splitFlag == 1
-	} else if log2TrafoSize > log2MaxTrafoSize {
+	} else if log2TrafoSize > log2MaxTrafoSize ||
+		(intraSplitFlag && trafoDepth == 0) {
 		split = true
 	}
 
@@ -494,7 +514,7 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 		for _, pos := range positions {
 			tus, err := decodeTransformTree(dec, ctx, pos[0], pos[1], x0, y0,
 				newLog2TrafoSize, log2CbSize, trafoDepth+1, cbSize,
-				cbfCb, cbfCr, p, lumaIntraModes, cuX0, cuY0)
+				cbfCb, cbfCr, p, lumaIntraModes, cuX0, cuY0, qps, intraSplitFlag)
 			if err != nil {
 				return nil, err
 			}
@@ -519,6 +539,13 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	}
 	cbfLumaFlag := dec.DecodeDecision(&ctx[context.CtxCbfLuma+cbfLumaCtx])
 	tu.CbfLuma = cbfLumaFlag == 1
+
+	// Decode cu_qp_delta if enabled and not yet coded for this QG
+	if p.CuQpDeltaEnabled && !qps.isCuQpDeltaCoded && (tu.CbfLuma || cbfCb || cbfCr) {
+		delta := decodeCuQpDelta(dec, ctx)
+		qps.currentQP = clip3(-12, 51, qps.currentQP+delta)
+		qps.isCuQpDeltaCoded = true
+	}
 
 	// Parse transform_skip_flag for 4x4 TUs when enabled
 	if p.TransformSkipEnabled && log2TrafoSize == 2 {
@@ -733,9 +760,14 @@ func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
 			startPos = lastScanPos - 1
 		}
 
+		// implicitNonZeroCoeff: for middle sub-blocks (coded_sub_block_flag
+		// explicitly decoded), if no sig_coeff at positions 1..15, position 0
+		// is implicitly significant without decoding a CABAC bin.
+		implicitNonZeroCoeff := (i > 0 && i < lastSubBlock)
+
 		for n := startPos; n >= 0; n-- {
 			// sig_coeff_flag
-			if n > 0 || codedSubBlock {
+			if n > 0 || !implicitNonZeroCoeff {
 				cx := coeffScanOrder[n][0]
 				cy := coeffScanOrder[n][1]
 				sigCtx := getSigCtxInc(cx, cy, log2TrafoSize, isLuma, sbX, sbY, scanIdx, prevCsbf)
@@ -746,11 +778,15 @@ func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
 						lastScanPosInSb = n
 					}
 					firstScanPos = n
+					implicitNonZeroCoeff = false
 				}
 			} else {
 				// DC coefficient of coded sub-block is always significant
 				sigFlags[0] = true
 				firstScanPos = 0
+				if lastScanPosInSb < 0 {
+					lastScanPosInSb = 0
+				}
 			}
 		}
 
@@ -971,6 +1007,54 @@ func decodeAbsLevelRemaining(dec *cabac.Decoder, cRiceParam int) int32 {
 	suffixLen := prefix - 3 + cRiceParam
 	suffix := int32(dec.ReadBypassU(suffixLen))
 	return (((int32(1) << uint(prefix-3)) + 3 - 1) << uint(cRiceParam)) + suffix
+}
+
+// decodeCuQpDelta decodes cu_qp_delta_abs and cu_qp_delta_sign_flag per HEVC spec 9.3.3.5.
+func decodeCuQpDelta(dec *cabac.Decoder, ctx []cabac.CtxState) int {
+	// prefix: up to 5 context-coded bins
+	prefix := 0
+	inc := 0
+	for prefix < 5 {
+		bin := dec.DecodeDecision(&ctx[context.CtxCuQpDeltaAbs+inc])
+		if bin == 0 {
+			break
+		}
+		prefix++
+		inc = 1
+	}
+	// suffix: bypass Exp-Golomb if prefix >= 5
+	suffix := 0
+	if prefix >= 5 {
+		k := 0
+		for dec.DecodeBypass() == 1 {
+			suffix += 1 << k
+			k++
+		}
+		for k > 0 {
+			k--
+			suffix += int(dec.DecodeBypass()) << k
+		}
+	}
+	abs := prefix + suffix
+	if abs == 0 {
+		return 0
+	}
+	// sign
+	sign := dec.DecodeBypass()
+	if sign == 1 {
+		return -abs
+	}
+	return abs
+}
+
+func clip3(lo, hi, val int) int {
+	if val < lo {
+		return lo
+	}
+	if val > hi {
+		return hi
+	}
+	return val
 }
 
 // getSigCtxInc returns the context index for sig_coeff_flag.

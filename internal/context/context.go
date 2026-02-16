@@ -55,9 +55,11 @@ const (
 	CtxSaoTypeIdx = 166
 	// merge_idx: 1 context (unused in I-slice)
 	CtxMergeIdx = 167
+	// cu_qp_delta_abs: 2 contexts
+	CtxCuQpDeltaAbs = 168
 
 	// Total context count
-	NumContextModels = 168
+	NumContextModels = 170
 )
 
 // CNU is "Context Not Used" — default initValue for unused contexts.
@@ -170,6 +172,9 @@ func init() {
 	idx = CtxMergeIdx
 	// merge_idx (1): unused in I-slice
 	initValuesISlice[idx] = cnu
+	idx = CtxCuQpDeltaAbs
+	// cu_qp_delta_abs (2)
+	copy(initValuesISlice[idx:], []uint8{154, 154})
 
 	// === P-slice init values (from FFmpeg hevc_cabac.c, init_type=1) ===
 	idx = CtxSplitCuFlag
@@ -225,6 +230,8 @@ func init() {
 	initValuesPSlice[idx] = 185
 	idx = CtxMergeIdx
 	initValuesPSlice[idx] = 122
+	idx = CtxCuQpDeltaAbs
+	copy(initValuesPSlice[idx:], []uint8{154, 154})
 }
 
 // InitModels initializes CABAC context models for the given slice type and QP.

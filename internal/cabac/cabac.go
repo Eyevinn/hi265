@@ -65,8 +65,6 @@ func (d *Decoder) renormalize() {
 // DecodeDecision decodes a single binary decision using the given context model
 // (section 9.3.3.2.1).
 func (d *Decoder) DecodeDecision(ctx *CtxState) uint8 {
-	origPState := ctx.PStateIdx
-	origMPS := ctx.ValMPS
 	qCodIRangeIdx := (d.codIRange >> 6) & 3
 	codIRangeLPS := rangeTabLPS[ctx.PStateIdx][qCodIRangeIdx]
 	d.codIRange -= codIRangeLPS
@@ -91,8 +89,8 @@ func (d *Decoder) DecodeDecision(ctx *CtxState) uint8 {
 	d.renormalize()
 	d.binCount++
 	if d.Trace {
-		fmt.Printf("CABAC[%d] Decision ctx(pState=%d,mps=%d) → %d range=%d offset=%d\n",
-			d.binCount, origPState, origMPS, binVal, d.codIRange, d.codIOffset)
+		fmt.Printf("CABAC[%d] Decision → %d range=%d offset=%d\n",
+			d.binCount, binVal, d.codIRange, d.codIOffset)
 	}
 	return binVal
 }
