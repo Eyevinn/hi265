@@ -38,13 +38,15 @@ func main() {
 	}
 
 	dec := decoder.New()
-	f, err := dec.DecodeAnnexB(data)
+	frames, err := dec.DecodeAnnexB(data)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Decode error: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Decoded %dx%d frame\n", f.Width, f.Height)
+	fmt.Printf("Decoded %d frame(s)\n", len(frames))
+	f := frames[len(frames)-1] // use last frame for output
+	fmt.Printf("Last frame: %dx%d\n", f.Width, f.Height)
 
 	if *outPath == "" {
 		// Default: replace extension with .yuv
@@ -54,7 +56,12 @@ func main() {
 	ext := strings.ToLower(filepath.Ext(*outPath))
 	switch ext {
 	case ".yuv":
-		err = os.WriteFile(*outPath, f.YUV420Bytes(), 0644)
+		// Write all frames concatenated
+		var yuvData []byte
+		for _, fr := range frames {
+			yuvData = append(yuvData, fr.YUV420Bytes()...)
+		}
+		err = os.WriteFile(*outPath, yuvData, 0644)
 	case ".png":
 		err = writePNG(*outPath, f.Y, f.Cb, f.Cr, f.Width, f.Height, f.StrideY, f.StrideC)
 	default:

@@ -105,6 +105,15 @@ func (f *Frame) SetChromaBlock(comp int, x0, y0, size int, block []int32) {
 	}
 }
 
+// SetLumaDecoded marks a square region as decoded without setting pixel values.
+func (f *Frame) SetLumaDecoded(x0, y0, size int) {
+	for y := y0; y < y0+size && y < f.Height; y++ {
+		for x := x0; x < x0+size && x < f.Width; x++ {
+			f.LumaDecoded[y*f.StrideY+x] = true
+		}
+	}
+}
+
 // YUV420Bytes returns the frame data in I420 planar format (Y, then U, then V).
 func (f *Frame) YUV420Bytes() []byte {
 	lumaSize := f.Width * f.Height

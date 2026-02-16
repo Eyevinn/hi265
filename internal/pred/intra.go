@@ -210,3 +210,129 @@ type Neighbors struct {
 	Left      []uint8 // left neighbor samples [0..2*size-1]
 	TopLeft   uint8   // top-left corner sample
 }
+
+// FilterRefSamples applies the HEVC spec 8.4.4.2.3 reference sample filtering
+// in-place. filterFlag depends on mode, block size, and component type.
+// strongSmooth enables strong intra smoothing for 32x32 luma (SPS flag).
+func FilterRefSamples(n *Neighbors, mode, size int, isLuma bool, strongSmooth bool) {
+	if n == nil || size <= 4 {
+		return
+	}
+
+	// DC mode (1): never filter
+	if mode == 1 {
+		return
+	}
+
+	// Planar mode (0): always filter for size >= 8
+	filterFlag := false
+	if mode == 0 {
+		filterFlag = true
+	} else {
+		// Angular modes: check distance from horizontal (10) and vertical (26)
+		distH := mode - 10
+		if distH < 0 {
+			distH = -distH
+		}
+		distV := mode - 26
+		if distV < 0 {
+			distV = -distV
+		}
+		minDist := distH
+		if distV < minDist {
+			minDist = distV
+		}
+
+		// Table 8-3: intraHorVerDistThres
+		var thresh int
+		switch size {
+		case 8:
+			thresh = 7
+		case 16:
+			thresh = 1
+		case 32:
+			thresh = 0
+		default:
+			return // shouldn't happen for valid HEVC
+		}
+		filterFlag = minDist > thresh
+	}
+
+	if !filterFlag {
+		return
+	}
+
+	nS := 2 * size // number of reference samples on each side
+
+	// Strong intra smoothing: bilinear interpolation for 32x32 luma
+	if strongSmooth && isLuma && size == 32 {
+		threshold := 1 << 3 // 1 << (BitDepthY - 5) for 8-bit
+		topLeft := int(n.TopLeft)
+		topRight := int(n.Top[nS-1])  // p[63][-1]
+		bottomLeft := int(n.Left[nS-1]) // p[-1][63]
+
+		topMid := int(n.Top[size-1])  // p[31][-1]
+		leftMid := int(n.Left[size-1]) // p[-1][31]
+
+		topSmooth := abs(topLeft+topRight-2*topMid) < threshold
+		leftSmooth := abs(topLeft+bottomLeft-2*leftMid) < threshold
+
+		if topSmooth && leftSmooth {
+			// Bilinear interpolation
+			filtTop := make([]uint8, nS)
+			filtLeft := make([]uint8, nS)
+			for i := 0; i < nS-1; i++ {
+				filtTop[i] = uint8(clip3(0, 255, (topLeft*(nS-1-i)+(i+1)*topRight+size)/(nS)))
+				filtLeft[i] = uint8(clip3(0, 255, (topLeft*(nS-1-i)+(i+1)*bottomLeft+size)/(nS)))
+			}
+			filtTop[nS-1] = n.Top[nS-1]
+			filtLeft[nS-1] = n.Left[nS-1]
+			copy(n.Top, filtTop)
+			copy(n.Left, filtLeft)
+			// TopLeft stays unchanged
+			return
+		}
+	}
+
+	// Regular 3-tap [1,2,1] filter
+	filtTop := make([]uint8, nS)
+	filtLeft := make([]uint8, nS)
+
+	// Corner: pF[-1][-1] = (p[-1][0] + 2*p[-1][-1] + p[0][-1] + 2) >> 2
+	filtTopLeft := uint8((int(n.Left[0]) + 2*int(n.TopLeft) + int(n.Top[0]) + 2) >> 2)
+
+	// Top row: pF[x][-1] = (p[x-1][-1] + 2*p[x][-1] + p[x+1][-1] + 2) >> 2
+	filtTop[0] = uint8((int(n.TopLeft) + 2*int(n.Top[0]) + int(n.Top[1]) + 2) >> 2)
+	for i := 1; i < nS-1; i++ {
+		filtTop[i] = uint8((int(n.Top[i-1]) + 2*int(n.Top[i]) + int(n.Top[i+1]) + 2) >> 2)
+	}
+	filtTop[nS-1] = n.Top[nS-1] // last sample unfiltered
+
+	// Left column: pF[-1][y] = (p[-1][y-1] + 2*p[-1][y] + p[-1][y+1] + 2) >> 2
+	filtLeft[0] = uint8((int(n.TopLeft) + 2*int(n.Left[0]) + int(n.Left[1]) + 2) >> 2)
+	for i := 1; i < nS-1; i++ {
+		filtLeft[i] = uint8((int(n.Left[i-1]) + 2*int(n.Left[i]) + int(n.Left[i+1]) + 2) >> 2)
+	}
+	filtLeft[nS-1] = n.Left[nS-1] // last sample unfiltered
+
+	n.TopLeft = filtTopLeft
+	copy(n.Top, filtTop)
+	copy(n.Left, filtLeft)
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func clip3(lo, hi, val int) int {
+	if val < lo {
+		return lo
+	}
+	if val > hi {
+		return hi
+	}
+	return val
+}

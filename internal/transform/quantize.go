@@ -5,6 +5,26 @@ package transform
 // Indexed by QP % 6.
 var levelScale = [6]int{40, 45, 51, 57, 64, 72}
 
+// TransformSkipShift applies the additional dequantization shift needed for transform skip mode.
+// After normal Dequantize(), transform skip coefficients need this fixed bit-depth shift
+// instead of the inverse DCT/DST. Per HEVC spec / FFmpeg hevcdsp dequant():
+// shift = 15 - bitDepth - log2TrafoSize
+func TransformSkipShift(coeffs []int32, log2TrafoSize, bitDepth int) []int32 {
+	out := make([]int32, len(coeffs))
+	shift := 15 - bitDepth - log2TrafoSize
+	if shift > 0 {
+		offset := int32(1) << uint(shift-1)
+		for i, c := range coeffs {
+			out[i] = (c + offset) >> uint(shift)
+		}
+	} else {
+		for i, c := range coeffs {
+			out[i] = c << uint(-shift)
+		}
+	}
+	return out
+}
+
 // Dequantize performs HEVC inverse quantization on a block of transform coefficients.
 // size is the block dimension (4, 8, 16, 32).
 // qp is the quantization parameter.
