@@ -246,6 +246,71 @@ grid, _ := yuv.ParseGrid("AB,CD")
 colors := yuv.ColorMap{'A': yuv.Color{16, 128, 128}, 'B': yuv.Color{128, 128, 128}}
 enc := &encode.FrameEncoder{Grid: grid, Colors: colors, QP: 26}
 annexB, err = enc.Encode()
+
+// Encode IDR and P-skip slices compatible with external SPS/PPS
+// (e.g., parameter sets from an MP4 sample description or third-party encoder)
+sps, _ := hevc.ParseSPSNALUnit(spsNALU)
+pps, _ := hevc.ParsePPSNALUnit(ppsNALU, spsMap)
+idrSlice, err := encode.EncodeIDRSliceFromSPSPPS(sps, pps, yPlane, cbPlane, crPlane)
+pSkipSlice, err := encode.EncodePSkipSliceFromSPSPPS(sps, pps, poc)
+```
+
+### Appending frames to an existing bitstream
+
+This example parses VPS/SPS/PPS from an existing HEVC bitstream, then appends
+a black IDR frame and a P-skip frame that are compatible with the original
+parameter sets:
+
+```go
+import (
+    "github.com/Eyevinn/mp4ff/avc"
+    "github.com/Eyevinn/mp4ff/hevc"
+    "github.com/Eyevinn/hi265/pkg/encode"
+)
+
+// Parse parameter sets from the existing bitstream
+nalus := avc.ExtractNalusFromByteStream(existingStream)
+spsMap := make(map[uint32]*hevc.SPS)
+var sps *hevc.SPS
+var pps *hevc.PPS
+for _, nalu := range nalus {
+    if len(nalu) < 2 {
+        continue
+    }
+    switch hevc.GetNaluType(nalu[0]) {
+    case hevc.NALU_SPS:
+        sps, _ = hevc.ParseSPSNALUnit(nalu)
+        spsMap[uint32(sps.SpsID)] = sps
+    case hevc.NALU_PPS:
+        pps, _ = hevc.ParsePPSNALUnit(nalu, spsMap)
+    }
+}
+
+// Create a black frame, using the color range from the SPS VUI.
+// Black is range-dependent (Y=16 limited, Y=0 full) but independent of
+// color primaries. For non-black content, use sps.VUI.MatrixCoefficients
+// to select the correct RGB-to-YCbCr conversion (1=BT.709, 6=BT.601, 9=BT.2020).
+w := int(sps.PicWidthInLumaSamples)
+h := int(sps.PicHeightInLumaSamples)
+blackY := uint8(16)  // limited range black
+if sps.VUI != nil && sps.VUI.VideoFullRangeFlag {
+    blackY = 0       // full range black
+}
+y := make([]uint8, w*h)
+cb := make([]uint8, w/2*h/2)
+cr := make([]uint8, w/2*h/2)
+for i := range y { y[i] = blackY }
+for i := range cb { cb[i] = 128; cr[i] = 128 }
+
+// Encode a black IDR slice using the existing parameter sets
+idrSlice, _ := encode.EncodeIDRSliceFromSPSPPS(sps, pps, y, cb, cr)
+
+// Encode a P-skip slice (copies the IDR frame unchanged)
+pSkipSlice, _ := encode.EncodePSkipSliceFromSPSPPS(sps, pps, 2) // POC=2
+
+// Append to the original stream
+stream := append(existingStream, idrSlice...)
+stream = append(stream, pSkipSlice...)
 ```
 
 ## Architecture
