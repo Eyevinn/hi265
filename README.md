@@ -1,0 +1,235 @@
+![Logo](images/logo.png)
+
+![Test](https://github.com/Eyevinn/hi265/workflows/Go/badge.svg)
+[![Coverage Status](https://coveralls.io/repos/github/Eyevinn/hi265/badge.svg?branch=main)](https://coveralls.io/github/Eyevinn/hi265?branch=main)
+[![Go Reference](https://pkg.go.dev/badge/github.com/Eyevinn/hi265.svg)](https://pkg.go.dev/github.com/Eyevinn/hi265)
+[![Go Report Card](https://goreportcard.com/badge/github.com/Eyevinn/hi265)](https://goreportcard.com/report/github.com/Eyevinn/hi265)
+[![license](https://img.shields.io/github/license/Eyevinn/hi265.svg)](https://github.com/Eyevinn/hi265/blob/main/LICENSE)
+[![Badge OSC](https://img.shields.io/badge/Evaluate-24243B?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTIiIGZpbGw9InVybCgjcGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyKSIvPgo8Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI3IiBzdHJva2U9ImJsYWNrIiBzdHJva2Utd2lkdGg9IjIiLz4KPGRlZnM+CjxsaW5lYXJHcmFkaWVudCBpZD0icGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyIiB4MT0iMTIiIHkxPSIwIiB4Mj0iMTIiIHkyPSIyNCIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPgo8c3RvcCBzdG9wLWNvbG9yPSIjQzE4M0ZGIi8+CjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzREQzlGRiIvPgo8L2xpbmVhckdyYWRpZW50Pgo8L2RlZnM+Cjwvc3ZnPgo=)](https://app.osaas.io/browse/eyevinn-mp4ff)
+
+## Pure Go HEVC/H.265 Frame Decoder & Bitstream Generator
+
+A pure Go HEVC/H.265 decoder for IDR and P-skip frames, plus a bitstream
+generator for producing valid HEVC test content from flat-color 16x16 CTU
+patterns. Sister project to [hi264](https://github.com/Eyevinn/hi264) (H.264/AVC).
+
+This is **not** a general-purpose video encoder — it does not accept arbitrary
+pixel input or perform motion estimation. The encoder produces intra DC
+prediction frames where each CTU is a single flat color, defined by a grid
+pattern. This is useful for generating test bitstreams, color bars, frame
+counters, and reference content for decoder verification.
+
+All processing is 8-bit 4:2:0 only (no 10-bit or 4:2:2/4:4:4 support).
+
+Pixel-perfect match with FFmpeg decoding across 16+ golden test cases covering
+SAO, sign hiding, transform skip, deblocking, P-frames, varied QP ranges, and
+complex content.
+
+## Build & Test
+
+```bash
+go build ./...
+go test ./...
+```
+
+## CLI Tools
+
+### hi265dec — Decode HEVC from raw .265 Annex-B
+
+```bash
+# Decode HEVC Annex-B to raw YUV
+go run ./cmd/hi265dec input.265 output.yuv
+```
+
+### hi265gen — HEVC bitstream generator for test content
+
+Generates valid HEVC/H.265 bitstreams from grid-based patterns. Each character
+in a grid maps to one 16x16 CTU filled with a single flat color, encoded as
+intra with DC prediction. This is not a general-purpose encoder — it produces
+test content from color patterns, not from arbitrary video frames.
+
+Output formats: Annex-B `.265`/`.hevc`, fragmented MP4 `.mp4`, Y4M `.y4m`, raw
+YUV `.yuv`, PNG `.png`, or JPEG `.jpg`. Multi-frame sequences use P-skip frames
+between IDR keyframes to copy the reference frame unchanged. Raw image formats
+(YUV, PNG, JPEG) output the grid pattern directly without HEVC encoding, useful
+as reference images for decoder verification.
+
+The grid and color systems are shared with
+[hi264](https://github.com/Eyevinn/hi264) via its `pkg/yuv` package, so the
+same `.gridimg` files and color specs work with both tools.
+
+```bash
+# Grid-only: single IDR frame from grid pattern (frame size = grid size)
+go run ./cmd/hi265gen -f examples/logo.gridimg -o logo.265
+go run ./cmd/hi265gen -grid "xy,yx" -c x=235,128,128 -c y=16,128,128 -o checker.265
+go run ./cmd/hi265gen -grid "ab" -c a=255,0,0 -c b=0,0,255 -rgb -qp 20 -o test.265
+
+# Counter: frame counter digits on solid background
+go run ./cmd/hi265gen -w 192 -h 96 -n 10 -digits 3 -o counter.265
+
+# With P-skip frames (IDR every 50 frames, P-skip copies between)
+go run ./cmd/hi265gen -w 192 -h 96 -n 100 -digits 3 -idr-interval 50 -o counter.265
+
+# Fragmented MP4 output (25 fps default, fragment every 25 frames)
+go run ./cmd/hi265gen -w 192 -h 96 -n 50 -digits 3 -o counter.mp4
+
+# MP4 with custom framerate and fragment duration
+go run ./cmd/hi265gen -w 320 -h 240 -n 75 -digits 3 -fps 30 -frag-dur 30 -o counter.mp4
+
+# Tiled: grid pattern tiled to fill custom dimensions, with optional counter
+go run ./cmd/hi265gen -grid "xy,yx" -c x=235,128,128 -c y=16,128,128 -w 192 -h 96 -n 10 -digits 3 -o counter.265
+
+# SMPTE color bars with counter overlay
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 10 -digits 3 -o smpte.265
+
+# SMPTE bars with digit background box and explicit scale
+go run ./cmd/hi265gen -smpte -w 352 -h 288 -n 1 -digits 2 -digit-scale 3 -digit-bg 0,0,0 -o smpte_big.265
+
+# Fixed bytes per picture (pad with HEVC filler NALUs for CBR-like streams)
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -bpp 5000 -o padded.265
+go run ./cmd/hi265gen -w 320 -h 240 -n 50 -digits 3 -bpp 8000 -o cbr_counter.mp4
+
+# Raw image output (no HEVC encoding, useful as decoder reference)
+go run ./cmd/hi265gen -f examples/logo.gridimg -o logo.png
+go run ./cmd/hi265gen -f examples/logo.gridimg -o logo.yuv
+go run ./cmd/hi265gen -f examples/logo.gridimg -q 95 -o logo.jpg
+go run ./cmd/hi265gen -w 192 -h 96 -n 5 -digits 3 -o output.y4m
+go run ./cmd/hi265gen -w 192 -h 96 -n 5 -digits 3 -o frame_%03d.png
+```
+
+```bash
+# Color space: generate BT.709 stream (VUI signaled in SPS)
+go run ./cmd/hi265gen -f examples/logo.gridimg -colorspace bt709 -o logo_709.265
+
+# Full-range BT.709
+go run ./cmd/hi265gen -smpte -w 320 -h 240 -colorspace bt709 -full-range -o smpte_709.265
+```
+
+Flags: `-f` (image file), `-grid`, `-c` (repeatable), `-rgb`, `-smpte` (SMPTE color bars),
+`-w` (width), `-h` (height), `-n` (frame count, default 1), `-digits` (counter digits, default 0),
+`-digit-scale` (0=auto), `-digit-bg` (R,G,B for digit box),
+`-fg` (R,G,B), `-bg` (R,G,B), `-qp` (0-51), `-q` (JPEG quality),
+`-idr-interval` (0=all-IDR), `-bpp` (bytes per picture),
+`-colorspace` (`bt601`/`bt709`/`bt2020`, default `bt601`), `-full-range`,
+`-fps` (MP4 framerate, default 25), `-frag-dur` (MP4 fragment duration in frames, default 25), `-o`
+
+### Constant bitrate testing with `-bpp`
+
+The `-bpp` flag pads each picture to an exact byte count using HEVC filler data
+NAL units (NAL type 38). This is useful for testing bitrate-sensitive scenarios
+such as ABR ladder switching, buffer management, and segment size constraints.
+
+The target bitrate in kbit/s is: `bpp * 8 * fps / 1000`. For example, `-bpp 5000`
+at 25 fps gives 1000 kbit/s. An error is returned if a frame's encoded slice
+already exceeds the target (use a higher QP or larger `-bpp` value).
+
+```bash
+# 500 kbit/s tier — green background
+go run ./cmd/hi265gen -w 320 -h 240 -n 50 -digits 3 -bg 0,128,0 -bpp 2500 -o low.mp4
+
+# 1500 kbit/s tier — blue background
+go run ./cmd/hi265gen -w 640 -h 360 -n 50 -digits 3 -bg 0,0,200 -bpp 7500 -o mid.mp4
+
+# 3000 kbit/s tier — red background
+go run ./cmd/hi265gen -w 1280 -h 720 -n 50 -digits 3 -bg 200,0,0 -bpp 15000 -o high.mp4
+```
+
+## Image File Format
+
+The `.gridimg` format combines color definitions and a grid layout in one file.
+This format is shared with [hi264](https://github.com/Eyevinn/hi264) — the same
+files work with both `hi264gen` and `hi265gen`.
+
+```
+# Comments start with #
+@rgb
+@bt709
+# Colors: char=v1,v2,v3 (YCbCr by default, RGB with @rgb directive or -rgb flag)
+B=0,106,167
+Y=254,204,0
+
+BBBBBYYBBBBBBBBB
+BBBBBYYBBBBBBBBB
+YYYYYYYYYYYYYYYY
+YYYYYYYYYYYYYYYY
+BBBBBYYBBBBBBBBB
+BBBBBYYBBBBBBBBB
+```
+
+Each character in the grid maps to one 16x16 CTU. Supported directives:
+`@rgb` (treat values as RGB), `@bt601`/`@bt709`/`@bt2020` (color space for
+RGB-to-YCbCr conversion).
+
+## Library Usage
+
+The `pkg/` packages provide a public API for use as a Go library. Implementation
+details are in `internal/` and not accessible to external callers.
+
+```go
+import (
+    "github.com/Eyevinn/hi265/pkg/decoder"
+    "github.com/Eyevinn/hi265/pkg/encode"
+    "github.com/Eyevinn/hi264/pkg/yuv"
+)
+
+// Decode an Annex-B byte stream (e.g. .265 file contents)
+dec := decoder.New()
+frames, err := dec.DecodeAnnexB(data)
+
+// Generate HEVC test bitstream from raw YUV planes
+p := encode.EncodeParams{Width: 320, Height: 240, QP: 26}
+annexB, err := encode.EncodeIDRFrame(p, yPlane, cbPlane, crPlane)
+
+// Generate HEVC from grid pattern (uses hi264's yuv package)
+grid, _ := yuv.ParseGrid("AB,CD")
+colors := yuv.ColorMap{'A': yuv.Color{16, 128, 128}, 'B': yuv.Color{128, 128, 128}}
+enc := &encode.FrameEncoder{Grid: grid, Colors: colors, QP: 26}
+annexB, err = enc.Encode()
+```
+
+## Architecture
+
+```
+pkg/decoder/       — Public: top-level decoder API (DecodeAnnexB)
+pkg/encode/        — Public: bitstream generator API (IDR + P-skip encoder, FrameEncoder)
+pkg/frame/         — Public: Frame type (decoded output)
+internal/cabac/    — Internal: CABAC arithmetic decoder and encoder engines
+internal/context/  — Internal: Context model initialization (170 contexts)
+internal/slice/    — Internal: Slice data parsing, CTU/CU/TU quadtree
+internal/transform/— Internal: Inverse quantization and transform (4x4, 8x8, 16x16)
+internal/pred/     — Internal: Intra prediction modes (planar, DC, angular)
+internal/deblock/  — Internal: Deblocking filter
+internal/sao/      — Internal: Sample Adaptive Offset
+cmd/hi265dec/      — CLI: decode HEVC from raw .265
+cmd/hi265gen/      — CLI: generate HEVC bitstreams or raw images from grid patterns
+examples/          — Example grid image files
+tools/             — Test generation scripts
+testdata/          — Golden HEVC bitstreams for regression testing
+```
+
+## Related Projects
+
+- [hi264](https://github.com/Eyevinn/hi264) — Sister project: pure Go H.264/AVC frame decoder & bitstream generator
+
+## Dependencies
+
+- [`github.com/Eyevinn/mp4ff`](https://github.com/Eyevinn/mp4ff) — VPS/SPS/PPS/SliceHeader parsing, MP4 container, HEVC descriptor, fragmented MP4 creation
+- [`github.com/Eyevinn/hi264`](https://github.com/Eyevinn/hi264) — Grid/color/SMPTE/counter utilities (`pkg/yuv`), frame type (`pkg/frame`)
+
+[![Badge OSC](https://img.shields.io/badge/Evaluate-24243B?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTIiIGZpbGw9InVybCgjcGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyKSIvPgo8Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI3IiBzdHJva2U9ImJsYWNrIiBzdHJva2Utd2lkdGg9IjIiLz4KPGRlZnM+CjxsaW5lYXJHcmFkaWVudCBpZD0icGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyIiB4MT0iMTIiIHkxPSIwIiB4Mj0iMTIiIHkyPSIyNCIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPgo8c3RvcCBzdG9wLWNvbG9yPSIjQzE4M0ZGIi8+CjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzREQzlGRiIvPgo8L2xpbmVhckdyYWRpZW50Pgo8L2RlZnM+Cjwvc3ZnPgo=)](https://app.osaas.io/browse/eyevinn-mp4ff)
+
+## Support
+
+Join our [community on Slack](http://slack.streamingtech.se) where you can post any questions regarding any of our open source projects. Eyevinn's consulting business can also offer you:
+
+* Further development of this component
+* Customization and integration of this component into your platform
+* Support and maintenance agreement
+
+Contact [sales@eyevinn.se](mailto:sales@eyevinn.se) if you are interested.
+
+## About Eyevinn Technology
+
+[Eyevinn Technology](https://www.eyevinntechnology.se) is an independent consultant firm specialized in video and streaming. Independent in a way that we are not commercially tied to any platform or technology vendor. As our way to innovate and push the industry forward we develop proof-of-concepts and tools. The things we learn and the code we write we share with the industry in [blogs](https://dev.to/video) and by open sourcing the code we have written.
+
+Want to know more about Eyevinn and how it is to work here. Contact us at work@eyevinn.se!

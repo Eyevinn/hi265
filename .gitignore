@@ -4,6 +4,7 @@ references/
 # Build output
 out/
 /hi265dec
+/hi265gen
 *.test
 
 # Coverage
