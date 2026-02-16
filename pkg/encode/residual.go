@@ -139,27 +139,7 @@ func encodeResidualCoding(enc *cabac.Encoder, models []cabac.CtxState,
 
 	size := 1 << log2TrafoSize
 
-	// Find last significant coefficient in scan order
-	scan := slice.ScanOrder(size, size, scanIdx)
-	lastScanPos := -1
-	for i := len(scan) - 1; i >= 0; i-- {
-		x, y := scan[i][0], scan[i][1]
-		if levels[y*size+x] != 0 {
-			lastScanPos = i
-			break
-		}
-	}
-	if lastScanPos < 0 {
-		return
-	}
-
-	lastX := scan[lastScanPos][0]
-	lastY := scan[lastScanPos][1]
-
-	// Encode last_sig_coeff_x_prefix/suffix and y_prefix/suffix
-	encodeLastSigCoeff(enc, models, lastX, lastY, log2TrafoSize, isLuma)
-
-	// Sub-block processing
+	// Sub-block processing setup
 	log2SbSize := 2
 	if log2TrafoSize == 2 {
 		log2SbSize = log2TrafoSize
@@ -171,16 +151,33 @@ func encodeResidualCoding(enc *cabac.Encoder, models []cabac.CtxState,
 	sbScanOrder := slice.ScanOrder(numSbX, numSbY, scanIdx)
 	coeffScanOrder := slice.ScanOrder(sbSize, sbSize, scanIdx)
 
-	// Find which sub-block contains the last significant coeff
-	lastSbX := lastX >> log2SbSize
-	lastSbY := lastY >> log2SbSize
-	lastSubBlock := 0
-	for i, sb := range sbScanOrder {
-		if sb[0] == lastSbX && sb[1] == lastSbY {
-			lastSubBlock = i
-			break
+	// Find last significant coefficient using the HIERARCHICAL scan order
+	// (sub-block scan × coefficient scan within sub-block). This must match
+	// the decoder which processes sub-blocks 0..lastSubBlock in this order.
+	lastX, lastY := -1, -1
+	lastSubBlock := -1
+	for i := len(sbScanOrder) - 1; i >= 0; i-- {
+		sbX := sbScanOrder[i][0]
+		sbY := sbScanOrder[i][1]
+		sbOriginX := sbX * sbSize
+		sbOriginY := sbY * sbSize
+		for j := len(coeffScanOrder) - 1; j >= 0; j-- {
+			cx := sbOriginX + coeffScanOrder[j][0]
+			cy := sbOriginY + coeffScanOrder[j][1]
+			if cx < size && cy < size && levels[cy*size+cx] != 0 {
+				lastX = cx
+				lastY = cy
+				lastSubBlock = i
+				goto foundLast
+			}
 		}
 	}
+foundLast:
+	if lastX < 0 {
+		return
+	}
+	// Encode last_sig_coeff_x_prefix/suffix and y_prefix/suffix
+	encodeLastSigCoeff(enc, models, lastX, lastY, log2TrafoSize, isLuma)
 
 	// coded_sub_block_flag tracking
 	codedSbFlags := make([][]bool, numSbY)
@@ -451,12 +448,29 @@ func encodeResidualCoding(enc *cabac.Encoder, models []cabac.CtxState,
 }
 
 // encodeLastSigCoeff encodes last_sig_coeff_x_prefix/suffix and y_prefix/suffix.
-// Must match the decoder's decodeLastSigCoeffPrefix + decodeLastSigCoeffSuffix exactly.
+// Per HEVC spec 7.3.8.11: both prefixes first, then both suffixes.
+// This order must match the decoder which reads X prefix, Y prefix, X suffix, Y suffix.
 func encodeLastSigCoeff(enc *cabac.Encoder, models []cabac.CtxState,
 	lastX, lastY, log2TrafoSize int, isLuma bool) {
 
-	encodeLastSigCoeffCoord(enc, models, lastX, log2TrafoSize, isLuma, context.CtxLastSigCoeffXPrefix)
-	encodeLastSigCoeffCoord(enc, models, lastY, log2TrafoSize, isLuma, context.CtxLastSigCoeffYPrefix)
+	xPrefix, xSuffixVal, xSuffixLen := lastPosToPrefix(lastX)
+	yPrefix, ySuffixVal, ySuffixLen := lastPosToPrefix(lastY)
+
+	// Encode both prefixes first (context-coded)
+	encodeLastSigCoeffPrefix(enc, models, xPrefix, log2TrafoSize, isLuma, context.CtxLastSigCoeffXPrefix)
+	encodeLastSigCoeffPrefix(enc, models, yPrefix, log2TrafoSize, isLuma, context.CtxLastSigCoeffYPrefix)
+
+	// Then encode both suffixes (bypass-coded)
+	if xSuffixLen > 0 {
+		for k := xSuffixLen - 1; k >= 0; k-- {
+			enc.EncodeBypass(uint8((xSuffixVal >> k) & 1))
+		}
+	}
+	if ySuffixLen > 0 {
+		for k := ySuffixLen - 1; k >= 0; k-- {
+			enc.EncodeBypass(uint8((ySuffixVal >> k) & 1))
+		}
+	}
 }
 
 // lastPosToPrefix converts a last significant coefficient position to prefix + suffix.
@@ -483,10 +497,9 @@ func lastPosToPrefix(pos int) (prefix, suffixVal, suffixLen int) {
 	}
 }
 
-func encodeLastSigCoeffCoord(enc *cabac.Encoder, models []cabac.CtxState,
-	lastPos, log2TrafoSize int, isLuma bool, ctxBase int) {
-
-	prefix, suffixVal, suffixLen := lastPosToPrefix(lastPos)
+// encodeLastSigCoeffPrefix encodes only the prefix part (context-coded truncated unary).
+func encodeLastSigCoeffPrefix(enc *cabac.Encoder, models []cabac.CtxState,
+	prefix, log2TrafoSize int, isLuma bool, ctxBase int) {
 
 	// Context offset and shift — must match decoder's decodeLastSigCoeffPrefix exactly
 	var ctxOffset, ctxShift int
@@ -510,13 +523,6 @@ func encodeLastSigCoeffCoord(enc *cabac.Encoder, models []cabac.CtxState,
 		} else {
 			enc.EncodeDecision(0, &models[ctxBase+ctxOffset+ctxInc])
 			break
-		}
-	}
-
-	// Encode suffix (bypass bins)
-	if suffixLen > 0 {
-		for k := suffixLen - 1; k >= 0; k-- {
-			enc.EncodeBypass(uint8((suffixVal >> k) & 1))
 		}
 	}
 }

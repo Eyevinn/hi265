@@ -78,7 +78,6 @@ func main() {
 				Log2MinTrafoSize:                log2MinTrSize,
 				Log2MaxTrafoSize:                log2MaxTrSize,
 				MaxTransformHierarchyDepthIntra: int(sps.MaxTransformHierarchyDepthIntra),
-				Trace:                           true,
 			})
 			if err != nil {
 				fmt.Println("Decode error:", err)

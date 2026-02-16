@@ -15,8 +15,6 @@ type Decoder struct {
 	data       []byte
 	pos        int // current byte position in data
 	bitsLeft   int // bits left in current byte
-	Trace      bool // enable debug tracing
-	binCount   int  // number of bins decoded
 }
 
 // NewDecoder creates a new CABAC decoder initialized with the given byte stream.
@@ -87,11 +85,6 @@ func (d *Decoder) DecodeDecision(ctx *CtxState) uint8 {
 	}
 
 	d.renormalize()
-	d.binCount++
-	if d.Trace {
-		fmt.Printf("CABAC[%d] Decision → %d range=%d offset=%d\n",
-			d.binCount, binVal, d.codIRange, d.codIOffset)
-	}
 	return binVal
 }
 
@@ -106,11 +99,6 @@ func (d *Decoder) DecodeBypass() uint8 {
 		d.codIOffset -= d.codIRange
 		val = 1
 	}
-	d.binCount++
-	if d.Trace {
-		fmt.Printf("CABAC[%d] Bypass → %d range=%d offset=%d\n",
-			d.binCount, val, d.codIRange, d.codIOffset)
-	}
 	return val
 }
 
@@ -124,9 +112,6 @@ func (d *Decoder) DecodeTerminate() uint8 {
 	d.renormalize()
 	return 0
 }
-
-// BinCount returns the number of CABAC bins decoded so far.
-func (d *Decoder) BinCount() int { return d.binCount }
 
 // BitsRead returns the number of bits consumed from the bitstream so far.
 func (d *Decoder) BitsRead() int {

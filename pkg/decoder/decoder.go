@@ -20,9 +20,9 @@ import (
 
 // Decoder is the HEVC decoder.
 type Decoder struct {
-	vpsMap map[uint32][]byte
-	spsMap map[uint32]*hevc.SPS
-	ppsMap map[uint32]*hevc.PPS
+	vpsMap   map[uint32][]byte
+	spsMap   map[uint32]*hevc.SPS
+	ppsMap   map[uint32]*hevc.PPS
 	refFrame *frame.Frame // reference frame for inter prediction
 }
 

@@ -70,7 +70,6 @@ type Params struct {
 	SaoChroma                       bool
 	CuQpDeltaEnabled                bool
 	Log2MinCuQpDeltaSize            int // log2CtbSize - DiffCuQpDeltaDepth
-	Trace                           bool
 }
 
 // qpState tracks mutable QP state across the quantization group.
@@ -86,7 +85,6 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init CABAC: %w", err)
 	}
-	dec.Trace = p.Trace
 	ctxModels := context.InitModels(p.SliceType, p.SliceQPY)
 
 	ctbSize := 1 << p.Log2CtbSize

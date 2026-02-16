@@ -164,6 +164,67 @@ func TestEncodePSkip(t *testing.T) {
 	}
 }
 
+// TestEncodeTwoColor32x32 tests encoding a 32x32 frame with high-contrast content
+// (left half Y=235, right half Y=16). This exercises multi-CTU encoding with
+// significant residual coefficients. Quantization at QP=26 introduces loss;
+// the test validates that encode→decode round-trip produces reasonable results.
+func TestEncodeTwoColor32x32(t *testing.T) {
+	w, h := 32, 32
+	qp := 26
+
+	y := make([]uint8, w*h)
+	cb := make([]uint8, w/2*h/2)
+	cr := make([]uint8, w/2*h/2)
+	for py := 0; py < h; py++ {
+		for px := 0; px < w; px++ {
+			if px < 16 {
+				y[py*w+px] = 235
+			} else {
+				y[py*w+px] = 16
+			}
+		}
+	}
+	for i := range cb {
+		cb[i] = 128
+		cr[i] = 128
+	}
+
+	annexB, err := EncodeIDRFrame(EncodeParams{Width: w, Height: h, QP: qp}, y, cb, cr)
+	if err != nil {
+		t.Fatalf("EncodeIDRFrame: %v", err)
+	}
+
+	d := decoder.New()
+	frames, err := d.DecodeAnnexB(annexB)
+	if err != nil {
+		t.Fatalf("DecodeAnnexB: %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("expected 1 frame, got %d", len(frames))
+	}
+
+	f := frames[0]
+
+	// With QP=26 and high-contrast content, quantization loss up to ~7 is expected.
+	// The encoder's reconstruction may differ from the original by more than ±1.
+	maxAllowed := 7
+	for i := range w * h {
+		expected := 235
+		if i%w >= 16 {
+			expected = 16
+		}
+		actual := int(f.Y[i])
+		diff := expected - actual
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > maxAllowed {
+			t.Fatalf("Y[%d] diff=%d (expected=%d, actual=%d), max allowed=%d",
+				i, diff, expected, actual, maxAllowed)
+		}
+	}
+}
+
 func makeUniform(n int, val uint8) []uint8 {
 	buf := make([]uint8, n)
 	for i := range buf {
