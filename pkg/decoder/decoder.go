@@ -408,7 +408,7 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 	// byte_alignment
 	stopBit := r.Read(1)
 	if stopBit != 1 {
-		return nil, fmt.Errorf("P-slice header: expected stop bit 1, got %d", stopBit)
+		return nil, fmt.Errorf("p-slice header: expected stop bit 1, got %d", stopBit)
 	}
 	bitsInByte := r.NrBitsRead() % 8
 	if bitsInByte != 0 {
@@ -552,9 +552,10 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 			}
 
 			chromaMode := cu.IntraChromaMode
-			if chromaMode == 4 {
+			switch chromaMode {
+			case 4:
 				chromaMode = lumaMode
-			} else if chromaMode == lumaMode {
+			case lumaMode:
 				chromaMode = 34
 			}
 

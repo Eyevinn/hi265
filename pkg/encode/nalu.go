@@ -7,12 +7,12 @@ import (
 
 // HEVC NALU types
 const (
-	naluTrailR    = 1
-	naluIDRWRadl  = 19
-	naluVPS       = 32
-	naluSPS       = 33
-	naluPPS       = 34
-	NaluFiller    = 38
+	naluTrailR   = 1
+	naluIDRWRadl = 19
+	naluVPS      = 32
+	naluSPS      = 33
+	naluPPS      = 34
+	NaluFiller   = 38
 )
 
 // WriteNALU writes a complete HEVC NALU to w: start code + 2-byte header + EBSP.
@@ -24,15 +24,15 @@ const (
 // For our use: layer_id=0, temporal_id_plus1=1.
 func WriteNALU(w io.Writer, naluType int, rbsp []byte) {
 	// Start code
-	w.Write([]byte{0x00, 0x00, 0x00, 0x01})
+	_, _ = w.Write([]byte{0x00, 0x00, 0x00, 0x01})
 
 	// 2-byte NALU header
 	b0 := byte((naluType & 0x3F) << 1) // forbidden_zero_bit=0, nal_unit_type, nuh_layer_id bit5=0
-	b1 := byte(1)                       // nuh_layer_id[4:0]=0, nuh_temporal_id_plus1=1
-	w.Write([]byte{b0, b1})
+	b1 := byte(1)                      // nuh_layer_id[4:0]=0, nuh_temporal_id_plus1=1
+	_, _ = w.Write([]byte{b0, b1})
 
 	// RBSP with emulation prevention bytes
-	w.Write(InsertEBSP(rbsp))
+	_, _ = w.Write(InsertEBSP(rbsp))
 }
 
 // buildNALU returns a raw NALU (2-byte header + EBSP, no start code) for MP4 use.

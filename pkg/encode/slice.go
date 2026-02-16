@@ -13,13 +13,13 @@ func encodeIDRSlice(width, height, qp int, y, cb, cr []uint8) []byte {
 	w := NewBitWriter()
 
 	// === Slice header ===
-	w.WriteBit(1)      // first_slice_segment_in_pic_flag = 1
-	w.WriteBit(0)      // no_output_of_prior_pics_flag = 0 (IDR only)
-	w.WriteUE(0)       // slice_pic_parameter_set_id = 0
-	w.WriteUE(2)       // slice_type = 2 (I-slice)
+	w.WriteBit(1) // first_slice_segment_in_pic_flag = 1
+	w.WriteBit(0) // no_output_of_prior_pics_flag = 0 (IDR only)
+	w.WriteUE(0)  // slice_pic_parameter_set_id = 0
+	w.WriteUE(2)  // slice_type = 2 (I-slice)
 	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set
 	// SAO disabled in SPS → no SAO flags
-	w.WriteSE(0)       // slice_qp_delta = 0 (PPS init_qp_minus26 = qp-26)
+	w.WriteSE(0) // slice_qp_delta = 0 (PPS init_qp_minus26 = qp-26)
 	// Deblocking disabled in PPS → no deblock syntax
 	// loop_filter_across_slices_enabled_flag: not present (PPS flag is 0 and deblock is disabled)
 
@@ -529,9 +529,9 @@ func encodePSkipSlice(width, height, qp, poc int) []byte {
 	w := NewBitWriter()
 
 	// === Slice header ===
-	w.WriteBit(1)      // first_slice_segment_in_pic_flag = 1
-	w.WriteUE(0)       // slice_pic_parameter_set_id = 0
-	w.WriteUE(1)       // slice_type = 1 (P-slice)
+	w.WriteBit(1) // first_slice_segment_in_pic_flag = 1
+	w.WriteUE(0)  // slice_pic_parameter_set_id = 0
+	w.WriteUE(1)  // slice_type = 1 (P-slice)
 
 	// pic_order_cnt_lsb: u(log2_max_pic_order_cnt_lsb) = u(4)
 	w.WriteBits(uint32(poc&0xF), 4)
@@ -540,10 +540,10 @@ func encodePSkipSlice(width, height, qp, poc int) []byte {
 	w.WriteBit(0)
 
 	// Inline STRPS: num_short_term_ref_pic_sets=0, so stRpsIdx=0, no inter_ref_pic_set_prediction
-	w.WriteUE(1)       // num_negative_pics = 1
-	w.WriteUE(0)       // num_positive_pics = 0
-	w.WriteUE(0)       // delta_poc_s0_minus1 = 0 (deltaPOC = -1)
-	w.WriteBit(1)      // used_by_curr_pic_s0_flag = 1
+	w.WriteUE(1)  // num_negative_pics = 1
+	w.WriteUE(0)  // num_positive_pics = 0
+	w.WriteUE(0)  // delta_poc_s0_minus1 = 0 (deltaPOC = -1)
+	w.WriteBit(1) // used_by_curr_pic_s0_flag = 1
 
 	// SAO disabled → no SAO flags
 	// num_ref_idx_active_override_flag = 0

@@ -11,14 +11,14 @@ import (
 
 // CodingUnit holds the decoded data for a single CU.
 type CodingUnit struct {
-	X0, Y0     int
-	Log2CbSize int
-	PredMode   int // 0=inter, 1=intra
-	PartMode   int // for intra: 0=2Nx2N, 1=NxN
-	SkipFlag   bool
-	MergeIdx   int
-	QpY        int // resolved luma QP for this CU
-	IntraLumaMode  [4]int // up to 4 PUs for NxN
+	X0, Y0          int
+	Log2CbSize      int
+	PredMode        int // 0=inter, 1=intra
+	PartMode        int // for intra: 0=2Nx2N, 1=NxN
+	SkipFlag        bool
+	MergeIdx        int
+	QpY             int    // resolved luma QP for this CU
+	IntraLumaMode   [4]int // up to 4 PUs for NxN
 	IntraChromaMode int
 	// Residual data per TU
 	TransformUnits []TransformUnit
@@ -26,17 +26,17 @@ type CodingUnit struct {
 
 // TransformUnit holds decoded residual coefficients for one TU.
 type TransformUnit struct {
-	X0, Y0     int
-	Log2TrSize int
-	CbfLuma    bool
-	CbfCb      bool
-	CbfCr      bool
+	X0, Y0            int
+	Log2TrSize        int
+	CbfLuma           bool
+	CbfCb             bool
+	CbfCr             bool
 	TransformSkipLuma bool
 	TransformSkipCb   bool
 	TransformSkipCr   bool
-	LumaCoeffs   []int32 // coefficients in scan order
-	CbCoeffs     []int32
-	CrCoeffs     []int32
+	LumaCoeffs        []int32 // coefficients in scan order
+	CbCoeffs          []int32
+	CrCoeffs          []int32
 }
 
 // SaoParams holds SAO parameters for one CTU (per component: 0=luma, 1=Cb, 2=Cr).
@@ -106,7 +106,10 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 
 		// Decode SAO parameters for this CTU
 		if p.SaoLuma || p.SaoChroma {
-			sd.SaoParams[ctbAddrRS] = decodeSaoParams(dec, ctxModels, ctbX, ctbY, ctbsX, ctbAddrRS, sd.SaoParams, p.SaoLuma, p.SaoChroma)
+			sd.SaoParams[ctbAddrRS] = decodeSaoParams(
+				dec, ctxModels, ctbX, ctbY, ctbsX, ctbAddrRS,
+				sd.SaoParams, p.SaoLuma, p.SaoChroma,
+			)
 		}
 
 		cus, err := decodeCodingQuadtree(dec, ctxModels, ctbX, ctbY, p.Log2CtbSize, 0, &p, modeMap, depthMap, qps)
@@ -236,7 +239,9 @@ func decodeSaoOffsetAbs(dec *cabac.Decoder) int {
 
 // decodeCodingQuadtree recursively splits the CTU into CUs.
 func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
-	x0, y0, log2CbSize, depth int, p *Params, modeMap *intraModeMap, depthMap *cuDepthMap, qps *qpState) ([]CodingUnit, error) {
+	x0, y0, log2CbSize, depth int, p *Params,
+	modeMap *intraModeMap, depthMap *cuDepthMap, qps *qpState,
+) ([]CodingUnit, error) {
 
 	// QG boundary reset per HEVC spec 7.3.8.4: at start of coding_quadtree
 	if p.CuQpDeltaEnabled && log2CbSize >= p.Log2MinCuQpDeltaSize {
@@ -475,7 +480,7 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	if log2TrafoSize <= log2MaxTrafoSize &&
 		log2TrafoSize > log2MinTrafoSize &&
 		trafoDepth < maxTrafoDepth &&
-		!(intraSplitFlag && trafoDepth == 0) &&
+		(!intraSplitFlag || trafoDepth != 0) &&
 		log2TrafoSize > 2 {
 		splitFlag := dec.DecodeDecision(&ctx[context.CtxSplitTransformFlag+int(5-log2TrafoSize)])
 		split = splitFlag == 1
@@ -925,7 +930,7 @@ func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
 					val = -val
 				}
 				coeffs[py*trSize+px] = val
-				}
+			}
 		}
 	}
 
@@ -1098,19 +1103,21 @@ func GetSigCtxInc(cx, cy, log2TrafoSize int, isLuma bool, sbX, sbY, scanIdx, pre
 			sigCtx = 2
 		}
 	case 1: // right neighbor coded
-		if yP == 0 {
+		switch yP {
+		case 0:
 			sigCtx = 2
-		} else if yP == 1 {
+		case 1:
 			sigCtx = 1
-		} else {
+		default:
 			sigCtx = 0
 		}
 	case 2: // below neighbor coded
-		if xP == 0 {
+		switch xP {
+		case 0:
 			sigCtx = 2
-		} else if xP == 1 {
+		case 1:
 			sigCtx = 1
-		} else {
+		default:
 			sigCtx = 0
 		}
 	default: // prevCsbf == 3, both neighbors coded
@@ -1212,8 +1219,8 @@ func sortMPM(mpm [3]int) [3]int {
 
 // cuDepthMap tracks CU split depths at minimum CB granularity.
 type cuDepthMap struct {
-	depths   []int // flat array, indexed as [y/minCb * widthMinCb + x/minCb]
-	minCbSize int
+	depths     []int // flat array, indexed as [y/minCb * widthMinCb + x/minCb]
+	minCbSize  int
 	widthMinCb int
 }
 
@@ -1247,8 +1254,8 @@ func (m *cuDepthMap) get(x, y int) int {
 
 // intraModeMap tracks decoded intra luma prediction modes at 4x4 PU granularity.
 type intraModeMap struct {
-	modes []int // flat array, indexed as [y/4 * width4 + x/4]
-	width4 int  // picture width in 4-sample units
+	modes  []int // flat array, indexed as [y/4 * width4 + x/4]
+	width4 int   // picture width in 4-sample units
 }
 
 func newIntraModeMap(picW, picH int) *intraModeMap {

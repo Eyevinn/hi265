@@ -143,7 +143,7 @@ func PredictAngular(mode, size int, neighbors *Neighbors, bitDepth int) []int32 
 			invA := invAngle[mode]
 			nProjected := (size * angle) >> 5
 			for i := nProjected; i < 0; i++ {
-				idx := -1 + ((i * invA + 128) >> 8)
+				idx := -1 + ((i*invA + 128) >> 8)
 				if idx >= 0 && idx < len(neighbors.Left) {
 					ref[off+i] = int32(neighbors.Left[idx])
 				}
@@ -177,7 +177,7 @@ func PredictAngular(mode, size int, neighbors *Neighbors, bitDepth int) []int32 
 			invA := invAngle[mode]
 			nProjected := (size * angle) >> 5
 			for i := nProjected; i < 0; i++ {
-				idx := -1 + ((i * invA + 128) >> 8)
+				idx := -1 + ((i*invA + 128) >> 8)
 				if idx >= 0 && idx < len(neighbors.Top) {
 					ref[off+i] = int32(neighbors.Top[idx])
 				}
@@ -268,10 +268,10 @@ func FilterRefSamples(n *Neighbors, mode, size int, isLuma bool, strongSmooth bo
 	if strongSmooth && isLuma && size == 32 {
 		threshold := 1 << 3 // 1 << (BitDepthY - 5) for 8-bit
 		topLeft := int(n.TopLeft)
-		topRight := int(n.Top[nS-1])  // p[63][-1]
+		topRight := int(n.Top[nS-1])    // p[63][-1]
 		bottomLeft := int(n.Left[nS-1]) // p[-1][63]
 
-		topMid := int(n.Top[size-1])  // p[31][-1]
+		topMid := int(n.Top[size-1])   // p[31][-1]
 		leftMid := int(n.Left[size-1]) // p[-1][31]
 
 		topSmooth := abs(topLeft+topRight-2*topMid) < threshold

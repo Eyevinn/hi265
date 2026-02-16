@@ -100,7 +100,10 @@ func markEdges(edgeFlags []byte, gridW, gridH, x0, y0, w, h, _, _ int) {
 }
 
 // filterEdges filters all edges in one direction.
-func filterEdges(f *frame.Frame, edgeFlags []byte, gridW, gridH int, qpMap []int, betaOffset, tcOffset int, vertical bool) {
+func filterEdges(
+	f *frame.Frame, edgeFlags []byte, gridW, gridH int,
+	qpMap []int, betaOffset, tcOffset int, vertical bool,
+) {
 	picW := f.Width
 	picH := f.Height
 
@@ -334,12 +337,12 @@ func filterLumaEdge(f *frame.Frame, px, py int, vertical bool, beta, tC int) {
 				writeLumaPixel(f, px, py, k, vertical, 0, qNew0)
 
 				if ndP > 1 {
-					deltaP := clip3(-(tC>>1), tC>>1, (((p2+p0+1)>>1)-p1+delta)>>1)
+					deltaP := clip3(-(tC >> 1), tC>>1, (((p2+p0+1)>>1)-p1+delta)>>1)
 					pNew1 := clip3(0, 255, p1+deltaP)
 					writeLumaPixel(f, px, py, k, vertical, -2, pNew1)
 				}
 				if ndQ > 1 {
-					deltaQ := clip3(-(tC>>1), tC>>1, (((q2+q0+1)>>1)-q1-delta)>>1)
+					deltaQ := clip3(-(tC >> 1), tC>>1, (((q2+q0+1)>>1)-q1-delta)>>1)
 					qNew1 := clip3(0, 255, q1+deltaQ)
 					writeLumaPixel(f, px, py, k, vertical, 1, qNew1)
 				}

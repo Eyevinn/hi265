@@ -147,11 +147,13 @@ func TestDecodeGrayDeblock128x64(t *testing.T) {
 }
 
 func TestDecodeSinCosDeblock128x64(t *testing.T) {
-	testGolden(t, "../../testdata/sincos_deblock_128x64.265", "../../testdata/golden/sincos_deblock_128x64.yuv", 128, 64)
+	testGolden(t, "../../testdata/sincos_deblock_128x64.265",
+		"../../testdata/golden/sincos_deblock_128x64.yuv", 128, 64)
 }
 
 func TestDecodeSinCosSignHide128x64(t *testing.T) {
-	testGolden(t, "../../testdata/sincos_signhide_128x64.265", "../../testdata/golden/sincos_signhide_128x64.yuv", 128, 64)
+	testGolden(t, "../../testdata/sincos_signhide_128x64.265",
+		"../../testdata/golden/sincos_signhide_128x64.yuv", 128, 64)
 }
 
 func TestDecodeSinCosTSkip128x64(t *testing.T) {
@@ -167,5 +169,6 @@ func TestDecodeSinCosCRF32_128x64(t *testing.T) {
 }
 
 func TestDecodeGray2Frames128x64(t *testing.T) {
-	testGoldenFrames(t, "../../testdata/gray_2frames_128x64.265", "../../testdata/golden/gray_2frames_128x64.yuv", 128, 64, 2)
+	testGoldenFrames(t, "../../testdata/gray_2frames_128x64.265",
+		"../../testdata/golden/gray_2frames_128x64.yuv", 128, 64, 2)
 }

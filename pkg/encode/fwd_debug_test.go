@@ -141,7 +141,7 @@ func TestEncodeWriteFile(t *testing.T) {
 	}
 
 	// Write to file for manual FFmpeg testing
-	os.WriteFile("/tmp/test_encode.265", annexB, 0644)
+	_ = os.WriteFile("/tmp/test_encode.265", annexB, 0644)
 	fmt.Printf("Wrote %d bytes to /tmp/test_encode.265\n", len(annexB))
 
 	// Decode with our decoder

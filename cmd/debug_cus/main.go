@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/Eyevinn/hi265/internal/slice"
 	"github.com/Eyevinn/mp4ff/avc"
 	"github.com/Eyevinn/mp4ff/bits"
 	"github.com/Eyevinn/mp4ff/hevc"
-	"github.com/Eyevinn/hi265/internal/slice"
 )
 
 func main() {
