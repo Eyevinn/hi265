@@ -1,15 +1,18 @@
-# HEVC/H.265 Frame Decoder in Pure Go
+# HEVC/H.265 Frame Decoder & Bitstream Generator in Pure Go
 
 ## Rules
 - Never add "Co-Authored-By" lines to git commits or pull requests
 
 ## Project Status
 
-Pure Go HEVC/H.265 decoder for IDR frames. Phase 1 target: decode a single
-black 16x16 IDR frame, byte-exact match with FFmpeg.
+Pure Go HEVC/H.265 decoder for IDR and P-skip frames, plus a bitstream
+generator for producing valid HEVC test content from flat-color 16x16 CTU
+grid patterns. Pixel-perfect match with FFmpeg decoding across 16+ golden
+test cases (SAO, sign hiding, transform skip, deblocking, P-frames, varied QP).
 
 ### Dependencies
-- `github.com/Eyevinn/mp4ff` - VPS/SPS/PPS/SliceHeader parsing, NAL extraction
+- `github.com/Eyevinn/mp4ff` — VPS/SPS/PPS parsing, NAL extraction, MP4 container
+- `github.com/Eyevinn/hi264` — Grid/color/SMPTE utilities (`pkg/yuv`), frame type
 
 ### Key Reference Files
 - Standard: `references/ISO_IEC_DIS_23008-2_Ed5_2022.pdf`
@@ -26,20 +29,42 @@ go test ./...
 
 ```bash
 # Decode HEVC Annex-B to raw YUV
-go run ./cmd/hi265dec testdata/black_16x16.265 out.yuv
+go run ./cmd/hi265dec input.265 output.yuv
+
+# Generate HEVC bitstream from grid pattern
+go run ./cmd/hi265gen -grid "AB,CD" -c A=16,128,128 -c B=235,128,128 -o test.265
 ```
+
+## Encoder API
+
+Grid-based functions that produce Annex-B HEVC NALUs from flat-color CTU patterns:
+
+- `GenerateVPSSPSPPS(p)` — VPS + SPS + PPS NALUs
+- `GenerateIDR(p, grid, colors)` — IDR slice NALU
+- `GeneratePSkip(p, poc)` — P-skip slice NALU
+
+External SPS/PPS support (for injecting frames into existing streams):
+
+- `EncodeIDRSliceFromSPSPPS(sps, pps, grid, colors)` — IDR slice compatible with external parameter sets
+- `EncodePSkipSliceFromSPSPPS(sps, pps, poc)` — P-skip slice compatible with external parameter sets
+
+`FrameEncoder` wraps these functions with a struct-based API for convenience.
 
 ## Architecture
 
 ```
-pkg/decoder/       - Public: top-level decoder API
-pkg/frame/         - Public: Frame type (decoded output)
-internal/cabac/    - Internal: CABAC arithmetic decoder (shared with H.264)
-internal/context/  - Internal: HEVC context model initialization
-internal/slice/    - Internal: Slice data parsing (CTU/CU/TU quadtree)
-internal/transform/- Internal: HEVC inverse transform and dequantization
-internal/pred/     - Internal: HEVC intra prediction
-cmd/hi265dec/      - CLI: decode HEVC
-testdata/          - Test bitstreams and golden references
-tools/             - Test generation scripts
+pkg/decoder/       — Public: top-level decoder API (DecodeAnnexB)
+pkg/encode/        — Public: bitstream generator API (GenerateIDR, GeneratePSkip, FrameEncoder)
+pkg/frame/         — Public: Frame type (decoded output)
+internal/cabac/    — Internal: CABAC arithmetic decoder and encoder engines
+internal/context/  — Internal: Context model initialization (170 contexts)
+internal/slice/    — Internal: Slice data parsing, CTU/CU/TU quadtree
+internal/transform/— Internal: Inverse quantization and transform (4x4, 8x8, 16x16)
+internal/pred/     — Internal: Intra prediction modes (planar, DC, angular)
+internal/deblock/  — Internal: Deblocking filter
+internal/sao/      — Internal: Sample Adaptive Offset
+cmd/hi265dec/      — CLI: decode HEVC from raw .265
+cmd/hi265gen/      — CLI: generate HEVC bitstreams or raw images from grid patterns
+testdata/          — Test bitstreams and golden references
+tools/             — Test generation scripts
 ```

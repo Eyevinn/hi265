@@ -17,58 +17,65 @@ type EncodeParams struct {
 	Range      yuv.Range      // default LimitedRange
 }
 
-// EncodeIDRFrame returns Annex-B bytes: VPS + SPS + PPS + IDR slice.
-// y, cb, cr are raw pixel planes in raster scan order (4:2:0).
-func EncodeIDRFrame(p EncodeParams, y, cb, cr []uint8) ([]byte, error) {
-	qp := p.QP
-	if qp == 0 {
-		qp = 26
+func (p EncodeParams) qp() int {
+	if p.QP == 0 {
+		return 26
 	}
+	return p.QP
+}
 
+// GenerateVPSSPSPPS returns Annex-B bytes containing VPS + SPS + PPS NALUs.
+func GenerateVPSSPSPPS(p EncodeParams) ([]byte, error) {
 	var buf bytes.Buffer
-
-	// Write VPS
 	WriteNALU(&buf, naluVPS, generateVPS())
-
-	// Write SPS
 	WriteNALU(&buf, naluSPS, generateSPS(p.Width, p.Height, p.ColorSpace, p.Range))
-
-	// Write PPS
-	WriteNALU(&buf, naluPPS, generatePPS(qp))
-
-	// Write IDR slice
-	WriteNALU(&buf, naluIDRWRadl, encodeIDRSlice(p.Width, p.Height, qp, y, cb, cr))
-
+	WriteNALU(&buf, naluPPS, generatePPS(p.qp()))
 	return buf.Bytes(), nil
 }
 
-// EncodePSkipFrame returns Annex-B bytes: P-slice (all skip CUs).
-// Must be called after EncodeIDRFrame to produce a valid stream.
-func EncodePSkipFrame(p EncodeParams, poc int) ([]byte, error) {
-	qp := p.QP
-	if qp == 0 {
-		qp = 26
+// GenerateIDR returns Annex-B bytes containing an IDR slice NALU.
+// The grid and colors define the per-CTU content (each grid cell is one 16x16 CTU).
+func GenerateIDR(p EncodeParams, grid *yuv.Grid, colors yuv.ColorMap) ([]byte, error) {
+	f, err := yuv.BuildFrame(grid, colors)
+	if err != nil {
+		return nil, err
 	}
+	f.Width = p.Width
+	f.Height = p.Height
 
 	var buf bytes.Buffer
+	WriteNALU(&buf, naluIDRWRadl, encodeIDRSlice(p.Width, p.Height, p.qp(), f.Y, f.Cb, f.Cr))
+	return buf.Bytes(), nil
+}
 
-	// Write P-slice
-	WriteNALU(&buf, naluTrailR, encodePSkipSlice(p.Width, p.Height, qp, poc))
-
+// GeneratePSkip returns Annex-B bytes containing a P-skip slice NALU.
+// All CUs copy from the reference frame with zero motion.
+func GeneratePSkip(p EncodeParams, poc int) ([]byte, error) {
+	var buf bytes.Buffer
+	WriteNALU(&buf, naluTrailR, encodePSkipSlice(p.Width, p.Height, p.qp(), poc))
 	return buf.Bytes(), nil
 }
 
 // EncodeIDRSliceFromSPSPPS encodes an IDR I-slice compatible with external SPS/PPS.
-// y, cb, cr are raw pixel planes in raster scan order (4:2:0).
+// The grid and colors define the per-CTU content (each grid cell is one 16x16 CTU).
 // Returns Annex-B framed IDR_W_RADL NALU.
-func EncodeIDRSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, y, cb, cr []uint8) ([]byte, error) {
+func EncodeIDRSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, grid *yuv.Grid, colors yuv.ColorMap) ([]byte, error) {
 	if err := validateSPSPPSForIDR(sps, pps); err != nil {
 		return nil, err
 	}
 
-	p := idrSliceParamsFromSPSPPS(sps, pps)
+	w := int(sps.PicWidthInLumaSamples)
+	h := int(sps.PicHeightInLumaSamples)
+	f, err := yuv.BuildFrame(grid, colors)
+	if err != nil {
+		return nil, err
+	}
+	f.Width = w
+	f.Height = h
+
+	sp := idrSliceParamsFromSPSPPS(sps, pps)
 	var buf bytes.Buffer
-	WriteNALU(&buf, naluIDRWRadl, encodeIDRSliceWithParams(p, y, cb, cr))
+	WriteNALU(&buf, naluIDRWRadl, encodeIDRSliceWithParams(sp, f.Y, f.Cb, f.Cr))
 	return buf.Bytes(), nil
 }
 
@@ -150,21 +157,16 @@ type FrameEncoder struct {
 
 // Encode produces a complete Annex-B IDR frame: VPS + SPS + PPS + IDR slice.
 func (e *FrameEncoder) Encode() ([]byte, error) {
-	f, err := yuv.BuildFrame(e.Grid, e.Colors)
+	p := e.encodeParams()
+	vpsSPSPPS, err := GenerateVPSSPSPPS(p)
 	if err != nil {
 		return nil, err
 	}
-	w := e.frameWidth()
-	h := e.frameHeight()
-	f.Width = w
-	f.Height = h
-	return EncodeIDRFrame(EncodeParams{
-		Width:      w,
-		Height:     h,
-		QP:         e.qp(),
-		ColorSpace: e.ColorSpace,
-		Range:      e.Range,
-	}, f.Y, f.Cb, f.Cr)
+	idr, err := GenerateIDR(p, e.Grid, e.Colors)
+	if err != nil {
+		return nil, err
+	}
+	return append(vpsSPSPPS, idr...), nil
 }
 
 // EncodeVPSSPSPPS writes the VPS, SPS, and PPS NALUs to buf.
@@ -176,38 +178,17 @@ func (e *FrameEncoder) EncodeVPSSPSPPS(buf *bytes.Buffer) {
 
 // EncodeIDRSlice produces an Annex-B IDR slice (no VPS/SPS/PPS).
 func (e *FrameEncoder) EncodeIDRSlice() ([]byte, error) {
-	f, err := yuv.BuildFrame(e.Grid, e.Colors)
-	if err != nil {
-		return nil, err
-	}
-	w := e.frameWidth()
-	h := e.frameHeight()
-	f.Width = w
-	f.Height = h
-
-	var buf bytes.Buffer
-	WriteNALU(&buf, naluIDRWRadl, encodeIDRSlice(w, h, e.qp(), f.Y, f.Cb, f.Cr))
-	return buf.Bytes(), nil
+	return GenerateIDR(e.encodeParams(), e.Grid, e.Colors)
 }
 
 // EncodePSkipSlice produces an Annex-B P-skip slice.
 func (e *FrameEncoder) EncodePSkipSlice(poc int) ([]byte, error) {
-	var buf bytes.Buffer
-	WriteNALU(&buf, naluTrailR, encodePSkipSlice(e.frameWidth(), e.frameHeight(), e.qp(), poc))
-	return buf.Bytes(), nil
+	return GeneratePSkip(e.encodeParams(), poc)
 }
 
 // EncodeIDRSliceFromSPSPPS produces an Annex-B IDR slice compatible with external SPS/PPS.
 func (e *FrameEncoder) EncodeIDRSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) ([]byte, error) {
-	f, err := yuv.BuildFrame(e.Grid, e.Colors)
-	if err != nil {
-		return nil, err
-	}
-	w := e.frameWidth()
-	h := e.frameHeight()
-	f.Width = w
-	f.Height = h
-	return EncodeIDRSliceFromSPSPPS(sps, pps, f.Y, f.Cb, f.Cr)
+	return EncodeIDRSliceFromSPSPPS(sps, pps, e.Grid, e.Colors)
 }
 
 // EncodePSkipSliceFromSPSPPS produces an Annex-B P-skip slice compatible with external SPS/PPS.
@@ -228,6 +209,16 @@ func (e *FrameEncoder) SPSNALUs() [][]byte {
 // PPSNALUs returns the raw PPS NALU (with 2-byte header, no start code) for MP4.
 func (e *FrameEncoder) PPSNALUs() [][]byte {
 	return [][]byte{buildNALU(naluPPS, generatePPS(e.qp()))}
+}
+
+func (e *FrameEncoder) encodeParams() EncodeParams {
+	return EncodeParams{
+		Width:      e.frameWidth(),
+		Height:     e.frameHeight(),
+		QP:         e.qp(),
+		ColorSpace: e.ColorSpace,
+		Range:      e.Range,
+	}
 }
 
 func (e *FrameEncoder) frameWidth() int {

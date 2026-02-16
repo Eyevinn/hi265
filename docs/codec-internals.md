@@ -180,7 +180,7 @@ P-slice:
 
 ### Encoding
 
-The encoder generates P-skip frames with `EncodePSkipFrame()`:
+The encoder generates P-skip frames with `GeneratePSkip()`:
 
 1. **Slice header**: Written with `slice_type=1` (P-slice), the POC LSB, and an
    inline `short_term_ref_pic_set` referencing the previous frame.
@@ -291,7 +291,7 @@ sps, _ := hevc.ParseSPSNALUnit(spsNALU)
 pps, _ := hevc.ParsePPSNALUnit(ppsNALU, spsMap)
 
 // Encode an IDR slice compatible with those parameter sets
-idrBytes, _ := encode.EncodeIDRSliceFromSPSPPS(sps, pps, y, cb, cr)
+idrBytes, _ := encode.EncodeIDRSliceFromSPSPPS(sps, pps, grid, colors)
 
 // Encode a P-skip slice compatible with those parameter sets
 pSkipBytes, _ := encode.EncodePSkipSliceFromSPSPPS(sps, pps, poc)
@@ -302,13 +302,13 @@ VPS/SPS/PPS prefixed. The caller is responsible for providing the parameter set
 NALUs separately (e.g., in the MP4 decoder configuration record or prepended to
 the Annex-B stream).
 
-**IDR slice (`EncodeIDRSliceFromSPSPPS`):** Encodes a full intra frame using DC
-prediction, respecting the external PPS QP (`26 + init_qp_minus26`) and writing
-the correct slice header fields: `slice_pic_parameter_set_id`,
-`num_extra_slice_header_bits`, SAO flags (if enabled in SPS), deblocking filter
-syntax (if controlled in PPS), and `slice_loop_filter_across_slices_enabled_flag`.
-Currently requires CTU size 16 (`log2MinCbSize=4, log2Diff=0`); larger CTU sizes
-are rejected with an error.
+**IDR slice (`EncodeIDRSliceFromSPSPPS`):** Encodes a full intra frame from a
+grid and color map using DC prediction, respecting the external PPS QP
+(`26 + init_qp_minus26`) and writing the correct slice header fields:
+`slice_pic_parameter_set_id`, `num_extra_slice_header_bits`, SAO flags (if
+enabled in SPS), deblocking filter syntax (if controlled in PPS), and
+`slice_loop_filter_across_slices_enabled_flag`. Currently requires CTU size 16
+(`log2MinCbSize=4, log2Diff=0`); larger CTU sizes are rejected with an error.
 
 **P-skip slice (`EncodePSkipSliceFromSPSPPS`):** Encodes an all-skip frame with
 the correct POC, short-term reference picture set (inline or SPS-indexed),
@@ -321,5 +321,5 @@ dependent slice segments, and weighted prediction. The IDR function additionally
 validates that the CTU size is 16.
 
 **`FrameEncoder` methods:** The `FrameEncoder` type exposes
-`EncodeIDRSliceFromSPSPPS` and `EncodePSkipSliceFromSPSPPS` methods that build
-pixel data from the grid/color map before delegating to the standalone functions.
+`EncodeIDRSliceFromSPSPPS` and `EncodePSkipSliceFromSPSPPS` methods that
+delegate to the standalone functions using the encoder's grid and color map.

@@ -237,21 +237,23 @@ import (
 dec := decoder.New()
 frames, err := dec.DecodeAnnexB(data)
 
-// Generate HEVC test bitstream from raw YUV planes
-p := encode.EncodeParams{Width: 320, Height: 240, QP: 26}
-annexB, err := encode.EncodeIDRFrame(p, yPlane, cbPlane, crPlane)
-
-// Generate HEVC from grid pattern (uses hi264's yuv package)
+// Generate HEVC from grid pattern (each cell = one 16x16 CTU)
 grid, _ := yuv.ParseGrid("AB,CD")
 colors := yuv.ColorMap{'A': yuv.Color{16, 128, 128}, 'B': yuv.Color{128, 128, 128}}
-enc := &encode.FrameEncoder{Grid: grid, Colors: colors, QP: 26}
-annexB, err = enc.Encode()
+p := encode.EncodeParams{Width: 32, Height: 32, QP: 26}
+vpsSPSPPS, _ := encode.GenerateVPSSPSPPS(p)
+idrSlice, _ := encode.GenerateIDR(p, grid, colors)
+annexB := append(vpsSPSPPS, idrSlice...)
+
+// Generate a P-skip frame (copies IDR content unchanged)
+pSkip, _ := encode.GeneratePSkip(p, 1)
+annexB = append(annexB, pSkip...)
 
 // Encode IDR and P-skip slices compatible with external SPS/PPS
 // (e.g., parameter sets from an MP4 sample description or third-party encoder)
 sps, _ := hevc.ParseSPSNALUnit(spsNALU)
 pps, _ := hevc.ParsePPSNALUnit(ppsNALU, spsMap)
-idrSlice, err := encode.EncodeIDRSliceFromSPSPPS(sps, pps, yPlane, cbPlane, crPlane)
+idrSlice, err := encode.EncodeIDRSliceFromSPSPPS(sps, pps, grid, colors)
 pSkipSlice, err := encode.EncodePSkipSliceFromSPSPPS(sps, pps, poc)
 ```
 
@@ -263,9 +265,10 @@ parameter sets:
 
 ```go
 import (
+    "github.com/Eyevinn/hi264/pkg/yuv"
+    "github.com/Eyevinn/hi265/pkg/encode"
     "github.com/Eyevinn/mp4ff/avc"
     "github.com/Eyevinn/mp4ff/hevc"
-    "github.com/Eyevinn/hi265/pkg/encode"
 )
 
 // Parse parameter sets from the existing bitstream
@@ -286,24 +289,17 @@ for _, nalu := range nalus {
     }
 }
 
-// Create a black frame, using the color range from the SPS VUI.
-// Black is range-dependent (Y=16 limited, Y=0 full) but independent of
-// color primaries. For non-black content, use sps.VUI.MatrixCoefficients
-// to select the correct RGB-to-YCbCr conversion (1=BT.709, 6=BT.601, 9=BT.2020).
+// Create a black grid matching the SPS dimensions (each cell = one 16x16 CTU)
 w := int(sps.PicWidthInLumaSamples)
 h := int(sps.PicHeightInLumaSamples)
 blackY := uint8(16)  // limited range black
 if sps.VUI != nil && sps.VUI.VideoFullRangeFlag {
     blackY = 0       // full range black
 }
-y := make([]uint8, w*h)
-cb := make([]uint8, w/2*h/2)
-cr := make([]uint8, w/2*h/2)
-for i := range y { y[i] = blackY }
-for i := range cb { cb[i] = 128; cr[i] = 128 }
+grid, colors := yuv.SolidGrid(w, h, yuv.Color{blackY, 128, 128})
 
 // Encode a black IDR slice using the existing parameter sets
-idrSlice, _ := encode.EncodeIDRSliceFromSPSPPS(sps, pps, y, cb, cr)
+idrSlice, _ := encode.EncodeIDRSliceFromSPSPPS(sps, pps, grid, colors)
 
 // Encode a P-skip slice (copies the IDR frame unchanged)
 pSkipSlice, _ := encode.EncodePSkipSliceFromSPSPPS(sps, pps, 2) // POC=2
@@ -317,7 +313,7 @@ stream = append(stream, pSkipSlice...)
 
 ```
 pkg/decoder/       — Public: top-level decoder API (DecodeAnnexB)
-pkg/encode/        — Public: bitstream generator API (IDR + P-skip encoder, FrameEncoder)
+pkg/encode/        — Public: bitstream generator API (GenerateIDR, GeneratePSkip, FrameEncoder)
 pkg/frame/         — Public: Frame type (decoded output)
 internal/cabac/    — Internal: CABAC arithmetic decoder and encoder engines
 internal/context/  — Internal: Context model initialization (170 contexts)

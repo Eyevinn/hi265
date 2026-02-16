@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/Eyevinn/hi264/pkg/yuv"
 	"github.com/Eyevinn/hi265/internal/cabac"
 	"github.com/Eyevinn/hi265/internal/context"
 	"github.com/Eyevinn/hi265/internal/transform"
@@ -128,17 +129,19 @@ func TestReconstructionDebug(t *testing.T) {
 }
 
 func TestEncodeWriteFile(t *testing.T) {
-	width, height := 16, 16
-	qp := 26
+	p := EncodeParams{Width: 16, Height: 16, QP: 26}
+	grid, _ := yuv.ParseGrid("A")
+	colors := yuv.ColorMap{'A': yuv.Color{Y: 16, Cb: 128, Cr: 128}}
 
-	y := makeUniform(width*height, 16)
-	cb := makeUniform(width/2*height/2, 128)
-	cr := makeUniform(width/2*height/2, 128)
-
-	annexB, err := EncodeIDRFrame(EncodeParams{Width: width, Height: height, QP: qp}, y, cb, cr)
+	vpsSPSPPS, err := GenerateVPSSPSPPS(p)
 	if err != nil {
-		t.Fatalf("EncodeIDRFrame: %v", err)
+		t.Fatalf("GenerateVPSSPSPPS: %v", err)
 	}
+	idr, err := GenerateIDR(p, grid, colors)
+	if err != nil {
+		t.Fatalf("GenerateIDR: %v", err)
+	}
+	annexB := append(vpsSPSPPS, idr...)
 
 	// Write to file for manual FFmpeg testing
 	_ = os.WriteFile("/tmp/test_encode.265", annexB, 0644)

@@ -4,6 +4,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/Eyevinn/hi264/pkg/yuv"
 	"github.com/Eyevinn/mp4ff/avc"
 	"github.com/Eyevinn/mp4ff/hevc"
 
@@ -11,20 +12,20 @@ import (
 )
 
 func TestEncodeBlack16x16(t *testing.T) {
-	width, height := 16, 16
-	qp := 26
+	p := EncodeParams{Width: 16, Height: 16, QP: 26}
+	grid, _ := yuv.ParseGrid("A")
+	colors := yuv.ColorMap{'A': yuv.Color{Y: 16, Cb: 128, Cr: 128}}
 
-	// Black frame: Y=16 (BT.601 black), Cb=Cr=128 (neutral chroma)
-	y := makeUniform(width*height, 16)
-	cb := makeUniform(width/2*height/2, 128)
-	cr := makeUniform(width/2*height/2, 128)
-
-	annexB, err := EncodeIDRFrame(EncodeParams{Width: width, Height: height, QP: qp}, y, cb, cr)
+	vpsSPSPPS, err := GenerateVPSSPSPPS(p)
 	if err != nil {
-		t.Fatalf("EncodeIDRFrame: %v", err)
+		t.Fatalf("GenerateVPSSPSPPS: %v", err)
 	}
+	idr, err := GenerateIDR(p, grid, colors)
+	if err != nil {
+		t.Fatalf("GenerateIDR: %v", err)
+	}
+	annexB := append(vpsSPSPPS, idr...)
 
-	// Decode with our decoder
 	dec := decoder.New()
 	frames, err := dec.DecodeAnnexB(annexB)
 	if err != nil {
@@ -35,28 +36,21 @@ func TestEncodeBlack16x16(t *testing.T) {
 	}
 
 	f := frames[0]
-
-	// Verify dimensions
-	if f.Width != width || f.Height != height {
-		t.Fatalf("dimensions: got %dx%d, want %dx%d", f.Width, f.Height, width, height)
+	if f.Width != 16 || f.Height != 16 {
+		t.Fatalf("dimensions: got %dx%d, want 16x16", f.Width, f.Height)
 	}
 
-	// Verify Y pixels
-	for i, v := range f.Y[:width*height] {
+	for i, v := range f.Y[:16*16] {
 		if abs(int(v)-16) > 1 {
 			t.Fatalf("Y[%d] = %d, want 16 (±1)", i, v)
 		}
 	}
-
-	// Verify Cb pixels
-	for i, v := range f.Cb[:width/2*height/2] {
+	for i, v := range f.Cb[:8*8] {
 		if abs(int(v)-128) > 1 {
 			t.Fatalf("Cb[%d] = %d, want 128 (±1)", i, v)
 		}
 	}
-
-	// Verify Cr pixels
-	for i, v := range f.Cr[:width/2*height/2] {
+	for i, v := range f.Cr[:8*8] {
 		if abs(int(v)-128) > 1 {
 			t.Fatalf("Cr[%d] = %d, want 128 (±1)", i, v)
 		}
@@ -64,17 +58,19 @@ func TestEncodeBlack16x16(t *testing.T) {
 }
 
 func TestEncodeBlack32x32(t *testing.T) {
-	width, height := 32, 32
-	qp := 26
+	p := EncodeParams{Width: 32, Height: 32, QP: 26}
+	grid, _ := yuv.ParseGrid("AA,AA")
+	colors := yuv.ColorMap{'A': yuv.Color{Y: 16, Cb: 128, Cr: 128}}
 
-	y := makeUniform(width*height, 16)
-	cb := makeUniform(width/2*height/2, 128)
-	cr := makeUniform(width/2*height/2, 128)
-
-	annexB, err := EncodeIDRFrame(EncodeParams{Width: width, Height: height, QP: qp}, y, cb, cr)
+	vpsSPSPPS, err := GenerateVPSSPSPPS(p)
 	if err != nil {
-		t.Fatalf("EncodeIDRFrame: %v", err)
+		t.Fatalf("GenerateVPSSPSPPS: %v", err)
 	}
+	idr, err := GenerateIDR(p, grid, colors)
+	if err != nil {
+		t.Fatalf("GenerateIDR: %v", err)
+	}
+	annexB := append(vpsSPSPPS, idr...)
 
 	dec := decoder.New()
 	frames, err := dec.DecodeAnnexB(annexB)
@@ -86,7 +82,7 @@ func TestEncodeBlack32x32(t *testing.T) {
 	}
 
 	f := frames[0]
-	for i, v := range f.Y[:width*height] {
+	for i, v := range f.Y[:32*32] {
 		if abs(int(v)-16) > 1 {
 			t.Fatalf("Y[%d] = %d, want 16 (±1)", i, v)
 		}
@@ -94,18 +90,19 @@ func TestEncodeBlack32x32(t *testing.T) {
 }
 
 func TestEncodeGray16x16(t *testing.T) {
-	width, height := 16, 16
-	qp := 26
+	p := EncodeParams{Width: 16, Height: 16, QP: 26}
+	grid, _ := yuv.ParseGrid("A")
+	colors := yuv.ColorMap{'A': yuv.Color{Y: 128, Cb: 128, Cr: 128}}
 
-	// Gray frame: Y=128
-	y := makeUniform(width*height, 128)
-	cb := makeUniform(width/2*height/2, 128)
-	cr := makeUniform(width/2*height/2, 128)
-
-	annexB, err := EncodeIDRFrame(EncodeParams{Width: width, Height: height, QP: qp}, y, cb, cr)
+	vpsSPSPPS, err := GenerateVPSSPSPPS(p)
 	if err != nil {
-		t.Fatalf("EncodeIDRFrame: %v", err)
+		t.Fatalf("GenerateVPSSPSPPS: %v", err)
 	}
+	idr, err := GenerateIDR(p, grid, colors)
+	if err != nil {
+		t.Fatalf("GenerateIDR: %v", err)
+	}
+	annexB := append(vpsSPSPPS, idr...)
 
 	dec := decoder.New()
 	frames, err := dec.DecodeAnnexB(annexB)
@@ -117,7 +114,7 @@ func TestEncodeGray16x16(t *testing.T) {
 	}
 
 	f := frames[0]
-	for i, v := range f.Y[:width*height] {
+	for i, v := range f.Y[:16*16] {
 		if abs(int(v)-128) > 1 {
 			t.Fatalf("Y[%d] = %d, want 128 (±1)", i, v)
 		}
@@ -125,29 +122,25 @@ func TestEncodeGray16x16(t *testing.T) {
 }
 
 func TestEncodePSkip(t *testing.T) {
-	width, height := 16, 16
-	qp := 26
+	p := EncodeParams{Width: 16, Height: 16, QP: 26}
+	grid, _ := yuv.ParseGrid("A")
+	colors := yuv.ColorMap{'A': yuv.Color{Y: 16, Cb: 128, Cr: 128}}
 
-	y := makeUniform(width*height, 16)
-	cb := makeUniform(width/2*height/2, 128)
-	cr := makeUniform(width/2*height/2, 128)
-
-	// Encode IDR
-	idrBytes, err := EncodeIDRFrame(EncodeParams{Width: width, Height: height, QP: qp}, y, cb, cr)
+	vpsSPSPPS, err := GenerateVPSSPSPPS(p)
 	if err != nil {
-		t.Fatalf("EncodeIDRFrame: %v", err)
+		t.Fatalf("GenerateVPSSPSPPS: %v", err)
+	}
+	idr, err := GenerateIDR(p, grid, colors)
+	if err != nil {
+		t.Fatalf("GenerateIDR: %v", err)
+	}
+	pSkip, err := GeneratePSkip(p, 1)
+	if err != nil {
+		t.Fatalf("GeneratePSkip: %v", err)
 	}
 
-	// Encode P-skip
-	pBytes, err := EncodePSkipFrame(EncodeParams{Width: width, Height: height, QP: qp}, 1)
-	if err != nil {
-		t.Fatalf("EncodePSkipFrame: %v", err)
-	}
-
-	// Concatenate and decode
-	stream := make([]byte, 0, len(idrBytes)+len(pBytes))
-	stream = append(stream, idrBytes...)
-	stream = append(stream, pBytes...)
+	stream := append(vpsSPSPPS, idr...)
+	stream = append(stream, pSkip...)
 
 	dec := decoder.New()
 	frames, err := dec.DecodeAnnexB(stream)
@@ -158,12 +151,11 @@ func TestEncodePSkip(t *testing.T) {
 		t.Fatalf("expected 2 frames, got %d", len(frames))
 	}
 
-	// P-frame should match IDR frame (copy)
-	idr := frames[0]
+	idrFrame := frames[0]
 	pFrame := frames[1]
-	for i := range width * height {
-		if idr.Y[i] != pFrame.Y[i] {
-			t.Fatalf("P-frame Y[%d] = %d, want %d (IDR)", i, pFrame.Y[i], idr.Y[i])
+	for i := range 16 * 16 {
+		if idrFrame.Y[i] != pFrame.Y[i] {
+			t.Fatalf("P-frame Y[%d] = %d, want %d (IDR)", i, pFrame.Y[i], idrFrame.Y[i])
 		}
 	}
 }
@@ -172,25 +164,19 @@ func TestEncodePSkip(t *testing.T) {
 // IDR slice by parsing SPS/PPS from an encoder-generated stream, then using the
 // new API to produce a compatible IDR frame.
 func TestEncodeIDRFromSPSPPS(t *testing.T) {
-	width, height := 16, 16
-	qp := 26
+	p := EncodeParams{Width: 16, Height: 16, QP: 26}
+	grid, _ := yuv.ParseGrid("A")
+	colors := yuv.ColorMap{'A': yuv.Color{Y: 16, Cb: 128, Cr: 128}}
 
-	y := makeUniform(width*height, 16)
-	cb := makeUniform(width/2*height/2, 128)
-	cr := makeUniform(width/2*height/2, 128)
-
-	// Encode IDR frame (includes VPS+SPS+PPS+IDR) to get parameter sets
-	idrBytes, err := EncodeIDRFrame(EncodeParams{Width: width, Height: height, QP: qp}, y, cb, cr)
+	vpsSPSPPS, err := GenerateVPSSPSPPS(p)
 	if err != nil {
-		t.Fatalf("EncodeIDRFrame: %v", err)
+		t.Fatalf("GenerateVPSSPSPPS: %v", err)
 	}
 
 	// Extract NALUs and parse SPS/PPS
-	nalus := avc.ExtractNalusFromByteStream(idrBytes)
+	nalus := avc.ExtractNalusFromByteStream(vpsSPSPPS)
 	spsMap := make(map[uint32]*hevc.SPS)
-	var vpsNALU []byte
-	var spsNALU []byte
-	var ppsNALU []byte
+	var vpsNALU, spsNALU, ppsNALU []byte
 	var sps *hevc.SPS
 	var pps *hevc.PPS
 
@@ -198,8 +184,7 @@ func TestEncodeIDRFromSPSPPS(t *testing.T) {
 		if len(nalu) < 2 {
 			continue
 		}
-		naluType := hevc.GetNaluType(nalu[0])
-		switch naluType {
+		switch hevc.GetNaluType(nalu[0]) {
 		case hevc.NALU_VPS:
 			vpsNALU = nalu
 		case hevc.NALU_SPS:
@@ -223,7 +208,7 @@ func TestEncodeIDRFromSPSPPS(t *testing.T) {
 	}
 
 	// Generate IDR slice using external SPS/PPS
-	idrSliceBytes, err := EncodeIDRSliceFromSPSPPS(sps, pps, y, cb, cr)
+	idrSliceBytes, err := EncodeIDRSliceFromSPSPPS(sps, pps, grid, colors)
 	if err != nil {
 		t.Fatalf("EncodeIDRSliceFromSPSPPS: %v", err)
 	}
@@ -242,19 +227,18 @@ func TestEncodeIDRFromSPSPPS(t *testing.T) {
 		t.Fatalf("expected 1 frame, got %d", len(frames))
 	}
 
-	// Verify decoded pixels match input (±1 for quantization)
 	f := frames[0]
-	for i, v := range f.Y[:width*height] {
+	for i, v := range f.Y[:16*16] {
 		if abs(int(v)-16) > 1 {
 			t.Fatalf("Y[%d] = %d, want 16 (±1)", i, v)
 		}
 	}
-	for i, v := range f.Cb[:width/2*height/2] {
+	for i, v := range f.Cb[:8*8] {
 		if abs(int(v)-128) > 1 {
 			t.Fatalf("Cb[%d] = %d, want 128 (±1)", i, v)
 		}
 	}
-	for i, v := range f.Cr[:width/2*height/2] {
+	for i, v := range f.Cr[:8*8] {
 		if abs(int(v)-128) > 1 {
 			t.Fatalf("Cr[%d] = %d, want 128 (±1)", i, v)
 		}
@@ -264,25 +248,19 @@ func TestEncodeIDRFromSPSPPS(t *testing.T) {
 // TestEncodeIDRAndPSkipFromSPSPPS tests the full workflow: encode IDR + P-skip
 // both using external SPS/PPS from an initial encoder stream.
 func TestEncodeIDRAndPSkipFromSPSPPS(t *testing.T) {
-	width, height := 32, 32
-	qp := 26
+	p := EncodeParams{Width: 32, Height: 32, QP: 26}
+	grid, _ := yuv.ParseGrid("AA,AA")
+	colors := yuv.ColorMap{'A': yuv.Color{Y: 16, Cb: 128, Cr: 128}}
 
-	y := makeUniform(width*height, 16)
-	cb := makeUniform(width/2*height/2, 128)
-	cr := makeUniform(width/2*height/2, 128)
-
-	// Encode IDR frame to get parameter sets
-	idrBytes, err := EncodeIDRFrame(EncodeParams{Width: width, Height: height, QP: qp}, y, cb, cr)
+	vpsSPSPPS, err := GenerateVPSSPSPPS(p)
 	if err != nil {
-		t.Fatalf("EncodeIDRFrame: %v", err)
+		t.Fatalf("GenerateVPSSPSPPS: %v", err)
 	}
 
 	// Extract NALUs and parse SPS/PPS
-	nalus := avc.ExtractNalusFromByteStream(idrBytes)
+	nalus := avc.ExtractNalusFromByteStream(vpsSPSPPS)
 	spsMap := make(map[uint32]*hevc.SPS)
-	var vpsNALU []byte
-	var spsNALU []byte
-	var ppsNALU []byte
+	var vpsNALU, spsNALU, ppsNALU []byte
 	var sps *hevc.SPS
 	var pps *hevc.PPS
 
@@ -290,8 +268,7 @@ func TestEncodeIDRAndPSkipFromSPSPPS(t *testing.T) {
 		if len(nalu) < 2 {
 			continue
 		}
-		naluType := hevc.GetNaluType(nalu[0])
-		switch naluType {
+		switch hevc.GetNaluType(nalu[0]) {
 		case hevc.NALU_VPS:
 			vpsNALU = nalu
 		case hevc.NALU_SPS:
@@ -311,7 +288,7 @@ func TestEncodeIDRAndPSkipFromSPSPPS(t *testing.T) {
 	}
 
 	// Generate IDR using external SPS/PPS
-	idrSliceBytes, err := EncodeIDRSliceFromSPSPPS(sps, pps, y, cb, cr)
+	idrSliceBytes, err := EncodeIDRSliceFromSPSPPS(sps, pps, grid, colors)
 	if err != nil {
 		t.Fatalf("EncodeIDRSliceFromSPSPPS: %v", err)
 	}
@@ -338,10 +315,9 @@ func TestEncodeIDRAndPSkipFromSPSPPS(t *testing.T) {
 		t.Fatalf("expected 2 frames, got %d", len(frames))
 	}
 
-	// P-frame should be pixel-exact copy of IDR
 	idrFrame := frames[0]
 	pFrame := frames[1]
-	for i := range width * height {
+	for i := range 32 * 32 {
 		if idrFrame.Y[i] != pFrame.Y[i] {
 			t.Fatalf("P-frame Y[%d] = %d, want %d (IDR)", i, pFrame.Y[i], idrFrame.Y[i])
 		}
@@ -349,29 +325,26 @@ func TestEncodeIDRAndPSkipFromSPSPPS(t *testing.T) {
 }
 
 // TestEncodePSkipFromSPSPPS tests that EncodePSkipSliceFromSPSPPS generates a valid
-// P-skip slice by parsing SPS/PPS from an encoder-generated stream, then using the
-// new API to produce a compatible P-skip frame.
+// P-skip slice by parsing SPS/PPS from an encoder-generated stream.
 func TestEncodePSkipFromSPSPPS(t *testing.T) {
-	width, height := 16, 16
-	qp := 26
+	p := EncodeParams{Width: 16, Height: 16, QP: 26}
+	grid, _ := yuv.ParseGrid("A")
+	colors := yuv.ColorMap{'A': yuv.Color{Y: 16, Cb: 128, Cr: 128}}
 
-	y := makeUniform(width*height, 16)
-	cb := makeUniform(width/2*height/2, 128)
-	cr := makeUniform(width/2*height/2, 128)
-
-	// Encode IDR frame (includes VPS+SPS+PPS+IDR)
-	idrBytes, err := EncodeIDRFrame(EncodeParams{Width: width, Height: height, QP: qp}, y, cb, cr)
+	vpsSPSPPS, err := GenerateVPSSPSPPS(p)
 	if err != nil {
-		t.Fatalf("EncodeIDRFrame: %v", err)
+		t.Fatalf("GenerateVPSSPSPPS: %v", err)
+	}
+	idrBytes, err := GenerateIDR(p, grid, colors)
+	if err != nil {
+		t.Fatalf("GenerateIDR: %v", err)
 	}
 
 	// Extract NALUs and parse SPS/PPS
-	nalus := avc.ExtractNalusFromByteStream(idrBytes)
+	fullStream := append(vpsSPSPPS, idrBytes...)
+	nalus := avc.ExtractNalusFromByteStream(fullStream)
 	spsMap := make(map[uint32]*hevc.SPS)
-	var vpsNALU []byte
-	var spsNALU []byte
-	var ppsNALU []byte
-	var idrNALU []byte
+	var vpsNALU, spsNALU, ppsNALU, idrNALU []byte
 	var sps *hevc.SPS
 	var pps *hevc.PPS
 
@@ -379,8 +352,7 @@ func TestEncodePSkipFromSPSPPS(t *testing.T) {
 		if len(nalu) < 2 {
 			continue
 		}
-		naluType := hevc.GetNaluType(nalu[0])
-		switch naluType {
+		switch hevc.GetNaluType(nalu[0]) {
 		case hevc.NALU_VPS:
 			vpsNALU = nalu
 		case hevc.NALU_SPS:
@@ -411,7 +383,7 @@ func TestEncodePSkipFromSPSPPS(t *testing.T) {
 		t.Fatalf("EncodePSkipSliceFromSPSPPS: %v", err)
 	}
 
-	// Build stream: reuse original VPS+SPS+PPS+IDR, append new P-skip
+	// Decode IDR first
 	dec := decoder.New()
 	frames, err := dec.DecodeNALUs([][]byte{vpsNALU, spsNALU, ppsNALU, idrNALU})
 	if err != nil {
@@ -421,7 +393,7 @@ func TestEncodePSkipFromSPSPPS(t *testing.T) {
 		t.Fatalf("expected 1 IDR frame, got %d", len(frames))
 	}
 
-	// Now decode the P-skip NALU
+	// Decode P-skip
 	pNalus := avc.ExtractNalusFromByteStream(pSkipBytes)
 	pFrames, err := dec.DecodeNALUs(pNalus)
 	if err != nil {
@@ -431,15 +403,14 @@ func TestEncodePSkipFromSPSPPS(t *testing.T) {
 		t.Fatalf("expected 1 P-skip frame, got %d", len(pFrames))
 	}
 
-	// P-frame should be pixel-exact copy of IDR
 	idrFrame := frames[0]
 	pFrame := pFrames[0]
-	for i := range width * height {
+	for i := range 16 * 16 {
 		if idrFrame.Y[i] != pFrame.Y[i] {
 			t.Fatalf("P-frame Y[%d] = %d, want %d (IDR)", i, pFrame.Y[i], idrFrame.Y[i])
 		}
 	}
-	for i := range width / 2 * height / 2 {
+	for i := range 8 * 8 {
 		if idrFrame.Cb[i] != pFrame.Cb[i] {
 			t.Fatalf("P-frame Cb[%d] = %d, want %d (IDR)", i, pFrame.Cb[i], idrFrame.Cb[i])
 		}
@@ -450,9 +421,7 @@ func TestEncodePSkipFromSPSPPS(t *testing.T) {
 }
 
 // TestEncodePSkipFromSPSPPS_x265 tests compatibility with an x265-generated bitstream.
-// It parses SPS/PPS from an existing test bitstream and generates a P-skip slice.
 func TestEncodePSkipFromSPSPPS_x265(t *testing.T) {
-	// Use an x265-generated test bitstream
 	testFiles := []string{
 		"../../testdata/gray_2frames_128x64.265",
 	}
@@ -473,8 +442,7 @@ func TestEncodePSkipFromSPSPPS_x265(t *testing.T) {
 				if len(nalu) < 2 {
 					continue
 				}
-				naluType := hevc.GetNaluType(nalu[0])
-				switch naluType {
+				switch hevc.GetNaluType(nalu[0]) {
 				case hevc.NALU_SPS:
 					sps, err = hevc.ParseSPSNALUnit(nalu)
 					if err != nil {
@@ -493,14 +461,11 @@ func TestEncodePSkipFromSPSPPS_x265(t *testing.T) {
 				t.Fatal("failed to parse SPS/PPS from test bitstream")
 			}
 
-			// Generate P-skip slice - should not error
-			_, err = EncodePSkipSliceFromSPSPPS(sps, pps, 2)
+			pSkipBytes, err := EncodePSkipSliceFromSPSPPS(sps, pps, 2)
 			if err != nil {
 				t.Fatalf("EncodePSkipSliceFromSPSPPS: %v", err)
 			}
 
-			// Concatenate original stream + new P-skip and decode all
-			pSkipBytes, _ := EncodePSkipSliceFromSPSPPS(sps, pps, 2)
 			stream := make([]byte, 0, len(data)+len(pSkipBytes))
 			stream = append(stream, data...)
 			stream = append(stream, pSkipBytes...)
@@ -511,12 +476,10 @@ func TestEncodePSkipFromSPSPPS_x265(t *testing.T) {
 				t.Fatalf("DecodeAnnexB: %v", err)
 			}
 
-			// Should have original frames + 1 P-skip frame
 			if len(frames) < 2 {
 				t.Fatalf("expected at least 2 frames, got %d", len(frames))
 			}
 
-			// Last frame (P-skip) should match previous frame (pixel-exact copy)
 			prev := frames[len(frames)-2]
 			pSkip := frames[len(frames)-1]
 			w := int(sps.PicWidthInLumaSamples)
@@ -531,34 +494,24 @@ func TestEncodePSkipFromSPSPPS_x265(t *testing.T) {
 }
 
 // TestEncodeTwoColor32x32 tests encoding a 32x32 frame with high-contrast content
-// (left half Y=235, right half Y=16). This exercises multi-CTU encoding with
-// significant residual coefficients. Quantization at QP=26 introduces loss;
-// the test validates that encode→decode round-trip produces reasonable results.
+// (left half Y=235, right half Y=16).
 func TestEncodeTwoColor32x32(t *testing.T) {
-	w, h := 32, 32
-	qp := 26
-
-	y := make([]uint8, w*h)
-	cb := make([]uint8, w/2*h/2)
-	cr := make([]uint8, w/2*h/2)
-	for py := 0; py < h; py++ {
-		for px := 0; px < w; px++ {
-			if px < 16 {
-				y[py*w+px] = 235
-			} else {
-				y[py*w+px] = 16
-			}
-		}
-	}
-	for i := range cb {
-		cb[i] = 128
-		cr[i] = 128
+	p := EncodeParams{Width: 32, Height: 32, QP: 26}
+	grid, _ := yuv.ParseGrid("AB,AB")
+	colors := yuv.ColorMap{
+		'A': yuv.Color{Y: 235, Cb: 128, Cr: 128},
+		'B': yuv.Color{Y: 16, Cb: 128, Cr: 128},
 	}
 
-	annexB, err := EncodeIDRFrame(EncodeParams{Width: w, Height: h, QP: qp}, y, cb, cr)
+	vpsSPSPPS, err := GenerateVPSSPSPPS(p)
 	if err != nil {
-		t.Fatalf("EncodeIDRFrame: %v", err)
+		t.Fatalf("GenerateVPSSPSPPS: %v", err)
 	}
+	idr, err := GenerateIDR(p, grid, colors)
+	if err != nil {
+		t.Fatalf("GenerateIDR: %v", err)
+	}
+	annexB := append(vpsSPSPPS, idr...)
 
 	d := decoder.New()
 	frames, err := d.DecodeAnnexB(annexB)
@@ -570,13 +523,10 @@ func TestEncodeTwoColor32x32(t *testing.T) {
 	}
 
 	f := frames[0]
-
-	// With QP=26 and high-contrast content, quantization loss up to ~7 is expected.
-	// The encoder's reconstruction may differ from the original by more than ±1.
 	maxAllowed := 7
-	for i := range w * h {
+	for i := range 32 * 32 {
 		expected := 235
-		if i%w >= 16 {
+		if i%32 >= 16 {
 			expected = 16
 		}
 		actual := int(f.Y[i])
