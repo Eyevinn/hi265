@@ -1,5 +1,8 @@
 # HEVC/H.265 Frame Decoder in Pure Go
 
+## Rules
+- Never add "Co-Authored-By" lines to git commits or pull requests
+
 ## Project Status
 
 Pure Go HEVC/H.265 decoder for IDR frames. Phase 1 target: decode a single

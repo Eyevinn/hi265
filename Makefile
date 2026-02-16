@@ -1,4 +1,4 @@
-.PHONY: all build test coverage check pre-commit-install pre-commit codespell clean install
+.PHONY: all build test coverage check pre-commit pre-commit-install codespell clean install
 
 LDFLAGS = -X github.com/Eyevinn/hi265/internal.commitVersion=$$(git describe --tags HEAD 2>/dev/null || echo dev-$$(git rev-parse --short HEAD)) \
           -X github.com/Eyevinn/hi265/internal.commitDate=$$(git log -1 --format=%ct)
@@ -25,20 +25,18 @@ coverage:
 check:
 	golangci-lint run
 
-venv:
-	python3 -m venv venv
-	venv/bin/pip install --upgrade pip
-	venv/bin/pip install pre-commit
-	venv/bin/pip install codespell
-
-pre-commit-install: venv
+pre-commit-install: venv/bin/pre-commit
 	venv/bin/pre-commit install
 
-pre-commit: venv
+pre-commit: venv/bin/pre-commit
 	venv/bin/pre-commit run --all-files
 
-codespell: venv
-	venv/bin/codespell -S venv,testdata,references -L pich,localy,ue
+venv/bin/pre-commit venv/bin/codespell:
+	python3 -m venv venv
+	venv/bin/pip install pre-commit codespell
+
+codespell: venv/bin/codespell
+	venv/bin/codespell -S venv,testdata,coverage.html,'*.y4m','*.265','*.hevc','*.mp4' -L pich,localy,ue
 
 clean:
 	rm -rf out/ coverage.out coverage.html coverage.txt venv/
