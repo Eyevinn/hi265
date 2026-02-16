@@ -1,0 +1,817 @@
+// Command hi265gen generates HEVC/H.265 bitstreams or raw images from grid patterns.
+//
+// Each character in a grid maps to one 16x16 CTU filled with a single flat color.
+// For HEVC output (.265, .hevc, .mp4), CTUs are encoded as intra with DC prediction.
+// For raw output (.png, .jpg, .yuv, .y4m), the grid pattern is rendered directly.
+//
+// Usage:
+//
+//	hi265gen -f pattern.gridimg -o output.265
+//	hi265gen -f pattern.gridimg -w 176 -h 80 -n 10 -digits 3 -o output.265
+//	hi265gen -w 176 -h 80 -n 10 -digits 3 -o output.265
+//	hi265gen -smpte -w 320 -o output.mp4
+package main
+
+import (
+	"bytes"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/Eyevinn/hi264/pkg/yuv"
+	"github.com/Eyevinn/hi265/internal"
+	"github.com/Eyevinn/hi265/pkg/encode"
+	"github.com/Eyevinn/mp4ff/avc"
+	"github.com/Eyevinn/mp4ff/mp4"
+)
+
+const appName = "hi265gen"
+
+var usg = `%s - generate HEVC/H.265 bitstreams or raw images from grid patterns.
+
+Usage:
+
+  %s -f pattern.gridimg -o output.265
+  %s -f pattern.gridimg -w 176 -h 80 -n 10 -digits 3 -o output.265
+  %s -w 176 -h 80 -n 10 -digits 3 -o output.265
+
+Output format is detected from the file extension:
+  .265/.hevc H.265 Annex-B bitstream (VPS+SPS+PPS once, then N slices)
+  .mp4       Fragmented MP4 (CMAF-compatible, configurable fps and fragment duration)
+  .y4m       Y4M multi-frame file
+  .yuv       Raw YUV420 (auto-adds _WxH_yuv420p suffix)
+  .png       PNG image (numbered _NNNN if -n > 1)
+  .jpg/.jpeg JPEG image (numbered _NNNN if -n > 1, -q for quality)
+  %%          Numbered images (e.g. frame_%%03d.png or frame_%%03d.jpg)
+
+Options:
+`
+
+type colorFlags []string
+
+func (c *colorFlags) String() string { return strings.Join(*c, ", ") }
+func (c *colorFlags) Set(s string) error {
+	*c = append(*c, s)
+	return nil
+}
+
+type options struct {
+	version     bool
+	grid        string
+	colors      colorFlags
+	imgFile     string
+	rgb         bool
+	smpte       bool
+	width       int
+	height      int
+	numFrames   int
+	digits      int
+	digitScale  int
+	digitBg     string
+	fg          string
+	bg          string
+	qp          int
+	idrInterval int
+	bpp         int
+	jpegQual    int
+	fps         int
+	fragDur     int
+	colorspace  string
+	fullRange   bool
+	output      string
+}
+
+func parseOptions(fs *flag.FlagSet, args []string) (*options, error) {
+	var opts options
+	fs.BoolVar(&opts.version, "version", false, "Get hi265 version")
+	fs.StringVar(&opts.grid, "grid", "", "grid pattern (rows separated by commas)")
+	fs.Var(&opts.colors, "c", "color spec: char=v1,v2,v3 (repeatable)")
+	fs.StringVar(&opts.imgFile, "f", "", "image file (.gridimg, alternative to -grid/-c)")
+	fs.BoolVar(&opts.rgb, "rgb", false, "interpret -c color values as RGB")
+	fs.BoolVar(&opts.smpte, "smpte", false, "use 75% SMPTE color bars as pattern")
+	fs.IntVar(&opts.width, "w", 0, "frame width in pixels (must be even; default: grid-derived)")
+	fs.IntVar(&opts.height, "h", 0, "frame height in pixels (must be even; default: grid-derived)")
+	fs.IntVar(&opts.numFrames, "n", 1, "number of frames")
+	fs.IntVar(&opts.digits, "digits", 0, "number of counter digits (0 = no counter)")
+	fs.IntVar(&opts.digitScale, "digit-scale", 0, "digit scale factor (0 = auto)")
+	fs.StringVar(&opts.digitBg, "digit-bg", "", "digit background box color (R,G,B)")
+	fs.StringVar(&opts.fg, "fg", "255,255,255", "foreground RGB color for counter (R,G,B)")
+	fs.StringVar(&opts.bg, "bg", "0,0,0", "background RGB color for counter (R,G,B)")
+	fs.IntVar(&opts.qp, "qp", 26, "quantization parameter (0-51)")
+	fs.IntVar(&opts.idrInterval, "idr-interval", 0, "frames between IDR frames (0 = every frame is IDR)")
+	fs.IntVar(&opts.bpp, "bpp", 0, "target bytes per picture (pad with filler NALUs)")
+	fs.IntVar(&opts.jpegQual, "q", 85, "JPEG quality (1-100)")
+	fs.IntVar(&opts.fps, "fps", 25, "framerate for MP4 output")
+	fs.IntVar(&opts.fragDur, "frag-dur", 25, "fragment duration in frames for MP4 output")
+	fs.StringVar(&opts.colorspace, "colorspace", "bt601", "color space (bt601, bt709, bt2020)")
+	fs.BoolVar(&opts.fullRange, "full-range", false, "use full-range YCbCr (0-255)")
+	fs.StringVar(&opts.output, "o", "", "output file (required)")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, usg, appName, appName, appName, appName)
+		fs.PrintDefaults()
+	}
+	err := fs.Parse(args[1:])
+	return &opts, err
+}
+
+func parseRGBWithCS(s string, cs yuv.ColorSpace, rng yuv.Range) (yuv.Color, error) {
+	parts := strings.Split(s, ",")
+	if len(parts) != 3 {
+		return yuv.Color{}, fmt.Errorf("expected R,G,B got %q", s)
+	}
+	var rgb [3]uint8
+	for i, p := range parts {
+		v, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil {
+			return yuv.Color{}, fmt.Errorf("invalid color component %q: %w", p, err)
+		}
+		if v < 0 || v > 255 {
+			return yuv.Color{}, fmt.Errorf("color component %d out of range [0,255]", v)
+		}
+		rgb[i] = uint8(v)
+	}
+	return yuv.RGBToYCbCrCS(rgb[0], rgb[1], rgb[2], cs, rng), nil
+}
+
+func main() {
+	if err := run(os.Args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	fs := flag.NewFlagSet(appName, flag.ContinueOnError)
+	opts, err := parseOptions(fs, args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+
+	if opts.version {
+		fmt.Printf("%s %s\n", appName, internal.GetVersion())
+		return nil
+	}
+
+	if opts.output == "" {
+		fs.Usage()
+		return fmt.Errorf("-o output file is required")
+	}
+
+	if (opts.grid != "" || len(opts.colors) > 0) && opts.imgFile != "" {
+		return fmt.Errorf("-f and -grid/-c are mutually exclusive")
+	}
+	if opts.smpte && (opts.imgFile != "" || opts.grid != "") {
+		return fmt.Errorf("-smpte is mutually exclusive with -f and -grid/-c")
+	}
+
+	cs, err := yuv.ParseColorSpace(opts.colorspace)
+	if err != nil {
+		return err
+	}
+	var rng yuv.Range
+	if opts.fullRange {
+		rng = yuv.FullRange
+	}
+
+	var patGrid *yuv.Grid
+	var patColors yuv.ColorMap
+	hasGridInput := opts.imgFile != "" || opts.grid != "" || opts.smpte
+
+	if opts.smpte {
+		// Deferred: SMPTE grid created after mbWidth is known.
+	} else if opts.imgFile != "" {
+		f, ferr := os.Open(opts.imgFile)
+		if ferr != nil {
+			return ferr
+		}
+		defer f.Close()
+		var fileCS yuv.ColorSpace
+		patGrid, patColors, fileCS, err = yuv.ParseImageFileCS(f, opts.rgb, cs, rng)
+		if err != nil {
+			return fmt.Errorf("parsing image file: %w", err)
+		}
+		if opts.colorspace == "bt601" {
+			cs = fileCS
+		}
+	} else if opts.grid != "" {
+		patGrid, err = yuv.ParseGrid(opts.grid)
+		if err != nil {
+			return fmt.Errorf("parsing grid: %w", err)
+		}
+		patColors = make(yuv.ColorMap)
+		for _, cspec := range opts.colors {
+			ch, c, cerr := yuv.ParseColorSpecCS(cspec, opts.rgb, cs, rng)
+			if cerr != nil {
+				return fmt.Errorf("parsing color: %w", cerr)
+			}
+			patColors[ch] = c
+		}
+	}
+
+	tiled := opts.width > 0 || opts.height > 0
+
+	if !hasGridInput && !tiled {
+		fs.Usage()
+		return fmt.Errorf("either grid input (-f or -grid/-c) or -w/-h with -digits is required")
+	}
+	if !hasGridInput && tiled && opts.digits <= 0 {
+		return fmt.Errorf("-digits is required when using -w/-h without grid input")
+	}
+
+	if tiled {
+		if opts.width <= 0 || opts.width%2 != 0 {
+			return fmt.Errorf("width must be a positive even number, got %d", opts.width)
+		}
+		if opts.height <= 0 || opts.height%2 != 0 {
+			return fmt.Errorf("height must be a positive even number, got %d", opts.height)
+		}
+	}
+	if opts.numFrames <= 0 {
+		return fmt.Errorf("number of frames must be positive, got %d", opts.numFrames)
+	}
+	if opts.digits < 0 {
+		return fmt.Errorf("digits must be non-negative, got %d", opts.digits)
+	}
+	if opts.qp < 0 || opts.qp > 51 {
+		return fmt.Errorf("QP must be 0-51, got %d", opts.qp)
+	}
+	if opts.idrInterval < 0 {
+		return fmt.Errorf("idr-interval must be non-negative, got %d", opts.idrInterval)
+	}
+	if opts.bpp < 0 {
+		return fmt.Errorf("bpp must be non-negative, got %d", opts.bpp)
+	}
+	if opts.fps <= 0 {
+		return fmt.Errorf("fps must be positive, got %d", opts.fps)
+	}
+	if opts.fragDur <= 0 {
+		return fmt.Errorf("frag-dur must be positive, got %d", opts.fragDur)
+	}
+
+	fgColor, err := parseRGBWithCS(opts.fg, cs, rng)
+	if err != nil {
+		return fmt.Errorf("parsing -fg: %w", err)
+	}
+	bgColor, err := parseRGBWithCS(opts.bg, cs, rng)
+	if err != nil {
+		return fmt.Errorf("parsing -bg: %w", err)
+	}
+
+	var frameW, frameH int
+	if tiled {
+		frameW = opts.width
+		frameH = opts.height
+	} else if opts.smpte {
+		frameW = 7 * 16
+		frameH = 16
+	} else {
+		frameW = patGrid.Width * 16
+		frameH = patGrid.Height * 16
+	}
+
+	mbWidth := (frameW + 15) / 16
+	mbHeight := (frameH + 15) / 16
+
+	if opts.smpte {
+		patGrid, patColors = yuv.SMPTEBarsGridCS(mbWidth, cs, rng)
+	}
+
+	digitScale := opts.digitScale
+	if digitScale == 0 && opts.digits > 0 {
+		digitScale = yuv.AutoDigitScale(opts.digits, mbWidth, mbHeight)
+	}
+
+	var digitBg *yuv.Color
+	if opts.digitBg != "" && opts.digits > 0 {
+		c, derr := parseRGBWithCS(opts.digitBg, cs, rng)
+		if derr != nil {
+			return fmt.Errorf("parsing -digit-bg: %w", derr)
+		}
+		digitBg = &c
+	}
+
+	ext := strings.ToLower(filepath.Ext(opts.output))
+	hasPct := strings.Contains(opts.output, "%")
+
+	switch {
+	case ext == ".265" || ext == ".hevc":
+		return generateH265(opts, frameW, frameH, mbWidth, mbHeight,
+			bgColor, fgColor, patGrid, patColors, tiled, digitScale, digitBg, cs, rng)
+	case ext == ".mp4":
+		return generateMP4(opts, frameW, frameH, mbWidth, mbHeight,
+			bgColor, fgColor, patGrid, patColors, tiled, digitScale, digitBg, cs, rng)
+	case ext == ".y4m":
+		return generateY4M(opts, frameW, frameH, mbWidth, mbHeight,
+			bgColor, fgColor, patGrid, patColors, tiled, digitScale, digitBg, cs, rng)
+	case ext == ".yuv":
+		return generateYUV(opts, frameW, frameH, mbWidth, mbHeight,
+			bgColor, fgColor, patGrid, patColors, tiled, digitScale, digitBg)
+	case hasPct:
+		return generateFormattedImages(opts, frameW, frameH, mbWidth, mbHeight,
+			bgColor, fgColor, patGrid, patColors, tiled, digitScale, digitBg, cs, rng)
+	case ext == ".png" || ext == ".jpg" || ext == ".jpeg":
+		return generateNumberedImages(opts, frameW, frameH, mbWidth, mbHeight,
+			bgColor, fgColor, patGrid, patColors, tiled, digitScale, digitBg, cs, rng)
+	default:
+		return fmt.Errorf("unknown output format %q"+
+			" (use .265, .hevc, .mp4, .y4m, .yuv, .png, .jpg, or %% pattern)", ext)
+	}
+}
+
+// buildFrameGrid creates the grid and color map for frame i.
+func buildFrameGrid(i int, patGrid *yuv.Grid, patColors yuv.ColorMap,
+	mbW, mbH, numDigits, scale int, bg, fg yuv.Color,
+	digitBg *yuv.Color, tiled bool) (*yuv.Grid, yuv.ColorMap, error) {
+
+	if !tiled {
+		return patGrid, patColors, nil
+	}
+
+	if numDigits > 0 {
+		grid, colors, err := yuv.CounterGrid(i, numDigits, mbW, mbH, scale, bg, fg, digitBg)
+		if err != nil {
+			return nil, nil, err
+		}
+		if patGrid != nil {
+			grid, colors, err = yuv.TileBackground(grid, colors, patGrid, patColors)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		return grid, colors, nil
+	}
+
+	// Tiled mode without counter: solid bg + tile pattern
+	chars := make([][]byte, mbH)
+	for y := range mbH {
+		chars[y] = make([]byte, mbW)
+		for x := range mbW {
+			chars[y][x] = '.'
+		}
+	}
+	bgGrid := &yuv.Grid{Chars: chars, Width: mbW, Height: mbH}
+	bgColors := yuv.ColorMap{'.': bg}
+
+	grid, colors, err := yuv.TileBackground(bgGrid, bgColors, patGrid, patColors)
+	if err != nil {
+		return nil, nil, err
+	}
+	return grid, colors, nil
+}
+
+func padSlice(slice []byte, bpp int, frameIdx int) ([]byte, error) {
+	if bpp <= 0 {
+		return slice, nil
+	}
+	padded, err := encode.PadSlice(slice, bpp)
+	if err != nil {
+		return nil, fmt.Errorf("frame %d: %w", frameIdx, err)
+	}
+	return padded, nil
+}
+
+func generateH265(opts *options, frameW, frameH, mbWidth, mbHeight int,
+	bg, fg yuv.Color, patGrid *yuv.Grid, patColors yuv.ColorMap, tiled bool,
+	digitScale int, digitBg *yuv.Color, cs yuv.ColorSpace, rng yuv.Range) error {
+
+	f, err := os.Create(opts.output)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	grid, colors, err := buildFrameGrid(0, patGrid, patColors,
+		mbWidth, mbHeight, opts.digits, digitScale, bg, fg, digitBg, tiled)
+	if err != nil {
+		return err
+	}
+
+	enc := &encode.FrameEncoder{
+		Grid:       grid,
+		Colors:     colors,
+		QP:         opts.qp,
+		Width:      frameW,
+		Height:     frameH,
+		ColorSpace: cs,
+		Range:      rng,
+	}
+
+	// Write VPS+SPS+PPS once
+	var paramBuf bytes.Buffer
+	enc.EncodeVPSSPSPPS(&paramBuf)
+	if _, err := f.Write(paramBuf.Bytes()); err != nil {
+		return err
+	}
+
+	if opts.idrInterval > 0 {
+		err = generateH265WithPSkip(f, opts, mbWidth, mbHeight,
+			bg, fg, enc, patGrid, patColors, tiled, digitScale, digitBg)
+	} else {
+		err = generateH265AllIDR(f, opts, frameW, frameH, mbWidth, mbHeight,
+			bg, fg, patGrid, patColors, tiled, digitScale, digitBg, cs, rng)
+	}
+	if err != nil {
+		return err
+	}
+
+	idrInfo := ""
+	if opts.idrInterval > 0 {
+		idrInfo = fmt.Sprintf(", IDR every %d frames", opts.idrInterval)
+	}
+	bppInfo := ""
+	if opts.bpp > 0 {
+		bppInfo = fmt.Sprintf(", bpp=%d", opts.bpp)
+	}
+	fmt.Printf("Wrote %d frames %dx%d (HEVC, QP=%d%s%s) to %s\n",
+		opts.numFrames, frameW, frameH, opts.qp, idrInfo, bppInfo, opts.output)
+	return nil
+}
+
+func generateH265AllIDR(f *os.File, opts *options, frameW, frameH, mbWidth, mbHeight int,
+	bg, fg yuv.Color, patGrid *yuv.Grid, patColors yuv.ColorMap, tiled bool,
+	digitScale int, digitBg *yuv.Color, cs yuv.ColorSpace, rng yuv.Range) error {
+
+	for i := range opts.numFrames {
+		grid, colors, err := buildFrameGrid(i, patGrid, patColors,
+			mbWidth, mbHeight, opts.digits, digitScale, bg, fg, digitBg, tiled)
+		if err != nil {
+			return err
+		}
+		enc := &encode.FrameEncoder{
+			Grid:       grid,
+			Colors:     colors,
+			QP:         opts.qp,
+			Width:      frameW,
+			Height:     frameH,
+			ColorSpace: cs,
+			Range:      rng,
+		}
+		slice, err := enc.EncodeIDRSlice()
+		if err != nil {
+			return fmt.Errorf("frame %d: %w", i, err)
+		}
+		if slice, err = padSlice(slice, opts.bpp, i); err != nil {
+			return err
+		}
+		if _, err := f.Write(slice); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func generateH265WithPSkip(f *os.File, opts *options, mbWidth, mbHeight int,
+	bg, fg yuv.Color, enc *encode.FrameEncoder, patGrid *yuv.Grid, patColors yuv.ColorMap, tiled bool,
+	digitScale int, digitBg *yuv.Color) error {
+
+	poc := 1
+
+	for i := range opts.numFrames {
+		if i%opts.idrInterval == 0 {
+			grid, colors, err := buildFrameGrid(i, patGrid, patColors,
+				mbWidth, mbHeight, opts.digits, digitScale, bg, fg, digitBg, tiled)
+			if err != nil {
+				return err
+			}
+			enc.Grid = grid
+			enc.Colors = colors
+			slice, err := enc.EncodeIDRSlice()
+			if err != nil {
+				return fmt.Errorf("frame %d (IDR): %w", i, err)
+			}
+			if slice, err = padSlice(slice, opts.bpp, i); err != nil {
+				return err
+			}
+			if _, err := f.Write(slice); err != nil {
+				return err
+			}
+			poc = 1
+		} else {
+			slice, err := enc.EncodePSkipSlice(poc)
+			if err != nil {
+				return fmt.Errorf("frame %d (P_Skip): %w", i, err)
+			}
+			if slice, err = padSlice(slice, opts.bpp, i); err != nil {
+				return err
+			}
+			if _, err := f.Write(slice); err != nil {
+				return err
+			}
+			poc++
+		}
+	}
+	return nil
+}
+
+func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
+	bg, fg yuv.Color, patGrid *yuv.Grid, patColors yuv.ColorMap, tiled bool,
+	digitScale int, digitBg *yuv.Color, cs yuv.ColorSpace, rng yuv.Range) error {
+
+	f, err := os.Create(opts.output)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	grid, colors, err := buildFrameGrid(0, patGrid, patColors,
+		mbWidth, mbHeight, opts.digits, digitScale, bg, fg, digitBg, tiled)
+	if err != nil {
+		return err
+	}
+
+	enc := &encode.FrameEncoder{
+		Grid:       grid,
+		Colors:     colors,
+		QP:         opts.qp,
+		Width:      frameW,
+		Height:     frameH,
+		ColorSpace: cs,
+		Range:      rng,
+	}
+
+	// Create init segment with HEVC descriptor
+	init := mp4.CreateEmptyInit()
+	init.AddEmptyTrack(uint32(opts.fps), "video", "und")
+	trak := init.Moov.Trak
+	if err := trak.SetHEVCDescriptor("hvc1", enc.VPSNALUs(), enc.SPSNALUs(), enc.PPSNALUs(), nil, true); err != nil {
+		return fmt.Errorf("set HEVC descriptor: %w", err)
+	}
+	if err := init.Encode(f); err != nil {
+		return fmt.Errorf("write init segment: %w", err)
+	}
+
+	// Encode all frames
+	type frameSample struct {
+		data  []byte
+		isIDR bool
+	}
+	samples := make([]frameSample, 0, opts.numFrames)
+
+	if opts.idrInterval > 0 {
+		poc := 1
+		for i := range opts.numFrames {
+			if i%opts.idrInterval == 0 {
+				g, c, err := buildFrameGrid(i, patGrid, patColors,
+					mbWidth, mbHeight, opts.digits, digitScale, bg, fg, digitBg, tiled)
+				if err != nil {
+					return err
+				}
+				enc.Grid = g
+				enc.Colors = c
+				slice, err := enc.EncodeIDRSlice()
+				if err != nil {
+					return fmt.Errorf("frame %d (IDR): %w", i, err)
+				}
+				if slice, err = padSlice(slice, opts.bpp, i); err != nil {
+					return err
+				}
+				samples = append(samples, frameSample{data: slice, isIDR: true})
+				poc = 1
+			} else {
+				slice, err := enc.EncodePSkipSlice(poc)
+				if err != nil {
+					return fmt.Errorf("frame %d (P_Skip): %w", i, err)
+				}
+				if slice, err = padSlice(slice, opts.bpp, i); err != nil {
+					return err
+				}
+				samples = append(samples, frameSample{data: slice, isIDR: false})
+				poc++
+			}
+		}
+	} else {
+		for i := range opts.numFrames {
+			g, c, err := buildFrameGrid(i, patGrid, patColors,
+				mbWidth, mbHeight, opts.digits, digitScale, bg, fg, digitBg, tiled)
+			if err != nil {
+				return err
+			}
+			enc := &encode.FrameEncoder{
+				Grid:       g,
+				Colors:     c,
+				QP:         opts.qp,
+				Width:      frameW,
+				Height:     frameH,
+				ColorSpace: cs,
+				Range:      rng,
+			}
+			slice, err := enc.EncodeIDRSlice()
+			if err != nil {
+				return fmt.Errorf("frame %d: %w", i, err)
+			}
+			if slice, err = padSlice(slice, opts.bpp, i); err != nil {
+				return err
+			}
+			samples = append(samples, frameSample{data: slice, isIDR: true})
+		}
+	}
+
+	// Write samples as fragmented MP4
+	seqNum := uint32(1)
+	for fragStart := 0; fragStart < len(samples); fragStart += opts.fragDur {
+		fragEnd := min(fragStart+opts.fragDur, len(samples))
+
+		frag, err := mp4.CreateFragment(seqNum, 1)
+		if err != nil {
+			return fmt.Errorf("create fragment %d: %w", seqNum, err)
+		}
+
+		for i := fragStart; i < fragEnd; i++ {
+			sampleData := avc.ConvertByteStreamToNaluSample(samples[i].data)
+			flags := mp4.SyncSampleFlags
+			if !samples[i].isIDR {
+				flags = mp4.NonSyncSampleFlags
+			}
+			frag.AddFullSample(mp4.FullSample{
+				Sample: mp4.Sample{
+					Flags:                 flags,
+					Dur:                   1,
+					Size:                  uint32(len(sampleData)),
+					CompositionTimeOffset: 0,
+				},
+				DecodeTime: uint64(i),
+				Data:       sampleData,
+			})
+		}
+
+		seg := mp4.NewMediaSegment()
+		seg.AddFragment(frag)
+		if err := seg.Encode(f); err != nil {
+			return fmt.Errorf("write segment %d: %w", seqNum, err)
+		}
+		seqNum++
+	}
+
+	idrInfo := ""
+	if opts.idrInterval > 0 {
+		idrInfo = fmt.Sprintf(", IDR every %d frames", opts.idrInterval)
+	}
+	bppInfo := ""
+	if opts.bpp > 0 {
+		bppInfo = fmt.Sprintf(", bpp=%d", opts.bpp)
+	}
+	fmt.Printf("Wrote %d frames %dx%d (HEVC, QP=%d, %d fps, frag=%d%s%s) to %s\n",
+		opts.numFrames, frameW, frameH, opts.qp, opts.fps, opts.fragDur, idrInfo, bppInfo, opts.output)
+	return nil
+}
+
+func generateY4M(opts *options, frameW, frameH, mbWidth, mbHeight int,
+	bg, fg yuv.Color, patGrid *yuv.Grid, patColors yuv.ColorMap, tiled bool,
+	digitScale int, digitBg *yuv.Color, cs yuv.ColorSpace, rng yuv.Range) error {
+
+	f, err := os.Create(opts.output)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := yuv.WriteY4MHeaderCS(f, frameW, frameH, cs, rng); err != nil {
+		return err
+	}
+
+	for i := range opts.numFrames {
+		grid, colors, err := buildFrameGrid(i, patGrid, patColors,
+			mbWidth, mbHeight, opts.digits, digitScale, bg, fg, digitBg, tiled)
+		if err != nil {
+			return err
+		}
+		frame, err := yuv.BuildFrame(grid, colors)
+		if err != nil {
+			return fmt.Errorf("frame %d: %w", i, err)
+		}
+		frame.Width = frameW
+		frame.Height = frameH
+		if err := yuv.WriteY4MFrame(f, frame); err != nil {
+			return fmt.Errorf("frame %d: %w", i, err)
+		}
+	}
+
+	fmt.Printf("Wrote %d frames %dx%d to %s\n",
+		opts.numFrames, frameW, frameH, opts.output)
+	return nil
+}
+
+func generateYUV(opts *options, frameW, frameH, mbWidth, mbHeight int,
+	bg, fg yuv.Color, patGrid *yuv.Grid, patColors yuv.ColorMap, tiled bool,
+	digitScale int, digitBg *yuv.Color) error {
+
+	outPath := yuv.AddSuffix(opts.output, frameW, frameH)
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	for i := range opts.numFrames {
+		grid, colors, err := buildFrameGrid(i, patGrid, patColors,
+			mbWidth, mbHeight, opts.digits, digitScale, bg, fg, digitBg, tiled)
+		if err != nil {
+			return err
+		}
+		frame, err := yuv.BuildFrame(grid, colors)
+		if err != nil {
+			return fmt.Errorf("frame %d: %w", i, err)
+		}
+		frame.Width = frameW
+		frame.Height = frameH
+		if _, err := f.Write(frame.YUV420Bytes()); err != nil {
+			return fmt.Errorf("frame %d: %w", i, err)
+		}
+	}
+
+	fmt.Printf("Wrote %d frame(s) %dx%d to %s\n", opts.numFrames, frameW, frameH, outPath)
+	return nil
+}
+
+func generateFormattedImages(opts *options, frameW, frameH, mbWidth, mbHeight int,
+	bg, fg yuv.Color, patGrid *yuv.Grid, patColors yuv.ColorMap, tiled bool,
+	digitScale int, digitBg *yuv.Color, cs yuv.ColorSpace, rng yuv.Range) error {
+
+	ext := strings.ToLower(filepath.Ext(opts.output))
+	isJPEG := ext == ".jpg" || ext == ".jpeg"
+
+	for i := range opts.numFrames {
+		grid, colors, err := buildFrameGrid(i, patGrid, patColors,
+			mbWidth, mbHeight, opts.digits, digitScale, bg, fg, digitBg, tiled)
+		if err != nil {
+			return err
+		}
+		frame, err := yuv.BuildFrame(grid, colors)
+		if err != nil {
+			return fmt.Errorf("frame %d: %w", i, err)
+		}
+		frame.Width = frameW
+		frame.Height = frameH
+		path := fmt.Sprintf(opts.output, i)
+		f, err := os.Create(path)
+		if err != nil {
+			return err
+		}
+		if isJPEG {
+			err = yuv.WriteJPEGCS(f, frame, opts.jpegQual, cs, rng)
+		} else {
+			err = yuv.WritePNGCS(f, frame, cs, rng)
+		}
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("frame %d: %w", i, err)
+		}
+	}
+
+	fmt.Printf("Wrote %d frames %dx%d to %s\n",
+		opts.numFrames, frameW, frameH, opts.output)
+	return nil
+}
+
+func generateNumberedImages(opts *options, frameW, frameH, mbWidth, mbHeight int,
+	bg, fg yuv.Color, patGrid *yuv.Grid, patColors yuv.ColorMap, tiled bool,
+	digitScale int, digitBg *yuv.Color, cs yuv.ColorSpace, rng yuv.Range) error {
+
+	ext := strings.ToLower(filepath.Ext(opts.output))
+	isJPEG := ext == ".jpg" || ext == ".jpeg"
+
+	for i := range opts.numFrames {
+		grid, colors, err := buildFrameGrid(i, patGrid, patColors,
+			mbWidth, mbHeight, opts.digits, digitScale, bg, fg, digitBg, tiled)
+		if err != nil {
+			return err
+		}
+		frame, err := yuv.BuildFrame(grid, colors)
+		if err != nil {
+			return fmt.Errorf("frame %d: %w", i, err)
+		}
+		frame.Width = frameW
+		frame.Height = frameH
+
+		path := opts.output
+		if opts.numFrames > 1 {
+			stem := strings.TrimSuffix(opts.output, filepath.Ext(opts.output))
+			width := max(len(fmt.Sprintf("%d", opts.numFrames-1)), 4)
+			path = fmt.Sprintf("%s_%0*d%s", stem, width, i, ext)
+		}
+
+		f, err := os.Create(path)
+		if err != nil {
+			return err
+		}
+		if isJPEG {
+			err = yuv.WriteJPEGCS(f, frame, opts.jpegQual, cs, rng)
+		} else {
+			err = yuv.WritePNGCS(f, frame, cs, rng)
+		}
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("frame %d: %w", i, err)
+		}
+	}
+
+	fmt.Printf("Wrote %d frame(s) %dx%d to %s\n", opts.numFrames, frameW, frameH, opts.output)
+	return nil
+}

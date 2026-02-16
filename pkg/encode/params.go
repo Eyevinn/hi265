@@ -1,5 +1,7 @@
 package encode
 
+import "github.com/Eyevinn/hi264/pkg/yuv"
+
 // writeProfileTierLevel writes the profile_tier_level() syntax to w.
 // Main profile, Level 3.0, maxSubLayers=1.
 func writeProfileTierLevel(w *BitWriter) {
@@ -54,8 +56,9 @@ func generateVPS() []byte {
 	return w.Bytes()
 }
 
-// generateSPS returns the SPS RBSP bytes for the given dimensions and QP.
-func generateSPS(width, height int) []byte {
+// generateSPS returns the SPS RBSP bytes for the given dimensions.
+// cs and rng control VUI colour description parameters.
+func generateSPS(width, height int, cs yuv.ColorSpace, rng yuv.Range) []byte {
 	w := NewBitWriter()
 
 	w.WriteBits(0, 4)  // sps_video_parameter_set_id = 0
@@ -95,7 +98,35 @@ func generateSPS(width, height int) []byte {
 	w.WriteBit(0)      // long_term_ref_pics_present_flag = 0
 	w.WriteBit(0)      // sps_temporal_mvp_enabled_flag = 0
 	w.WriteBit(0)      // strong_intra_smoothing_enabled_flag = 0
-	w.WriteBit(0)      // vui_parameters_present_flag = 0
+
+	// VUI parameters
+	writeVUI := cs != yuv.BT601 || rng != yuv.LimitedRange
+	if writeVUI {
+		w.WriteBit(1) // vui_parameters_present_flag = 1
+		w.WriteBit(0) // aspect_ratio_info_present_flag = 0
+		w.WriteBit(0) // overscan_info_present_flag = 0
+		w.WriteBit(1) // video_signal_type_present_flag = 1
+		w.WriteBits(5, 3) // video_format = 5 (unspecified)
+		if rng == yuv.FullRange {
+			w.WriteBit(1) // video_full_range_flag = 1
+		} else {
+			w.WriteBit(0) // video_full_range_flag = 0
+		}
+		w.WriteBit(1) // colour_description_present_flag = 1
+		w.WriteBits(uint32(cs.ColourPrimaries()), 8)
+		w.WriteBits(uint32(cs.TransferCharacteristics()), 8)
+		w.WriteBits(uint32(cs.MatrixCoefficients()), 8)
+		w.WriteBit(0) // chroma_loc_info_present_flag = 0
+		w.WriteBit(0) // neutral_chroma_indication_flag = 0
+		w.WriteBit(0) // field_seq_flag = 0
+		w.WriteBit(0) // frame_field_info_present_flag = 0
+		w.WriteBit(0) // default_display_window_flag = 0
+		w.WriteBit(0) // vui_timing_info_present_flag = 0
+		w.WriteBit(0) // bitstream_restriction_flag = 0
+	} else {
+		w.WriteBit(0) // vui_parameters_present_flag = 0
+	}
+
 	w.WriteBit(0)      // sps_extension_present_flag = 0
 
 	// RBSP trailing bits
