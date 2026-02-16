@@ -1,0 +1,629 @@
+package encode
+
+import (
+	"github.com/Eyevinn/hi265/internal/cabac"
+	"github.com/Eyevinn/hi265/internal/context"
+	"github.com/Eyevinn/hi265/internal/pred"
+	"github.com/Eyevinn/hi265/internal/transform"
+	"github.com/Eyevinn/hi265/pkg/frame"
+)
+
+// encodeIDRSlice generates the IDR slice RBSP (header + CABAC data).
+func encodeIDRSlice(width, height, qp int, y, cb, cr []uint8) []byte {
+	w := NewBitWriter()
+
+	// === Slice header ===
+	w.WriteBit(1)      // first_slice_segment_in_pic_flag = 1
+	w.WriteBit(0)      // no_output_of_prior_pics_flag = 0 (IDR only)
+	w.WriteUE(0)       // slice_pic_parameter_set_id = 0
+	w.WriteUE(2)       // slice_type = 2 (I-slice)
+	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set
+	// SAO disabled in SPS → no SAO flags
+	w.WriteSE(0)       // slice_qp_delta = 0 (PPS init_qp_minus26 = qp-26)
+	// Deblocking disabled in PPS → no deblock syntax
+	// loop_filter_across_slices_enabled_flag: not present (PPS flag is 0 and deblock is disabled)
+
+	// byte_alignment
+	w.WriteBit(1)
+	for w.BitsWritten()%8 != 0 {
+		w.WriteBit(0)
+	}
+
+	headerBytes := w.Bytes()
+
+	// === Slice data (CABAC) ===
+	cabacBytes := encodeIDRSliceData(width, height, qp, y, cb, cr)
+
+	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
+	result = append(result, headerBytes...)
+	result = append(result, cabacBytes...)
+	return result
+}
+
+// encodeIDRSliceData encodes the CABAC slice data for an IDR I-slice.
+func encodeIDRSliceData(width, height, qp int, y, cb, cr []uint8) []byte {
+	enc := cabac.NewEncoder()
+	models := context.InitModels(context.SliceTypeI, qp)
+
+	ctuSize := 16
+	numCTUx := (width + ctuSize - 1) / ctuSize
+	numCTUy := (height + ctuSize - 1) / ctuSize
+	totalCTUs := numCTUx * numCTUy
+
+	// Reconstruction frame for neighbor prediction
+	reconFrame := frame.NewFrame(width, height)
+
+	// Track intra modes for MPM derivation (keyed by [ctuX/ctuSize, ctuY/ctuSize])
+	lumaModesMap := make(map[[2]int]int)
+
+	ctuIdx := 0
+	for ctuY := 0; ctuY < height; ctuY += ctuSize {
+		for ctuX := 0; ctuX < width; ctuX += ctuSize {
+			// No split_cu_flag (CTU = minCbSize, implicitly no split)
+			// No pred_mode_flag (I-slice, implicitly intra)
+
+			// part_mode: decoded when log2CbSize == log2MinCbSize
+			// bin=1 → 2Nx2N, bin=0 → NxN
+			enc.EncodeDecision(1, &models[context.CtxPartMode])
+
+			// Derive MPM for this CU
+			lumaMode := 1 // DC mode
+
+			mpm := deriveMPM(ctuX, ctuY, ctuSize, width, lumaModesMap)
+
+			// Encode intra luma mode
+			mpmIdx := -1
+			for i, m := range mpm {
+				if m == lumaMode {
+					mpmIdx = i
+					break
+				}
+			}
+
+			if mpmIdx >= 0 {
+				// prev_intra_luma_pred_flag = 1
+				enc.EncodeDecision(1, &models[context.CtxPrevIntraLumaPredFlag])
+				// mpm_idx: TU bypass bins (0, 10, 11)
+				switch mpmIdx {
+				case 0:
+					enc.EncodeBypass(0)
+				case 1:
+					enc.EncodeBypass(1)
+					enc.EncodeBypass(0)
+				case 2:
+					enc.EncodeBypass(1)
+					enc.EncodeBypass(1)
+				}
+			} else {
+				// prev_intra_luma_pred_flag = 0
+				enc.EncodeDecision(0, &models[context.CtxPrevIntraLumaPredFlag])
+				// rem_intra_luma_pred_mode: 5 bypass bins
+				rem := computeRemIntraLumaPredMode(lumaMode, mpm)
+				for k := 4; k >= 0; k-- {
+					enc.EncodeBypass(uint8((rem >> k) & 1))
+				}
+			}
+			lumaModesMap[[2]int{ctuX / ctuSize, ctuY / ctuSize}] = lumaMode
+
+			// intra_chroma_pred_mode = 4 (DM mode)
+			// First bin = 0 means "use DM mode"
+			enc.EncodeDecision(0, &models[context.CtxIntraChromaPredMode])
+
+			// Transform tree (no split, TU = CU = 16x16)
+			// cbf_cb at depth 0
+			cbfCb := hasNonZeroChroma(ctuX, ctuY, ctuSize, width, cb, qp, lumaMode, reconFrame, 0)
+			encBool(enc, &models[context.CtxCbfCb], cbfCb)
+
+			// cbf_cr at depth 0
+			cbfCr := hasNonZeroChroma(ctuX, ctuY, ctuSize, width, cr, qp, lumaMode, reconFrame, 1)
+			encBool(enc, &models[context.CtxCbfCr], cbfCr)
+
+			// Compute luma residual
+			lumaResidual, lumaLevels, cbfLuma := computeLumaResidual(
+				ctuX, ctuY, ctuSize, width, y, qp, lumaMode, reconFrame)
+
+			// cbf_luma at depth 0 (context = !trafoDepth = 1, so ctxIdx = CtxCbfLuma + 1)
+			encBool(enc, &models[context.CtxCbfLuma+1], cbfLuma)
+
+			// Encode residual if any cbf is set
+			if cbfLuma {
+				encodeResidualCoding(enc, models, lumaLevels, 4, true, 0)
+			}
+
+			// Reconstruct luma
+			reconstructLuma(reconFrame, ctuX, ctuY, ctuSize, width, height,
+				lumaMode, lumaResidual, cbfLuma, lumaLevels, qp)
+
+			// Encode and reconstruct chroma
+			chromaTrSize := ctuSize / 2
+			chromaMode := lumaMode // DM mode
+
+			for comp := range 2 {
+				var chromaSrc []uint8
+				if comp == 0 {
+					chromaSrc = cb
+				} else {
+					chromaSrc = cr
+				}
+				hasCbf := (comp == 0 && cbfCb) || (comp == 1 && cbfCr)
+
+				if hasCbf {
+					chromaLevels := computeChromaLevels(ctuX, ctuY, ctuSize, width,
+						chromaSrc, qp, chromaMode, reconFrame, comp)
+					encodeResidualCoding(enc, models, chromaLevels, 3, false, 0) // log2(8)=3
+					reconstructChroma(reconFrame, comp, ctuX/2, ctuY/2, chromaTrSize,
+						width/2, height/2, chromaMode, chromaLevels, qp)
+				} else {
+					reconstructChroma(reconFrame, comp, ctuX/2, ctuY/2, chromaTrSize,
+						width/2, height/2, chromaMode, nil, qp)
+				}
+			}
+
+			// end_of_slice_segment_flag
+			ctuIdx++
+			if ctuIdx == totalCTUs {
+				enc.EncodeTerminate(1)
+			} else {
+				enc.EncodeTerminate(0)
+			}
+		}
+	}
+
+	return enc.Flush()
+}
+
+func encBool(enc *cabac.Encoder, ctx *cabac.CtxState, val bool) {
+	v := uint8(0)
+	if val {
+		v = 1
+	}
+	enc.EncodeDecision(v, ctx)
+}
+
+// deriveMPM computes the Most Probable Modes for the CU at (x0,y0).
+func deriveMPM(x0, y0, cuSize, picWidth int, modeMap map[[2]int]int) [3]int {
+	cuX := x0 / cuSize
+	cuY := y0 / cuSize
+
+	leftMode := -1
+	if x0 > 0 {
+		if m, ok := modeMap[[2]int{cuX - 1, cuY}]; ok {
+			leftMode = m
+		}
+	}
+
+	aboveMode := -1
+	if y0 > 0 {
+		if m, ok := modeMap[[2]int{cuX, cuY - 1}]; ok {
+			aboveMode = m
+		}
+	}
+
+	// HEVC spec 8.4.2
+	if leftMode < 0 {
+		leftMode = 1 // DC
+	}
+	if aboveMode < 0 {
+		aboveMode = 1 // DC
+	}
+
+	var mpm [3]int
+	if leftMode == aboveMode {
+		if leftMode < 2 {
+			mpm = [3]int{0, 1, 26}
+		} else {
+			mpm[0] = leftMode
+			mpm[1] = 2 + ((leftMode + 29) % 32)
+			mpm[2] = 2 + ((leftMode - 2 + 1) % 32)
+		}
+	} else {
+		mpm[0] = leftMode
+		mpm[1] = aboveMode
+		if leftMode != 0 && aboveMode != 0 {
+			mpm[2] = 0
+		} else if leftMode != 1 && aboveMode != 1 {
+			mpm[2] = 1
+		} else {
+			mpm[2] = 26
+		}
+	}
+	return mpm
+}
+
+// computeRemIntraLumaPredMode computes rem_intra_luma_pred_mode from the
+// actual mode and MPM list (mode is not in MPM).
+func computeRemIntraLumaPredMode(mode int, mpm [3]int) int {
+	// Sort MPM in ascending order
+	sorted := sortMPM(mpm)
+	rem := mode
+	for _, m := range sorted {
+		if rem >= m {
+			rem--
+		}
+	}
+	return rem
+}
+
+func sortMPM(mpm [3]int) [3]int {
+	s := mpm
+	if s[0] > s[1] {
+		s[0], s[1] = s[1], s[0]
+	}
+	if s[1] > s[2] {
+		s[1], s[2] = s[2], s[1]
+	}
+	if s[0] > s[1] {
+		s[0], s[1] = s[1], s[0]
+	}
+	return s
+}
+
+// hasNonZeroChroma checks if the chroma residual has non-zero quantized coefficients.
+func hasNonZeroChroma(ctuX, ctuY, ctuSize, picWidth int, chromaSrc []uint8,
+	qp, lumaMode int, recon *frame.Frame, comp int) bool {
+
+	chromaTrSize := ctuSize / 2
+	chromaQP := chromaQPFromLumaQP(qp)
+	cx := ctuX / 2
+	cy := ctuY / 2
+
+	// Get prediction
+	chromaPred := predictChromaBlock(recon, comp, cx, cy, chromaTrSize, lumaMode)
+
+	// Compute residual
+	chromaW := picWidth / 2
+	chromaH := picWidth / 2 // assumes square for now; picHeight/2 for non-square
+	residual := make([]int32, chromaTrSize*chromaTrSize)
+	for py := range chromaTrSize {
+		for px := range chromaTrSize {
+			sx := cx + px
+			sy := cy + py
+			if sx < chromaW && sy < chromaH {
+				srcIdx := sy*chromaW + sx
+				residual[py*chromaTrSize+px] = int32(chromaSrc[srcIdx]) - chromaPred[py*chromaTrSize+px]
+			}
+		}
+	}
+
+	// Forward transform + quantize
+	coeffs := forwardDCT(residual, chromaTrSize)
+	levels := quantize(coeffs, chromaTrSize, chromaQP)
+
+	for _, l := range levels {
+		if l != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// computeLumaResidual computes the luma residual, transforms, and quantizes.
+// Returns the prediction, quantized levels, and whether cbf_luma is set.
+func computeLumaResidual(ctuX, ctuY, ctuSize, picWidth int, lumaSrc []uint8,
+	qp, lumaMode int, recon *frame.Frame) (prediction []int32, levels []int32, cbfLuma bool) {
+
+	// Get intra prediction for this block
+	prediction = predictLumaBlock(recon, ctuX, ctuY, ctuSize, lumaMode)
+
+	// Compute residual
+	residual := make([]int32, ctuSize*ctuSize)
+	for py := range ctuSize {
+		for px := range ctuSize {
+			sx := ctuX + px
+			sy := ctuY + py
+			if sx < picWidth {
+				residual[py*ctuSize+px] = int32(lumaSrc[sy*picWidth+sx]) - prediction[py*ctuSize+px]
+			}
+		}
+	}
+
+	// Forward transform + quantize
+	coeffs := forwardDCT(residual, ctuSize)
+	levels = quantize(coeffs, ctuSize, qp)
+
+	for _, l := range levels {
+		if l != 0 {
+			cbfLuma = true
+			break
+		}
+	}
+	return prediction, levels, cbfLuma
+}
+
+// computeChromaLevels computes quantized chroma levels for encoding.
+func computeChromaLevels(ctuX, ctuY, ctuSize, picWidth int, chromaSrc []uint8,
+	qp, chromaMode int, recon *frame.Frame, comp int) []int32 {
+
+	chromaTrSize := ctuSize / 2
+	chromaQP := chromaQPFromLumaQP(qp)
+	cx := ctuX / 2
+	cy := ctuY / 2
+
+	chromaPred := predictChromaBlock(recon, comp, cx, cy, chromaTrSize, chromaMode)
+
+	chromaW := picWidth / 2
+	residual := make([]int32, chromaTrSize*chromaTrSize)
+	for py := range chromaTrSize {
+		for px := range chromaTrSize {
+			sx := cx + px
+			sy := cy + py
+			if sx < chromaW {
+				residual[py*chromaTrSize+px] = int32(chromaSrc[sy*chromaW+sx]) - chromaPred[py*chromaTrSize+px]
+			}
+		}
+	}
+
+	coeffs := forwardDCT(residual, chromaTrSize)
+	return quantize(coeffs, chromaTrSize, chromaQP)
+}
+
+// predictLumaBlock generates DC intra prediction for a luma block.
+func predictLumaBlock(f *frame.Frame, x0, y0, size, mode int) []int32 {
+	ctuSize := 16 // our fixed CTU size
+	neighbors := buildRefSamples(x0, y0, size, f.Width, f.Height, ctuSize,
+		func(x, y int) uint8 { return f.GetLumaPixel(x, y) },
+		func(x, y int) bool { return f.IsLumaDecoded(x, y) },
+	)
+	pred.FilterRefSamples(neighbors, mode, size, true, false)
+	return predictIntra(mode, size, neighbors, 8, true)
+}
+
+// predictChromaBlock generates intra prediction for a chroma block.
+func predictChromaBlock(f *frame.Frame, comp, x0, y0, size, mode int) []int32 {
+	ctuSize := 8 // chroma CTU size for 4:2:0
+	neighbors := buildRefSamples(x0, y0, size, f.Width/2, f.Height/2, ctuSize,
+		func(x, y int) uint8 { return f.GetChromaPixel(comp, x, y) },
+		func(x, y int) bool { return f.IsLumaDecoded(x*2, y*2) },
+	)
+	pred.FilterRefSamples(neighbors, mode, size, false, false)
+	return predictIntra(mode, size, neighbors, 8, false)
+}
+
+// predictIntra performs intra prediction for a block.
+func predictIntra(mode, size int, neighbors *pred.Neighbors, bitDepth int, isLuma bool) []int32 {
+	switch mode {
+	case 0:
+		return pred.PredictPlanar(size, neighbors, bitDepth)
+	case 1:
+		return pred.PredictDC(size, neighbors, bitDepth, isLuma)
+	default:
+		return pred.PredictAngular(mode, size, neighbors, bitDepth)
+	}
+}
+
+// buildRefSamples extracts and substitutes reference samples for intra prediction.
+// Mirrors the decoder's buildRefSamples.
+func buildRefSamples(x0, y0, size, picW, picH, ctbSize int,
+	getPixel func(x, y int) uint8, isDecoded func(x, y int) bool) *pred.Neighbors {
+	numCtbX := (picW + ctbSize - 1) / ctbSize
+	curCtbX := x0 / ctbSize
+	curCtbY := y0 / ctbSize
+	curAddr := curCtbY*numCtbX + curCtbX
+
+	isAvailable := func(px, py int) bool {
+		if px < 0 || py < 0 || px >= picW || py >= picH {
+			return false
+		}
+		nCtbX := px / ctbSize
+		nCtbY := py / ctbSize
+		nAddr := nCtbY*numCtbX + nCtbX
+		if nAddr < curAddr {
+			return true
+		}
+		if nAddr == curAddr {
+			return isDecoded(px, py)
+		}
+		return false
+	}
+
+	hasAny := isAvailable(x0-1, y0) || isAvailable(x0, y0-1)
+	if !hasAny {
+		return nil
+	}
+
+	totalSamples := 4*size + 1
+	ref := make([]uint8, totalSamples)
+	avail := make([]bool, totalSamples)
+
+	for i := range 2 * size {
+		y := y0 + 2*size - 1 - i
+		if isAvailable(x0-1, y) {
+			ref[i] = getPixel(x0-1, y)
+			avail[i] = true
+		}
+	}
+
+	tlIdx := 2 * size
+	if isAvailable(x0-1, y0-1) {
+		ref[tlIdx] = getPixel(x0-1, y0-1)
+		avail[tlIdx] = true
+	}
+
+	for i := range 2 * size {
+		x := x0 + i
+		if isAvailable(x, y0-1) {
+			ref[tlIdx+1+i] = getPixel(x, y0-1)
+			avail[tlIdx+1+i] = true
+		}
+	}
+
+	firstAvail := -1
+	for i := range totalSamples {
+		if avail[i] {
+			firstAvail = i
+			break
+		}
+	}
+	if firstAvail < 0 {
+		return nil
+	}
+
+	for i := range firstAvail {
+		ref[i] = ref[firstAvail]
+	}
+	for i := firstAvail + 1; i < totalSamples; i++ {
+		if !avail[i] {
+			ref[i] = ref[i-1]
+		}
+	}
+
+	n := &pred.Neighbors{
+		TopAvail:  true,
+		LeftAvail: true,
+		Top:       make([]uint8, 2*size),
+		Left:      make([]uint8, 2*size),
+	}
+
+	for i := range 2 * size {
+		n.Left[i] = ref[2*size-1-i]
+	}
+	n.TopLeft = ref[tlIdx]
+	copy(n.Top, ref[tlIdx+1:])
+
+	return n
+}
+
+// reconstructLuma reconstructs luma pixels after encoding.
+func reconstructLuma(f *frame.Frame, x0, y0, size, picW, picH, mode int,
+	prediction []int32, cbfLuma bool, levels []int32, qp int) {
+
+	var residual []int32
+	if cbfLuma {
+		dequantCoeffs := transform.Dequantize(levels, size, qp)
+		residual = transform.InverseDCT(dequantCoeffs, size)
+	} else {
+		residual = make([]int32, size*size)
+	}
+
+	recon := make([]int32, size*size)
+	for i := range recon {
+		recon[i] = prediction[i] + residual[i]
+	}
+	f.SetLumaBlock(x0, y0, size, recon)
+}
+
+// reconstructChroma reconstructs chroma pixels after encoding.
+func reconstructChroma(f *frame.Frame, comp, cx, cy, chromaTrSize, chromaW, chromaH,
+	mode int, levels []int32, qp int) {
+
+	chromaQP := chromaQPFromLumaQP(qp)
+	chromaPred := predictChromaBlock(f, comp, cx, cy, chromaTrSize, mode)
+
+	var residual []int32
+	if levels != nil {
+		dequantCoeffs := transform.Dequantize(levels, chromaTrSize, chromaQP)
+		residual = transform.InverseDCT(dequantCoeffs, chromaTrSize)
+	} else {
+		residual = make([]int32, chromaTrSize*chromaTrSize)
+	}
+
+	recon := make([]int32, chromaTrSize*chromaTrSize)
+	for i := range recon {
+		recon[i] = chromaPred[i] + residual[i]
+	}
+	f.SetChromaBlock(comp, cx, cy, chromaTrSize, recon)
+}
+
+// encodePSkipSlice generates a P-skip slice RBSP (header + CABAC data).
+func encodePSkipSlice(width, height, qp, poc int) []byte {
+	w := NewBitWriter()
+
+	// === Slice header ===
+	w.WriteBit(1)      // first_slice_segment_in_pic_flag = 1
+	w.WriteUE(0)       // slice_pic_parameter_set_id = 0
+	w.WriteUE(1)       // slice_type = 1 (P-slice)
+
+	// pic_order_cnt_lsb: u(log2_max_pic_order_cnt_lsb) = u(4)
+	w.WriteBits(uint32(poc&0xF), 4)
+
+	// short_term_ref_pic_set_sps_flag = 0 (inline)
+	w.WriteBit(0)
+
+	// Inline STRPS: num_short_term_ref_pic_sets=0, so stRpsIdx=0, no inter_ref_pic_set_prediction
+	w.WriteUE(1)       // num_negative_pics = 1
+	w.WriteUE(0)       // num_positive_pics = 0
+	w.WriteUE(0)       // delta_poc_s0_minus1 = 0 (deltaPOC = -1)
+	w.WriteBit(1)      // used_by_curr_pic_s0_flag = 1
+
+	// SAO disabled → no SAO flags
+	// num_ref_idx_active_override_flag = 0
+	w.WriteBit(0)
+
+	// cabac_init_flag: not present (cabac_init_present_flag=0 in PPS)
+
+	// five_minus_max_num_merge_cand = 4 (maxMergeCand = 1)
+	w.WriteUE(4)
+
+	// slice_qp_delta = 0
+	w.WriteSE(0)
+
+	// byte_alignment
+	w.WriteBit(1)
+	for w.BitsWritten()%8 != 0 {
+		w.WriteBit(0)
+	}
+
+	headerBytes := w.Bytes()
+
+	// === Slice data (CABAC) ===
+	cabacBytes := encodePSkipSliceData(width, height, qp)
+
+	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
+	result = append(result, headerBytes...)
+	result = append(result, cabacBytes...)
+	return result
+}
+
+// encodePSkipSliceData encodes the CABAC slice data for a P-skip slice.
+func encodePSkipSliceData(width, height, qp int) []byte {
+	enc := cabac.NewEncoder()
+	models := context.InitModels(context.SliceTypeP, qp)
+
+	ctuSize := 16
+	numCTUx := (width + ctuSize - 1) / ctuSize
+	numCTUy := (height + ctuSize - 1) / ctuSize
+	totalCTUs := numCTUx * numCTUy
+
+	ctuIdx := 0
+	for ctuY := 0; ctuY < height; ctuY += ctuSize {
+		for ctuX := 0; ctuX < width; ctuX += ctuSize {
+			// cu_skip_flag = 1
+			// Context: ctxInc from left + above availability
+			ctxInc := 0
+			if ctuX > 0 {
+				ctxInc++ // left available
+			}
+			if ctuY > 0 {
+				ctxInc++ // above available
+			}
+			enc.EncodeDecision(1, &models[context.CtxCuSkipFlag+ctxInc])
+
+			// merge_idx = 0: when maxMergeCand=1, no bins coded
+
+			// end_of_slice_segment_flag
+			ctuIdx++
+			if ctuIdx == totalCTUs {
+				enc.EncodeTerminate(1)
+			} else {
+				enc.EncodeTerminate(0)
+			}
+		}
+	}
+
+	return enc.Flush()
+}
+
+func chromaQPFromLumaQP(qpY int) int {
+	if qpY < 30 {
+		return qpY
+	}
+	table := []int{
+		29, 30, 31, 32, 32, 33, 34, 34, 35, 35,
+		36, 36, 37, 37, 38, 39, 40, 41, 42, 43,
+		44, 45, 46,
+	}
+	if qpY-30 < len(table) {
+		return table[qpY-30]
+	}
+	return qpY - 6
+}

@@ -662,8 +662,8 @@ func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
 	lastSbY := lastSigCoeffY >> log2SbSize
 
 	// Scan order depends on scanIdx: 0=diagonal, 1=horizontal, 2=vertical
-	sbScanOrder := scanOrder(numSbX, numSbY, scanIdx)
-	coeffScanOrder := scanOrder(1<<log2SbSize, 1<<log2SbSize, scanIdx)
+	sbScanOrder := ScanOrder(numSbX, numSbY, scanIdx)
+	coeffScanOrder := ScanOrder(1<<log2SbSize, 1<<log2SbSize, scanIdx)
 
 	// Find lastScanPos and lastSubBlock
 	lastSubBlock := len(sbScanOrder) - 1
@@ -770,7 +770,7 @@ func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
 			if n > 0 || !implicitNonZeroCoeff {
 				cx := coeffScanOrder[n][0]
 				cy := coeffScanOrder[n][1]
-				sigCtx := getSigCtxInc(cx, cy, log2TrafoSize, isLuma, sbX, sbY, scanIdx, prevCsbf)
+				sigCtx := GetSigCtxInc(cx, cy, log2TrafoSize, isLuma, sbX, sbY, scanIdx, prevCsbf)
 				flag := dec.DecodeDecision(&ctx[context.CtxSigCoeffFlag+sigCtx])
 				sigFlags[n] = flag == 1
 				if sigFlags[n] {
@@ -1057,10 +1057,10 @@ func clip3(lo, hi, val int) int {
 	return val
 }
 
-// getSigCtxInc returns the context index for sig_coeff_flag.
+// GetSigCtxInc returns the context index for sig_coeff_flag.
 // Based on HEVC spec 9.3.4.2.6.
 // prevCsbf = csbfRight + 2*csbfBelow (coded_sub_block_flag of right and below neighbors).
-func getSigCtxInc(cx, cy, log2TrafoSize int, isLuma bool, sbX, sbY, scanIdx, prevCsbf int) int {
+func GetSigCtxInc(cx, cy, log2TrafoSize int, isLuma bool, sbX, sbY, scanIdx, prevCsbf int) int {
 	if log2TrafoSize == 2 {
 		// 4x4 transform: use Table 9-39 context mapping
 		ctxIdxMaps := [3][16]int{
@@ -1184,9 +1184,9 @@ func verticalScanOrder(width, height int) [][2]int {
 	return order
 }
 
-// scanOrder returns the scan order for the given scanIdx.
+// ScanOrder returns the scan order for the given scanIdx.
 // scanIdx: 0=diagonal, 1=horizontal, 2=vertical.
-func scanOrder(width, height, scanIdx int) [][2]int {
+func ScanOrder(width, height, scanIdx int) [][2]int {
 	switch scanIdx {
 	case 1:
 		return horizontalScanOrder(width, height)

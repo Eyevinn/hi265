@@ -23,24 +23,24 @@ func InverseDST(coeffs []int32) []int32 {
 	return inverseDST4(coeffs)
 }
 
-// HEVC 4x4 DCT matrix (spec Table 8-3) — transposed for inverse
-var dct4 = [4][4]int32{
+// DCT4 is the HEVC 4x4 DCT matrix (spec Table 8-3).
+var DCT4 = [4][4]int32{
 	{64, 64, 64, 64},
 	{83, 36, -36, -83},
 	{64, -64, -64, 64},
 	{36, -83, 83, -36},
 }
 
-// HEVC 4x4 DST matrix (spec Table 8-5)
-var dst4 = [4][4]int32{
+// DST4 is the HEVC 4x4 DST matrix (spec Table 8-5).
+var DST4 = [4][4]int32{
 	{29, 55, 74, 84},
 	{74, 74, 0, -74},
 	{84, -29, -74, 55},
 	{55, -84, 74, -29},
 }
 
-// HEVC 8x8 DCT matrix (spec Table 8-3)
-var dct8 = [8][8]int32{
+// DCT8 is the HEVC 8x8 DCT matrix (spec Table 8-3).
+var DCT8 = [8][8]int32{
 	{64, 64, 64, 64, 64, 64, 64, 64},
 	{89, 75, 50, 18, -18, -50, -75, -89},
 	{83, 36, -36, -83, -83, -36, 36, 83},
@@ -51,8 +51,8 @@ var dct8 = [8][8]int32{
 	{18, -50, 75, -89, 89, -75, 50, -18},
 }
 
-// HEVC 16x16 DCT matrix (spec Table 8-4)
-var dct16 = [16][16]int32{
+// DCT16 is the HEVC 16x16 DCT matrix (spec Table 8-4).
+var DCT16 = [16][16]int32{
 	{64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
 	{90, 87, 80, 70, 57, 43, 25, 9, -9, -25, -43, -57, -70, -80, -87, -90},
 	{89, 75, 50, 18, -18, -50, -75, -89, -89, -75, -50, -18, 18, 50, 75, 89},
@@ -71,8 +71,8 @@ var dct16 = [16][16]int32{
 	{9, -25, 43, -57, 70, -80, 87, -90, 90, -87, 80, -70, 57, -43, 25, -9},
 }
 
-// HEVC 32x32 DCT matrix (spec Table 8-3)
-var dct32 = [32][32]int32{
+// DCT32 is the HEVC 32x32 DCT matrix (spec Table 8-3).
+var DCT32 = [32][32]int32{
 	{64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
 	{90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13, 4, -4, -13, -22, -31, -38, -46, -54, -61, -67, -73, -78, -82, -85, -88, -90, -90},
 	{90, 87, 80, 70, 57, 43, 25, 9, -9, -25, -43, -57, -70, -80, -87, -90, -90, -87, -80, -70, -57, -43, -25, -9, 9, 25, 43, 57, 70, 80, 87, 90},
@@ -116,7 +116,7 @@ func inverseDCT4(coeffs []int32) []int32 {
 		for i := range 4 {
 			var sum int32
 			for j := range 4 {
-				sum += dct4[j][i] * coeffs[c+j*4]
+				sum += DCT4[j][i] * coeffs[c+j*4]
 			}
 			tmp[c+i*4] = clip16((sum + 64) >> 7)
 		}
@@ -127,7 +127,7 @@ func inverseDCT4(coeffs []int32) []int32 {
 		for i := range 4 {
 			var sum int32
 			for j := range 4 {
-				sum += dct4[j][i] * tmp[y*4+j]
+				sum += DCT4[j][i] * tmp[y*4+j]
 			}
 			out[y*4+i] = clip16((sum + 2048) >> 12)
 		}
@@ -155,7 +155,7 @@ func inverseDST4(coeffs []int32) []int32 {
 		for i := range 4 {
 			var sum int32
 			for j := range 4 {
-				sum += dst4[j][i] * coeffs[c+j*4]
+				sum += DST4[j][i] * coeffs[c+j*4]
 			}
 			tmp[c+i*4] = clip16((sum + 64) >> 7)
 		}
@@ -166,7 +166,7 @@ func inverseDST4(coeffs []int32) []int32 {
 		for i := range 4 {
 			var sum int32
 			for j := range 4 {
-				sum += dst4[j][i] * tmp[y*4+j]
+				sum += DST4[j][i] * tmp[y*4+j]
 			}
 			out[y*4+i] = clip16((sum + 2048) >> 12)
 		}
@@ -183,7 +183,7 @@ func inverseDCT8(coeffs []int32) []int32 {
 		for i := range 8 {
 			var sum int32
 			for j := range 8 {
-				sum += dct8[j][i] * coeffs[c+j*8]
+				sum += DCT8[j][i] * coeffs[c+j*8]
 			}
 			tmp[c+i*8] = clip16((sum + 64) >> 7)
 		}
@@ -194,7 +194,7 @@ func inverseDCT8(coeffs []int32) []int32 {
 		for i := range 8 {
 			var sum int32
 			for j := range 8 {
-				sum += dct8[j][i] * tmp[y*8+j]
+				sum += DCT8[j][i] * tmp[y*8+j]
 			}
 			out[y*8+i] = clip16((sum + 2048) >> 12)
 		}
@@ -212,7 +212,7 @@ func inverseDCT16(coeffs []int32) []int32 {
 		for i := range n {
 			var sum int32
 			for j := range n {
-				sum += dct16[j][i] * coeffs[c+j*n]
+				sum += DCT16[j][i] * coeffs[c+j*n]
 			}
 			tmp[c+i*n] = clip16((sum + 64) >> 7)
 		}
@@ -223,7 +223,7 @@ func inverseDCT16(coeffs []int32) []int32 {
 		for i := range n {
 			var sum int32
 			for j := range n {
-				sum += dct16[j][i] * tmp[y*n+j]
+				sum += DCT16[j][i] * tmp[y*n+j]
 			}
 			out[y*n+i] = clip16((sum + 2048) >> 12)
 		}
@@ -241,7 +241,7 @@ func inverseDCT32(coeffs []int32) []int32 {
 		for i := range n {
 			var sum int32
 			for j := range n {
-				sum += dct32[j][i] * coeffs[c+j*n]
+				sum += DCT32[j][i] * coeffs[c+j*n]
 			}
 			tmp[c+i*n] = clip16((sum + 64) >> 7)
 		}
@@ -252,7 +252,7 @@ func inverseDCT32(coeffs []int32) []int32 {
 		for i := range n {
 			var sum int32
 			for j := range n {
-				sum += dct32[j][i] * tmp[y*n+j]
+				sum += DCT32[j][i] * tmp[y*n+j]
 			}
 			out[y*n+i] = clip16((sum + 2048) >> 12)
 		}
