@@ -184,8 +184,12 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 	// bin=1 → 2Nx2N, bin=0 → NxN
 	enc.EncodeDecision(1, &models[context.CtxPartMode])
 
-	// Derive MPM for this CU
-	lumaMode := 1 // DC mode
+	// Choose the best intra prediction mode for this flat-color block.
+	// For flat 16x16 blocks, vertical (26) or horizontal (10) can produce
+	// zero residual when the block color matches the top or left neighbor,
+	// while DC (1) averages both neighbors and also introduces AC energy
+	// through edge filtering at color boundaries.
+	lumaMode := chooseBestLumaMode(reconFrame, ctuX, ctuY, ctuSize, width, y)
 
 	mpm := deriveMPM(ctuX, ctuY, ctuSize, width, lumaModesMap)
 
@@ -495,6 +499,45 @@ func predictIntra(mode, size int, neighbors *pred.Neighbors, bitDepth int, isLum
 	default:
 		return pred.PredictAngular(mode, size, neighbors, bitDepth)
 	}
+}
+
+// chooseBestLumaMode evaluates candidate intra prediction modes and returns
+// the one with the smallest residual. For flat-color 16x16 blocks, vertical (26)
+// gives zero residual when the block matches the top neighbor, horizontal (10)
+// when it matches the left neighbor, and DC (1) when both match or neither does.
+func chooseBestLumaMode(recon *frame.Frame, ctuX, ctuY, ctuSize, picWidth int, lumaSrc []uint8) int {
+	candidates := []int{1, 10, 26} // DC, horizontal, vertical
+	bestMode := 1
+	bestCost := int64(1 << 62)
+
+	for _, mode := range candidates {
+		prediction := predictLumaBlock(recon, ctuX, ctuY, ctuSize, mode)
+
+		var cost int64
+		for py := range ctuSize {
+			for px := range ctuSize {
+				sx := ctuX + px
+				sy := ctuY + py
+				if sx < picWidth {
+					diff := int64(lumaSrc[sy*picWidth+sx]) - int64(prediction[py*ctuSize+px])
+					if diff < 0 {
+						diff = -diff
+					}
+					cost += diff
+				}
+			}
+		}
+
+		if cost < bestCost {
+			bestCost = cost
+			bestMode = mode
+		}
+		if cost == 0 {
+			break
+		}
+	}
+
+	return bestMode
 }
 
 // buildRefSamples extracts and substitutes reference samples for intra prediction.
