@@ -32,7 +32,7 @@ go test ./...
 go run ./cmd/hi265dec input.265 output.yuv
 
 # Generate HEVC bitstream from grid pattern
-go run ./cmd/hi265gen -grid "AB,CD" -c A=16,128,128 -c B=235,128,128 -o test.265
+go run ./cmd/hi265gen -gp "AB,CD" -gc A=16,128,128 -gc B=235,128,128 -o test.265
 ```
 
 ## Encoder API
