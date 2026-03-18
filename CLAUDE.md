@@ -33,6 +33,9 @@ go run ./cmd/hi265dec input.265 output.yuv
 
 # Generate HEVC bitstream from grid pattern
 go run ./cmd/hi265gen -gp "AB,CD" -gc A=16,128,128 -gc B=235,128,128 -o test.265
+
+# Generate gray IDR frame from external VPS/SPS/PPS (any chroma format/bit depth)
+go run ./cmd/hi265gray -f params.json -o gray.265
 ```
 
 ## Encoder API
@@ -47,6 +50,7 @@ External SPS/PPS support (for injecting frames into existing streams):
 
 - `EncodeIDRSliceFromSPSPPS(sps, pps, grid, colors)` — IDR slice compatible with external parameter sets
 - `EncodePSkipSliceFromSPSPPS(sps, pps, poc)` — P-skip slice compatible with external parameter sets
+- `EncodeGrayIDRSliceFromSPSPPS(sps, pps)` — Gray IDR slice (any chroma format/bit depth)
 
 `FrameEncoder` wraps these functions with a struct-based API for convenience.
 
@@ -65,6 +69,7 @@ internal/deblock/  — Internal: Deblocking filter
 internal/sao/      — Internal: Sample Adaptive Offset
 cmd/hi265dec/      — CLI: decode HEVC from raw .265
 cmd/hi265gen/      — CLI: generate HEVC bitstreams or raw images from grid patterns
+cmd/hi265gray/     — CLI: generate gray IDR frames from external VPS/SPS/PPS
 testdata/          — Test bitstreams and golden references
 tools/             — Test generation scripts
 ```
