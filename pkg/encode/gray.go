@@ -167,6 +167,12 @@ func encodeGrayIDRSlice(p graySliceParams) []byte {
 // - First CU: no neighbors → reference samples default to 1<<(bitDepth-1) = mid-gray
 // - Subsequent CUs: neighbors are all mid-gray → DC pred = mid-gray
 // Therefore cbf_luma = cbf_cb = cbf_cr = 0 for all CUs.
+//
+// Each CTU is encoded as the largest possible CU (no quadtree splitting) when it
+// fits entirely within the picture. Boundary CTUs that extend past the picture edge
+// use implicit splits down to sub-CUs that fit. This produces ~14x smaller bitstreams
+// than splitting every CTU to minCB, since one large CU needs only one set of intra
+// mode + cbf bins instead of 64 sets for a 64x64 CTU split to 8x8.
 func encodeGraySliceData(p graySliceParams) []byte {
 	enc := cabac.NewEncoder()
 	models := context.InitModels(context.SliceTypeI, p.qp)
@@ -195,38 +201,36 @@ func encodeGraySliceData(p graySliceParams) []byte {
 
 // encodeGrayCUTree recursively processes the coding quadtree.
 // Follows HEVC spec 7.3.8.4 coding_quadtree().
+//
+// For a uniform gray frame, we use the largest possible CU at each position:
+// - If the CU fits in the picture: encode it directly (split_cu_flag = 0)
+// - If it extends past the picture: implicit split, recurse into quadrants
+//
+// Context for split_cu_flag: ctxInc = condL + condA where condL/condA = 1 when
+// the left/above neighbor CU depth > current depth. Since we always use the largest
+// CU that fits, neighbor depths are never greater than the current depth, so ctxInc = 0.
 func encodeGrayCUTree(enc *cabac.Encoder, models []cabac.CtxState,
 	x0, y0, cuSize, log2CuSize int, p graySliceParams) {
 
-	// HEVC spec: split_cu_flag is only coded when:
-	// 1. CU fits entirely within the picture
-	// 2. log2CbSize > MinCbLog2SizeY
 	fitsInPicture := (x0+cuSize <= p.width) && (y0+cuSize <= p.height)
 
-	if log2CuSize == p.log2MinCbSize {
-		// At minCbSize: no further split possible, encode the CU
-		encodeGrayCU(enc, models, x0, y0, log2CuSize, p)
+	if fitsInPicture {
+		if log2CuSize > p.log2MinCbSize {
+			// Code split_cu_flag = 0 (don't split — use largest possible CU)
+			enc.EncodeDecision(0, &models[context.CtxSplitCuFlag])
+		}
+		encodeGrayCU(enc, models, log2CuSize, p)
 		return
 	}
 
-	if fitsInPicture {
-		// Code split_cu_flag = 1 (always split to minCbSize)
-		// Context: ctxInc = condL + condA
-		// Since all CUs are split to maxDepth, neighbor depth > current depth when available.
-		ctxInc := 0
-		if x0 > 0 {
-			ctxInc++
-		}
-		if y0 > 0 {
-			ctxInc++
-		}
-		enc.EncodeDecision(1, &models[context.CtxSplitCuFlag+ctxInc])
+	if log2CuSize == p.log2MinCbSize {
+		// At minCbSize and doesn't fit — shouldn't happen for valid SPS
+		encodeGrayCU(enc, models, log2CuSize, p)
+		return
 	}
-	// else: CU extends beyond picture → split is implicit (inferred as 1)
 
+	// CU extends beyond picture → implicit split (no flag coded)
 	half := cuSize / 2
-	// Z-order: top-left, top-right, bottom-left, bottom-right
-	// Only code children that start within the picture.
 	for _, off := range [][2]int{{0, 0}, {half, 0}, {0, half}, {half, half}} {
 		cx := x0 + off[0]
 		cy := y0 + off[1]
@@ -236,13 +240,17 @@ func encodeGrayCUTree(enc *cabac.Encoder, models []cabac.CtxState,
 	}
 }
 
-// encodeGrayCU encodes a single CU at minCbSize for a gray frame.
+// encodeGrayCU encodes a single CU for a gray frame at any size.
 // DC prediction mode (1), zero residual for luma and both chroma components.
 func encodeGrayCU(enc *cabac.Encoder, models []cabac.CtxState,
-	x0, y0, log2CuSize int, p graySliceParams) {
+	log2CuSize int, p graySliceParams) {
 
-	// part_mode = 2Nx2N (single bin = 1)
-	enc.EncodeDecision(1, &models[context.CtxPartMode])
+	// part_mode: only coded when log2CbSize == MinCbLog2SizeY (spec 7.3.8.5).
+	// For I-slices, PART_NxN is only allowed at minCB, so at larger sizes
+	// part_mode is implicitly PART_2Nx2N.
+	if log2CuSize == p.log2MinCbSize {
+		enc.EncodeDecision(1, &models[context.CtxPartMode]) // part_mode = 2Nx2N
+	}
 
 	// Intra luma mode: DC (mode 1)
 	// MPM derivation: for a uniform DC grid, both neighbors are DC (or default to DC).

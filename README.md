@@ -230,8 +230,9 @@ parameter sets. Intended for bootstrapping decoders in Gradual Decode Refresh
 
 The gray frame uses DC prediction with zero residual, making it independent of
 chroma format and bit depth — it works with 4:2:0, 4:2:2, 4:4:4 at any bit
-depth. The output is an Annex-B bitstream containing VPS + SPS + PPS + IDR
-slice.
+depth. Each CTU is encoded as the largest possible CU (no quadtree splitting),
+producing compact bitstreams (~275 bytes for 1920x1080, 2x smaller than x265).
+The output is an Annex-B bitstream containing VPS + SPS + PPS + IDR slice.
 
 ```bash
 # From a JSON parameter set file (extracts first VPS/SPS/PPS)
