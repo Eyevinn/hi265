@@ -5,13 +5,16 @@ LDFLAGS = -X github.com/Eyevinn/hi265/internal.commitVersion=$$(git describe --t
 
 all: check build test
 
-build: out/hi265dec out/hi265gen
+build: out/hi265dec out/hi265gen out/hi265gray
 
 out/hi265dec: $(shell find pkg cmd/hi265dec internal -name '*.go')
 	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265dec
 
 out/hi265gen: $(shell find pkg cmd/hi265gen internal -name '*.go')
 	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265gen
+
+out/hi265gray: $(shell find pkg cmd/hi265gray internal -name '*.go')
+	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265gray
 
 test:
 	go test ./...
@@ -36,7 +39,7 @@ venv/bin/pre-commit venv/bin/codespell:
 	venv/bin/pip install pre-commit codespell
 
 codespell: venv/bin/codespell
-	venv/bin/codespell -S venv,testdata,coverage.html,'*.y4m','*.265','*.hevc','*.mp4' -L pich,localy,ue
+	venv/bin/codespell -S venv,vendor,testdata,coverage.html,'*.y4m','*.265','*.hevc','*.mp4' -L pich,localy,ue
 
 clean:
 	rm -rf out/ coverage.out coverage.html coverage.txt venv/
@@ -44,3 +47,4 @@ clean:
 install:
 	go install -ldflags "$(LDFLAGS)" ./cmd/hi265dec
 	go install -ldflags "$(LDFLAGS)" ./cmd/hi265gen
+	go install -ldflags "$(LDFLAGS)" ./cmd/hi265gray

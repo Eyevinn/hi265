@@ -19,7 +19,8 @@ prediction frames where each CTU is a single flat color, defined by a grid
 pattern. This is useful for generating test bitstreams, color bars, frame
 counters, and reference content for decoder verification.
 
-All processing is 8-bit 4:2:0 only (no 10-bit or 4:2:2/4:4:4 support).
+Decoding is 8-bit 4:2:0 only. The gray IDR generator (`hi265gray`) supports
+any chroma format and bit depth (4:2:0, 4:2:2, 4:4:4; 8-bit, 10-bit, 12-bit).
 
 Pixel-perfect match with FFmpeg decoding across 16+ golden test cases covering
 SAO, sign hiding, transform skip, deblocking, P-frames, varied QP ranges, and
@@ -221,6 +222,40 @@ ffmpeg -i logo.265 -pix_fmt yuv420p -f rawvideo ff.yuv
 cmp logo.yuv ff.yuv  # should be identical
 ```
 
+### hi265gray — Gray IDR frame generator for GDR streams
+
+Generates a uniform mid-gray IDR frame given external VPS, SPS, and PPS
+parameter sets. Intended for bootstrapping decoders in Gradual Decode Refresh
+(GDR) streams that lack IDR frames.
+
+The gray frame uses DC prediction with zero residual, making it independent of
+chroma format and bit depth — it works with 4:2:0, 4:2:2, 4:4:4 at any bit
+depth. Each CTU is encoded as the largest possible CU (no quadtree splitting),
+producing compact bitstreams (~275 bytes for 1920x1080, 2x smaller than x265).
+The output is an Annex-B bitstream containing VPS + SPS + PPS + IDR slice.
+
+```bash
+# From a JSON parameter set file (extracts first VPS/SPS/PPS)
+go run ./cmd/hi265gray -f params.json -o gray.265
+
+# From hex strings
+go run ./cmd/hi265gray -vps 40010c... -sps 4201... -pps 4401... -o gray.265
+```
+
+The input file (`-f`) is a JSON object with `vps`, `sps`, and `pps` hex strings:
+
+```json
+{"vps": "40010c01ffff...", "sps": "4201012408...", "pps": "4401c0764c..."}
+```
+
+Test parameter sets are included in `cmd/hi265gray/testdata/`:
+
+| File | Format | Notes |
+|---|---|---|
+| `vps_sps_pps_420_8bit.json` | 4:2:0 8-bit | 128x64, CTU=64 |
+| `vps_sps_pps_420_10bit.json` | 4:2:0 10-bit | 1920x1080, CTU=64 |
+| `vps_sps_pps_422_10bit.json` | 4:2:2 10-bit | 1920x1080, CTU=64 |
+
 ## Library Usage
 
 The `pkg/` packages provide a public API for use as a Go library. Implementation
@@ -255,6 +290,10 @@ sps, _ := hevc.ParseSPSNALUnit(spsNALU)
 pps, _ := hevc.ParsePPSNALUnit(ppsNALU, spsMap)
 idrSlice, err := encode.EncodeIDRSliceFromSPSPPS(sps, pps, grid, colors)
 pSkipSlice, err := encode.EncodePSkipSliceFromSPSPPS(sps, pps, poc)
+
+// Generate a gray IDR frame from external SPS/PPS (any chroma format / bit depth)
+// Useful for bootstrapping GDR streams that lack IDR frames.
+grayIDR, err := encode.EncodeGrayIDRSliceFromSPSPPS(sps, pps)
 ```
 
 ### Appending frames to an existing bitstream
@@ -324,6 +363,7 @@ internal/deblock/  — Internal: Deblocking filter
 internal/sao/      — Internal: Sample Adaptive Offset
 cmd/hi265dec/      — CLI: decode HEVC from raw .265
 cmd/hi265gen/      — CLI: generate HEVC bitstreams or raw images from grid patterns
+cmd/hi265gray/     — CLI: generate gray IDR frames from external VPS/SPS/PPS
 examples/          — Example grid image files
 tools/             — Test generation scripts
 testdata/          — Golden HEVC bitstreams for regression testing

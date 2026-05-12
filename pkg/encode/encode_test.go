@@ -523,7 +523,7 @@ func TestEncodeTwoColor32x32(t *testing.T) {
 	}
 
 	f := frames[0]
-	maxAllowed := 7
+	maxAllowed := 2
 	for i := range 32 * 32 {
 		expected := 235
 		if i%32 >= 16 {

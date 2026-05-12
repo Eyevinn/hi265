@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- hi265gray CLI and `EncodeGrayIDRSliceFromSPSPPS` API for generating uniform
+  mid-gray IDR frames from external VPS/SPS/PPS. Supports any chroma format
+  (4:2:0, 4:2:2, 4:4:4) and bit depth (8, 10, 12). Uses DC prediction with
+  zero residual and largest-possible CU encoding (~275 bytes for 1920x1080,
+  ~40 us on Apple M4 Pro). Intended for bootstrapping GDR streams that lack
+  IDR frames.
+- Multi-resolution gray IDR test covering 12 resolutions (64x64 to 1920x1088)
+  with CTU=32 and CTU=64, verified pixel-perfect against FFmpeg decode
+- Benchmark for gray IDR generation at 1920x1080 in three formats
+  (4:2:0 8-bit, 4:2:0 10-bit, 4:2:2 10-bit)
 - hi265gen CLI tool for generating HEVC bitstreams and raw images from grid patterns
 - `FrameEncoder` type with grid-based API using hi264's `pkg/yuv` package
 - VUI colour description in SPS (BT.601/BT.709/BT.2020, full/limited range)
