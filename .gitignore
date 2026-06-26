@@ -5,7 +5,22 @@ references/
 out/
 /hi265dec
 /hi265gen
+/hi265grey
+/psnr
+cmd/hi265dec/hi265dec
+cmd/hi265gen/hi265gen
+cmd/hi265gray/hi265grey
 *.test
+
+# Generated media output (encoder/decoder artifacts)
+*.mp4
+*.y4m
+*.jpg
+*.jpeg
+/testdata/*.yuv
+cmd/**/*.265
+cmd/**/*.yuv
+cmd/**/*.y4m
 
 # Coverage
 /coverage.*
@@ -15,14 +30,19 @@ vendor/
 
 # IDE
 .vscode/
+.DS_Store
 
 # Python virtual environments
 venv/
 .venv/
 
+# Local development notes (not part of the published project)
+notes/
+
 # Debug/diagnostic tools (not part of the main project)
 cmd/bitstreamdump/
 cmd/cabactrace/
+cmd/debug_cus/
 cmd/findcoeff/
 cmd/qptest/
 cmd/spsdump/
