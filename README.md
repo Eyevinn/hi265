@@ -3,7 +3,6 @@
 ![Test](https://github.com/Eyevinn/hi265/workflows/Go/badge.svg)
 [![Coverage Status](https://coveralls.io/repos/github/Eyevinn/hi265/badge.svg?branch=main)](https://coveralls.io/github/Eyevinn/hi265?branch=main)
 [![Go Reference](https://pkg.go.dev/badge/github.com/Eyevinn/hi265.svg)](https://pkg.go.dev/github.com/Eyevinn/hi265)
-[![Go Report Card](https://goreportcard.com/badge/github.com/Eyevinn/hi265)](https://goreportcard.com/report/github.com/Eyevinn/hi265)
 [![license](https://img.shields.io/github/license/Eyevinn/hi265.svg)](https://github.com/Eyevinn/hi265/blob/main/LICENSE)
 [![Badge OSC](https://img.shields.io/badge/Evaluate-24243B?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTIiIGZpbGw9InVybCgjcGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyKSIvPgo8Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI3IiBzdHJva2U9ImJsYWNrIiBzdHJva2Utd2lkdGg9IjIiLz4KPGRlZnM+CjxsaW5lYXJHcmFkaWVudCBpZD0icGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyIiB4MT0iMTIiIHkxPSIwIiB4Mj0iMTIiIHkyPSIyNCIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPgo8c3RvcCBzdG9wLWNvbG9yPSIjQzE4M0ZGIi8+CjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzREQzlGRiIvPgo8L2xpbmVhckdyYWRpZW50Pgo8L2RlZnM+Cjwvc3ZnPgo=)](https://app.osaas.io/browse/eyevinn-mp4ff)
 
