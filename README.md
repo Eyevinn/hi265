@@ -221,9 +221,9 @@ ffmpeg -i logo.265 -pix_fmt yuv420p -f rawvideo ff.yuv
 cmp logo.yuv ff.yuv  # should be identical
 ```
 
-### hi265gray — Gray IDR frame generator for GDR streams
+### hi265gray — Gray IDR/CRA frame generator for GDR streams
 
-Generates a uniform mid-gray IDR frame given external VPS, SPS, and PPS
+Generates a uniform mid-gray IDR or CRA frame given external VPS, SPS, and PPS
 parameter sets. Intended for bootstrapping decoders in Gradual Decode Refresh
 (GDR) streams that lack IDR frames.
 
@@ -239,7 +239,16 @@ go run ./cmd/hi265gray -f params.json -o gray.265
 
 # From hex strings
 go run ./cmd/hi265gray -vps 40010c... -sps 4201... -pps 4401... -o gray.265
+
+# A CRA refresh frame (nal_unit_type 21) at a chosen picture order count
+go run ./cmd/hi265gray -f params.json -cra -poc 42 -o gray_cra.265
 ```
+
+With `-cra` the slice is a CRA (Clean Random Access) picture at the POC given by
+`-poc` instead of an IDR. A CRA derives its POC MSBs from the preceding pictures
+rather than resetting the POC to 0, so it can be spliced into a running stream as
+a refresh point without breaking POC continuity of the pictures that follow —
+which an IDR cannot do.
 
 The input file (`-f`) is a JSON object with `vps`, `sps`, and `pps` hex strings:
 
@@ -293,6 +302,12 @@ pSkipSlice, err := encode.EncodePSkipSliceFromSPSPPS(sps, pps, poc)
 // Generate a gray IDR frame from external SPS/PPS (any chroma format / bit depth)
 // Useful for bootstrapping GDR streams that lack IDR frames.
 grayIDR, err := encode.EncodeGrayIDRSliceFromSPSPPS(sps, pps)
+
+// CRA (Clean Random Access) refresh point at a chosen POC. Unlike an IDR, a CRA
+// does not reset the POC, so it splices into a running stream without breaking
+// POC continuity of the pictures that follow.
+craSlice, err := encode.EncodeCRASliceFromSPSPPS(sps, pps, grid, colors, poc)
+grayCRA, err := encode.EncodeGrayCRASliceFromSPSPPS(sps, pps, poc)
 ```
 
 ### Appending frames to an existing bitstream
@@ -362,7 +377,7 @@ internal/deblock/  — Internal: Deblocking filter
 internal/sao/      — Internal: Sample Adaptive Offset
 cmd/hi265dec/      — CLI: decode HEVC from raw .265
 cmd/hi265gen/      — CLI: generate HEVC bitstreams or raw images from grid patterns
-cmd/hi265gray/     — CLI: generate gray IDR frames from external VPS/SPS/PPS
+cmd/hi265gray/     — CLI: generate gray IDR/CRA frames from external VPS/SPS/PPS
 examples/          — Example grid image files
 tools/             — Test generation scripts
 testdata/          — Golden HEVC bitstreams for regression testing
