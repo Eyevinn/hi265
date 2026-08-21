@@ -560,6 +560,8 @@ func TestGeneratorConformance(t *testing.T) {
 				buf []byte
 			}{{"ffmpeg", ff}, {"hi265", hi}} {
 				pe := measurePatternError(d.buf, s.intended)
+				t.Logf("%s vs intended pattern: max delta %d, mean abs %.4f",
+					d.who, pe.maxDelta, pe.meanAbs)
 				if pe.maxDelta > c.maxPatternDelta || pe.meanAbs > c.maxPatternMean {
 					t.Errorf("%s decode drifts from the intended pattern: "+
 						"max delta %d (limit %d), mean abs %.3f (limit %.3f)",
