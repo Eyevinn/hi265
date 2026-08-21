@@ -1352,8 +1352,8 @@ func deriveMPM(candA, candB int) [3]int {
 		}
 		return [3]int{
 			candA,
-			2 + ((candA - 2 + 29) % 32), // candA - 1 in angular range
-			2 + ((candA - 2 + 1) % 32),  // candA + 1 in angular range
+			2 + ((candA + 29) % 32),    // candA - 1 in angular range
+			2 + ((candA - 2 + 1) % 32), // candA + 1 in angular range
 		}
 	}
 
