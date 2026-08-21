@@ -712,8 +712,8 @@ func encodeWithX265(t *testing.T, x265 string, src []byte,
 		"--qp", fmt.Sprintf("%d", qp),
 		"--no-sao", "--no-signhide", "--no-strong-intra-smoothing",
 		"--psy-rd", "0", "--no-weightp", "--bframes", "0",
-		// hi265dec does not implement entropy_coding_sync (WPP), which x265
-		// enables by default; without this the slice header does not parse.
+		// WPP off here so these vectors isolate the feature under test; the
+		// WPP path itself is covered by TestDecodeWPPStreams.
 		"--no-wpp", "--no-info",
 		"--output", out,
 	}

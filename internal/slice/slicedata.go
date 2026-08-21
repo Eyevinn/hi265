@@ -70,6 +70,13 @@ type Params struct {
 	SaoChroma                       bool
 	CuQpDeltaEnabled                bool
 	Log2MinCuQpDeltaSize            int // log2CtbSize - DiffCuQpDeltaDepth
+
+	// EntropyCodingSyncEnabled mirrors the PPS flag: wavefront parallel
+	// processing, where each CTU row is its own CABAC substream.
+	EntropyCodingSyncEnabled bool
+	// EntryPoints holds the byte offset into the slice data of each substream
+	// after the first, from the slice header's entry point offsets.
+	EntryPoints []int
 }
 
 // qpState tracks mutable QP state across the quantization group.
@@ -81,12 +88,6 @@ type qpState struct {
 // DecodeSliceData decodes the slice data segment using CABAC.
 // cabacData is the raw CABAC bitstream (after slice header, emulation prevention removed).
 func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
-	dec, err := cabac.NewDecoder(cabacData)
-	if err != nil {
-		return nil, fmt.Errorf("init CABAC: %w", err)
-	}
-	ctxModels := context.InitModels(p.SliceType, p.SliceQPY)
-
 	ctbSize := 1 << p.Log2CtbSize
 	ctbsX := (p.PicWidth + ctbSize - 1) / ctbSize
 	ctbsY := (p.PicHeight + ctbSize - 1) / ctbSize
@@ -100,9 +101,49 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 
 	qps := &qpState{currentQP: p.SliceQPY}
 
+	// Wavefront parallel processing splits the slice data into one substream per
+	// CTU row. Each substream restarts the arithmetic decoding engine at its
+	// entry point, and its context state is inherited from a snapshot taken
+	// after the second CTU of the row above rather than continuing the row
+	// before it (spec 9.3.1). Without WPP there is a single substream and the
+	// state simply carries on across rows.
+	wpp := p.EntropyCodingSyncEnabled && len(p.EntryPoints) > 0
+	substreams, err := splitSubstreams(cabacData, p.EntryPoints, wpp, ctbsY)
+	if err != nil {
+		return nil, err
+	}
+
+	dec, err := cabac.NewDecoder(substreams[0])
+	if err != nil {
+		return nil, fmt.Errorf("init CABAC: %w", err)
+	}
+	ctxModels := context.InitModels(p.SliceType, p.SliceQPY)
+	var syncModels []cabac.CtxState // state saved after the second CTU of a row
+
 	for ctbAddrRS := 0; ctbAddrRS < numCTUs; ctbAddrRS++ {
 		ctbX := (ctbAddrRS % ctbsX) * ctbSize
 		ctbY := (ctbAddrRS / ctbsX) * ctbSize
+		row := ctbAddrRS / ctbsX
+
+		if wpp && ctbAddrRS%ctbsX == 0 && row > 0 {
+			// Start of a CTU row: open its substream and take the context state
+			// from the row above, or start fresh when there was no second CTU
+			// there to snapshot (a picture one CTU wide).
+			if row >= len(substreams) {
+				return nil, fmt.Errorf("WPP: no substream for CTU row %d of %d", row, ctbsY)
+			}
+			dec, err = cabac.NewDecoder(substreams[row])
+			if err != nil {
+				return nil, fmt.Errorf("WPP: init CABAC for CTU row %d: %w", row, err)
+			}
+			if syncModels != nil {
+				ctxModels = append(ctxModels[:0], syncModels...)
+			} else {
+				ctxModels = context.InitModels(p.SliceType, p.SliceQPY)
+			}
+			qps.currentQP = p.SliceQPY
+			qps.isCuQpDeltaCoded = false
+		}
 
 		// Decode SAO parameters for this CTU
 		if p.SaoLuma || p.SaoChroma {
@@ -118,14 +159,46 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 		}
 		sd.CUs = append(sd.CUs, cus...)
 
+		// Snapshot the context state after the second CTU of a row, which is
+		// what the first CTU of the next row starts from.
+		if wpp && ctbAddrRS%ctbsX == 1 {
+			syncModels = append(syncModels[:0], ctxModels...)
+		}
+
 		// end_of_slice_segment_flag
 		endOfSlice := dec.DecodeTerminate()
 		if endOfSlice == 1 {
 			break
 		}
+		// With WPP the row ends with end_of_subset_one_bit followed by byte
+		// alignment, but the next row is reached through its entry point, so
+		// those trailing bits are simply left behind with the substream.
 	}
 
 	return sd, nil
+}
+
+// splitSubstreams divides the slice data at the entry point offsets. Without
+// WPP the whole slice is one substream.
+func splitSubstreams(cabacData []byte, entryPoints []int, wpp bool, ctbsY int) ([][]byte, error) {
+	if !wpp {
+		return [][]byte{cabacData}, nil
+	}
+	if len(entryPoints)+1 != ctbsY {
+		return nil, fmt.Errorf("WPP: %d entry point offsets for %d CTU rows",
+			len(entryPoints), ctbsY)
+	}
+	subs := make([][]byte, 0, len(entryPoints)+1)
+	start := 0
+	for _, ep := range entryPoints {
+		if ep <= start || ep > len(cabacData) {
+			return nil, fmt.Errorf("WPP: entry point %d outside slice data of %d bytes",
+				ep, len(cabacData))
+		}
+		subs = append(subs, cabacData[start:ep])
+		start = ep
+	}
+	return append(subs, cabacData[start:]), nil
 }
 
 // decodeSaoParams decodes SAO parameters for one CTU per HEVC spec 7.3.8.3.

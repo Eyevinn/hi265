@@ -73,7 +73,6 @@ func (d *Decoder) DecodeNALUs(nalus [][]byte) ([]*frame.Frame, error) {
 			if err != nil {
 				return nil, err
 			}
-			d.refFrame = f
 			frames = append(frames, f)
 
 		case hevc.NALU_CRA:
@@ -84,7 +83,6 @@ func (d *Decoder) DecodeNALUs(nalus [][]byte) ([]*frame.Frame, error) {
 			if err != nil {
 				return nil, err
 			}
-			d.refFrame = f
 			frames = append(frames, f)
 
 		case hevc.NALU_TRAIL_R, hevc.NALU_TRAIL_N:
@@ -92,7 +90,6 @@ func (d *Decoder) DecodeNALUs(nalus [][]byte) ([]*frame.Frame, error) {
 			if err != nil {
 				return nil, err
 			}
-			d.refFrame = f
 			frames = append(frames, f)
 
 		case hevc.NALU_SEI_PREFIX, hevc.NALU_SEI_SUFFIX:
@@ -190,6 +187,53 @@ func parsePOCAndRefPicSets(r *bits.EBSPReader, sps *hevc.SPS) (pocLsb int, tempo
 // when isCRA is set. Both are decoded as intra pictures; the CRA header
 // additionally carries slice_pic_order_cnt_lsb, the reference picture sets and
 // slice_temporal_mvp_enabled_flag (spec 7.3.6.1).
+// finishSliceHeader parses the tail of a slice segment header: the entry point
+// offsets, any slice segment header extension, and byte_alignment. It returns
+// the byte offsets, relative to the start of the slice data, at which each
+// substream after the first begins.
+//
+// num_entry_point_offsets is present whenever tiles or wavefront parallel
+// processing is enabled (spec 7.3.6.1). Skipping it left the reader a few bits
+// short of the alignment, which showed up as a failed stop-bit check — and since
+// x265 enables WPP by default, that was most real-world streams.
+func finishSliceHeader(r *bits.EBSPReader, sps *hevc.SPS, pps *hevc.PPS) ([]int, error) {
+	var entryPoints []int
+	if pps.TilesEnabledFlag || pps.EntropyCodingSyncEnabledFlag {
+		numEntryPointOffsets := int(r.ReadExpGolomb())
+		if numEntryPointOffsets > 0 {
+			offsetLen := int(r.ReadExpGolomb()) + 1
+			if offsetLen < 1 || offsetLen > 32 {
+				return nil, fmt.Errorf("slice header: offset_len_minus1+1 = %d out of range", offsetLen)
+			}
+			// The coded values are the sizes of consecutive substreams, so
+			// accumulate them into absolute positions within the slice data.
+			pos := 0
+			entryPoints = make([]int, 0, numEntryPointOffsets)
+			for range numEntryPointOffsets {
+				pos += int(r.Read(offsetLen)) + 1
+				entryPoints = append(entryPoints, pos)
+			}
+		}
+	}
+
+	if pps.SliceSegmentHeaderExtensionPresentFlag {
+		extLen := int(r.ReadExpGolomb())
+		for range extLen {
+			r.Read(8)
+		}
+	}
+
+	// byte_alignment
+	stopBit := r.Read(1)
+	if stopBit != 1 {
+		return nil, fmt.Errorf("slice header: expected stop bit 1, got %d", stopBit)
+	}
+	if bitsInByte := r.NrBitsRead() % 8; bitsInByte != 0 {
+		r.Read(8 - bitsInByte)
+	}
+	return entryPoints, nil
+}
+
 func (d *Decoder) decodeIRAP(nalu []byte, isCRA bool) (*frame.Frame, error) {
 	r := bits.NewEBSPReader(bytes.NewReader(nalu))
 
@@ -271,14 +315,10 @@ func (d *Decoder) decodeIRAP(nalu []byte, isCRA bool) (*frame.Frame, error) {
 		r.ReadFlag()
 	}
 
-	// byte_alignment
-	stopBit := r.Read(1)
-	if stopBit != 1 {
-		return nil, fmt.Errorf("slice header: expected stop bit 1, got %d", stopBit)
-	}
-	bitsInByte := r.NrBitsRead() % 8
-	if bitsInByte != 0 {
-		r.Read(8 - bitsInByte)
+	// Entry point offsets, slice header extension and byte alignment.
+	entryPoints, epErr := finishSliceHeader(r, sps, pps)
+	if epErr != nil {
+		return nil, epErr
 	}
 
 	if err := r.AccError(); err != nil {
@@ -293,7 +333,8 @@ func (d *Decoder) decodeIRAP(nalu []byte, isCRA bool) (*frame.Frame, error) {
 	log2CtbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3 +
 		int(sps.Log2DiffMaxMinLumaCodingBlockSize)
 
-	cabacData := removeEmulationPreventionBytes(nalu[headerSize:])
+	cabacData, droppedEPBs := removeEmulationPreventionBytesWithMap(nalu[headerSize:])
+	entryPoints = rebaseEntryPoints(entryPoints, droppedEPBs)
 
 	log2MinTrSize := int(sps.Log2MinLumaTransformBlockSizeMinus2) + 2
 	log2MaxTrSize := log2MinTrSize + int(sps.Log2DiffMaxMinLumaTransformBlockSize)
@@ -315,6 +356,8 @@ func (d *Decoder) decodeIRAP(nalu []byte, isCRA bool) (*frame.Frame, error) {
 		SaoChroma:                       sliceSaoChroma,
 		CuQpDeltaEnabled:                pps.CuQpDeltaEnabledFlag,
 		Log2MinCuQpDeltaSize:            log2CtbSize - int(pps.DiffCuQpDeltaDepth),
+		EntropyCodingSyncEnabled:        pps.EntropyCodingSyncEnabledFlag,
+		EntryPoints:                     entryPoints,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("decode slice data: %w", err)
@@ -443,14 +486,10 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 		r.ReadFlag()
 	}
 
-	// byte_alignment
-	stopBit := r.Read(1)
-	if stopBit != 1 {
-		return nil, fmt.Errorf("p-slice header: expected stop bit 1, got %d", stopBit)
-	}
-	bitsInByte := r.NrBitsRead() % 8
-	if bitsInByte != 0 {
-		r.Read(8 - bitsInByte)
+	// Entry point offsets, slice header extension and byte alignment.
+	entryPoints, epErr := finishSliceHeader(r, sps, pps)
+	if epErr != nil {
+		return nil, epErr
 	}
 
 	if err := r.AccError(); err != nil {
@@ -465,7 +504,8 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 	log2CtbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3 +
 		int(sps.Log2DiffMaxMinLumaCodingBlockSize)
 
-	cabacData := removeEmulationPreventionBytes(nalu[headerSize:])
+	cabacData, droppedEPBs := removeEmulationPreventionBytesWithMap(nalu[headerSize:])
+	entryPoints = rebaseEntryPoints(entryPoints, droppedEPBs)
 
 	log2MinTrSize := int(sps.Log2MinLumaTransformBlockSizeMinus2) + 2
 	log2MaxTrSize := log2MinTrSize + int(sps.Log2DiffMaxMinLumaTransformBlockSize)
@@ -488,6 +528,8 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 		SaoChroma:                       sliceSaoChroma,
 		CuQpDeltaEnabled:                pps.CuQpDeltaEnabledFlag,
 		Log2MinCuQpDeltaSize:            log2CtbSize - int(pps.DiffCuQpDeltaDepth),
+		EntropyCodingSyncEnabled:        pps.EntropyCodingSyncEnabledFlag,
+		EntryPoints:                     entryPoints,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("decode P-slice data: %w", err)
@@ -648,7 +690,44 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 		sao.Apply(f, sd.SaoParams, log2CtbSize)
 	}
 
-	return f, nil
+	// Later pictures predict from the full coded picture, but what comes out of
+	// the decoder is the conformance window.
+	d.refFrame = f
+	return cropToConformanceWindow(f, sps), nil
+}
+
+// cropToConformanceWindow returns the visible part of a decoded picture. An
+// encoder that pads the coded size up to a whole number of CTUs — x265 codes a
+// 360-line source as 368 lines — signals the padding in the SPS conformance
+// window, and a decoder that ignores it hands back the wrong picture size.
+// Returns the input untouched when there is nothing to crop.
+func cropToConformanceWindow(f *frame.Frame, sps *hevc.SPS) *frame.Frame {
+	if !sps.ConformanceWindowFlag {
+		return f
+	}
+	outW, outH := sps.ImageSize()
+	width, height := int(outW), int(outH)
+	if width == f.Width && height == f.Height {
+		return f
+	}
+	if width <= 0 || height <= 0 || width > f.Width || height > f.Height {
+		return f // nonsensical window: better the whole picture than nothing
+	}
+
+	// 4:2:0 offsets are in chroma units, so both planes crop on even boundaries.
+	left := int(sps.ConformanceWindow.LeftOffset) * 2
+	top := int(sps.ConformanceWindow.TopOffset) * 2
+
+	out := frame.NewFrame(width, height)
+	for y := range height {
+		copy(out.Y[y*out.StrideY:y*out.StrideY+width], f.Y[(y+top)*f.StrideY+left:])
+	}
+	cw, ch := width/2, height/2
+	for y := range ch {
+		copy(out.Cb[y*out.StrideC:y*out.StrideC+cw], f.Cb[(y+top/2)*f.StrideC+left/2:])
+		copy(out.Cr[y*out.StrideC:y*out.StrideC+cw], f.Cr[(y+top/2)*f.StrideC+left/2:])
+	}
+	return out
 }
 
 // predictIntra performs intra prediction for a block.
@@ -769,17 +848,43 @@ func getChromaNeighbors(f *frame.Frame, comp, x0, y0, size, ctbSize int) *pred.N
 	)
 }
 
-func removeEmulationPreventionBytes(data []byte) []byte {
-	out := make([]byte, 0, len(data))
+// removeEmulationPreventionBytesWithMap also reports the input positions of the
+// bytes it dropped, so offsets expressed in raw NAL bytes can be translated to
+// the cleaned buffer.
+func removeEmulationPreventionBytesWithMap(data []byte) (out []byte, dropped []int) {
+	out = make([]byte, 0, len(data))
 	i := 0
 	for i < len(data) {
 		if i+2 < len(data) && data[i] == 0 && data[i+1] == 0 && data[i+2] == 3 {
 			out = append(out, 0, 0)
+			dropped = append(dropped, i+2)
 			i += 3
 		} else {
 			out = append(out, data[i])
 			i++
 		}
+	}
+	return out, dropped
+}
+
+// rebaseEntryPoints translates entry point offsets from raw NAL byte positions
+// into positions in the emulation-prevention-stripped slice data.
+//
+// Spec 7.4.7.1 counts emulation prevention bytes as part of the slice segment
+// data for the purposes of these offsets, so on content that escapes a lot —
+// flat colour, where long zero runs are common — the raw offsets run well past
+// the end of the stripped buffer.
+func rebaseEntryPoints(entryPoints, dropped []int) []int {
+	if len(entryPoints) == 0 || len(dropped) == 0 {
+		return entryPoints
+	}
+	out := make([]int, len(entryPoints))
+	next := 0
+	for i, ep := range entryPoints {
+		for next < len(dropped) && dropped[next] < ep {
+			next++
+		}
+		out[i] = ep - next
 	}
 	return out
 }
