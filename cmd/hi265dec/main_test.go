@@ -72,3 +72,27 @@ func TestRunNoInput(t *testing.T) {
 		t.Error("expected an error when no input file is given")
 	}
 }
+
+// TestRunPositionalOutput covers the hi264dec-style form where the output path
+// is the second positional argument rather than -o.
+func TestRunPositionalOutput(t *testing.T) {
+	in := filepath.Join("..", "..", "testdata", "black_16x16.265")
+	if _, err := os.Stat(in); err != nil {
+		t.Skipf("test bitstream not available: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "positional.yuv")
+
+	if err := run([]string{appName, in, out}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if fi, err := os.Stat(out); err != nil || fi.Size() == 0 {
+		t.Fatalf("output not written to the positional path: %v", err)
+	}
+}
+
+func TestRunRejectsDoubleOutput(t *testing.T) {
+	in := filepath.Join("..", "..", "testdata", "black_16x16.265")
+	if err := run([]string{appName, in, "a.yuv", "-o", "b.yuv"}); err == nil {
+		t.Error("expected an error when the output is given both ways")
+	}
+}

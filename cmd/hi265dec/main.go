@@ -59,7 +59,7 @@ func run(args []string) error {
 	fs.BoolVar(&opts.fullRange, "full-range", false, "treat input as full-range YCbCr (0-255)")
 	fs.BoolVar(&opts.version, "version", false, "print version")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: %s [flags] input.265\n\nFlags:\n", appName)
+		fmt.Fprintf(fs.Output(), "Usage: %s [flags] input.265 [output]\n\nFlags:\n", appName)
 		fs.PrintDefaults()
 	}
 
@@ -74,15 +74,24 @@ func run(args []string) error {
 		fmt.Printf("%s %s\n", appName, internal.GetVersion())
 		return nil
 	}
+	// The output path may be given either with -o or as a second positional,
+	// matching hi264dec.
+	var inPath string
 	switch len(positional) {
 	case 1:
+		inPath = positional[0]
+	case 2:
+		if opts.outPath != "" {
+			return fmt.Errorf("output given twice: -o %s and positional %s",
+				opts.outPath, positional[1])
+		}
+		inPath, opts.outPath = positional[0], positional[1]
 	case 0:
 		fs.Usage()
 		return errors.New("no input file given")
 	default:
-		return fmt.Errorf("expected one input file, got %d: %v", len(positional), positional)
+		return fmt.Errorf("expected at most two paths, got %d: %v", len(positional), positional)
 	}
-	inPath := positional[0]
 
 	if opts.numFrames < 0 {
 		return fmt.Errorf("-n must be non-negative, got %d", opts.numFrames)

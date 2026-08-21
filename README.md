@@ -34,11 +34,70 @@ go test ./...
 
 ## CLI Tools
 
-### hi265dec — Decode HEVC from raw .265
+### hi265dec — Decode HEVC to raw frames or images
+
+Input is Annex-B (`.265`, `.hevc`, `.h265`) or MP4 (`.mp4`, `.m4v`, `.m4s`),
+progressive or fragmented; MP4 parameter sets are read from the `hvcC` box.
+Output format follows the output extension: `.yuv`, `.y4m`, `.png`, `.jpg`.
+The output path may be given positionally or with `-o`, and flags may appear on
+either side of the input path.
 
 ```bash
-# Decode HEVC Annex-B to raw YUV
+# Raw YUV (all decoded frames, concatenated)
 go run ./cmd/hi265dec input.265 output.yuv
+go run ./cmd/hi265dec input.265 -o output.yuv
+
+# MP4 input; samples decode in order, so P-skip frames resolve correctly
+go run ./cmd/hi265dec input.mp4 -o frames.yuv
+
+# Thumbnail: first frame only
+go run ./cmd/hi265dec -n 1 input.mp4 thumb.png
+
+# N frames as numbered images (thumbs_0000.jpg, thumbs_0001.jpg, ...)
+go run ./cmd/hi265dec -n 5 -q 95 input.mp4 thumbs.jpg
+
+# Y4M, and a BT.709 RGB conversion for the image formats
+go run ./cmd/hi265dec input.265 out.y4m
+go run ./cmd/hi265dec -colorspace bt709 input.265 out.png
+```
+
+| Flag | Description | Default |
+|---|---|---|
+| `-o` | Output file (or give it as the second positional) | input name + `.yuv` |
+| `-n` | Number of frames to write (0 = all) | 0 |
+| `-q` | JPEG quality (1-100) | 85 |
+| `-colorspace` | Color space for RGB conversion (`bt601`/`bt709`/`bt2020`) | `bt601` |
+| `-full-range` | Treat input as full-range YCbCr | off |
+
+> Streams using wavefront parallel processing (`entropy_coding_sync`) or tiles
+> are not yet supported and fail with a slice-header error. x265 enables WPP by
+> default, so encode test material with `--no-wpp`. Tracked as item 0.9 in
+> `docs/roadmap.md`.
+
+### hi265-mp4-extend — Extend a CMAF segment with empty frames
+
+Appends N frames to a fragmented MP4 media segment, reusing the source's SPS
+and PPS verbatim so the output splices with no parameter-set change. Useful for
+padding a segment out to a target duration.
+
+```bash
+# Freeze: append 25 P-skip copies of the segment's last picture
+go run ./cmd/hi265-mp4-extend -frames 25 init.mp4 in.m4s out.m4s
+
+# Refresh with a mid-gray CRA, then P-skip copies of it. A CRA carries
+# slice_pic_order_cnt_lsb, so it continues the source POC instead of resetting
+# it — the right choice for splicing into a running stream, and something
+# H.264 cannot express.
+go run ./cmd/hi265-mp4-extend -frames 25 -gray-cra init.mp4 in.m4s out.m4s
+
+# Or a gray IDR (resets POC to 0 for everything after it)
+go run ./cmd/hi265-mp4-extend -frames 25 -gray-idr init.mp4 in.m4s out.m4s
+
+# Attach a Time Code SEI to each appended frame, continuing from the source
+go run ./cmd/hi265-mp4-extend -frames 25 -timecode init.mp4 in.m4s out.m4s
+
+# The result is a self-contained media segment, played next to the init segment
+cat init.mp4 out.m4s | ffplay -i -
 ```
 
 ### hi265gen — HEVC bitstream generator for test content
@@ -94,6 +153,11 @@ go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 10 -text "%03d" -o smpte.265
 
 # SMPTE bars with digit background box and explicit scale
 go run ./cmd/hi265gen -smpte -w 352 -h 288 -n 1 -text "%02d" -text-scale 3 -text-bg 0,0,0 -o smpte_big.265
+
+# 8x8 coding granularity: minCb=8, so each 16x16 CTU is split into four
+# independent 8x8 CUs, each with its own intra mode. Finer coding structure for
+# the same pattern; the grid still maps one character per 16x16 block.
+go run ./cmd/hi265gen -gp "xy,yx" -gc x=235,128,128 -gc y=16,128,128 -w 64 -h 64 -8x8 -o fine.265
 
 # Fixed bytes per picture (pad with HEVC filler NALUs for CBR-like streams)
 go run ./cmd/hi265gen -smpte -w 192 -h 96 -bpp 5000 -o padded.265
@@ -154,6 +218,7 @@ Flags:
 | `-text-bg` | Text background box color (R,G,B) | none |
 | `-fg` | Foreground RGB color for text | `255,255,255` |
 | `-bg` | Background RGB color | `0,0,0` |
+| `-8x8` | Split each 16x16 CTU into four independent 8x8 CUs | off |
 | `-qp` | Quantization parameter (0-51) | 26 |
 | `-q` | JPEG quality (1-100) | 85 |
 | `-idr-interval` | Frames between IDR keyframes (0 = all-IDR) | 0 |

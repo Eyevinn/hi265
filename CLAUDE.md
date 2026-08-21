@@ -76,7 +76,7 @@ internal/transform/— Internal: Inverse quantization and transform (4x4, 8x8, 1
 internal/pred/     — Internal: Intra prediction modes (planar, DC, angular)
 internal/deblock/  — Internal: Deblocking filter
 internal/sao/      — Internal: Sample Adaptive Offset
-cmd/hi265dec/      — CLI: decode HEVC from raw .265
+cmd/hi265dec/      — CLI: decode HEVC from Annex-B or MP4 to YUV/Y4M/PNG/JPEG
 cmd/hi265gen/      — CLI: generate HEVC bitstreams or raw images from grid patterns
 cmd/hi265gray/     — CLI: generate gray IDR/CRA frames from external VPS/SPS/PPS
 testdata/          — Test bitstreams and golden references
