@@ -71,6 +71,41 @@ Every `hi265gen` example in `README.md` fails as written: the documented `-f`,
 `-grid`, `-c`, `-digits` are actually `-gi`, `-gp`, `-gc`, `-text` (and `-f` is
 now the output format). Regenerate the examples from `parseOptions`.
 
+### 0.5 Deblocking was enabled in the generated PPS by accident (S) — **done**
+
+The PPS wrote `deblocking_filter_control_present_flag = 0`, which infers
+`pps_deblocking_filter_disabled_flag = 0` — i.e. deblocking **on**, the opposite
+of what the slice-header writers and their comments assume. Now signalled
+explicitly as disabled. Effect on FFmpeg-vs-`hi265dec` agreement for generated
+streams:
+
+| pattern | before | after |
+|---|---|---|
+| tiled two-colour grid, 192x96 | 7184 samples differ, max 4 | exact |
+| SMPTE bars, 192x96 | 1104 differ, max 2 | exact |
+| SMPTE + `%03d` overlay | luma 5163 / max 75, chroma 824 / max 4 | luma 2112 / max 76, chroma exact |
+| 3-frame P-skip sequence | chroma drift growing 4 → 12 → 20 per frame | no drift |
+
+### 0.6 Non-flat CTU luma coding mismatch (M) — **open bug**
+
+Once 0.1 and 0.5 are in, flat content is bit-exact against FFmpeg but CTUs
+carrying real AC residual are not. On a 192x96 SMPTE frame with a `%03d`
+overlay: **2112 luma samples differ, max delta 76**, chroma exact, unchanged by
+deblocking, and identical on every frame of a P-skip sequence (so it is coded
+in, not accumulated). Luma TBs are 16x16 here, so mode-dependent scan should
+not be involved. The encoder's own reconstruction is what later CTUs predict
+from, so an error there propagates spatially.
+
+### 0.7 Deblocking filter exactness at moderate QP (M) — **open, decoder side**
+
+With deblocking enabled (before 0.5), `hi265dec` differed from FFmpeg by up to 4
+on flat content at QP 26, accumulating across P-skip frames. The three golden
+deblock streams pass, but they were deliberately generated at `--qp 40` "for a
+clean test (minimal ±1 rounding)" — which implies the filter is not bit-exact at
+moderate QP. 0.5 hides this for *generated* content but it still affects the
+decoder's main job: decoding real-world streams. Needs its own x265/FFmpeg
+vectors at QP 22–30 with deblocking on.
+
 ### 0.4 `hi265dec` argument handling (S)
 
 `go run ./cmd/hi265dec in.265 -o out.yuv` silently ignores `-o` — Go's `flag`
