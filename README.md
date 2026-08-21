@@ -69,10 +69,10 @@ go run ./cmd/hi265dec -colorspace bt709 input.265 out.png
 | `-colorspace` | Color space for RGB conversion (`bt601`/`bt709`/`bt2020`) | `bt601` |
 | `-full-range` | Treat input as full-range YCbCr | off |
 
-> Streams using wavefront parallel processing (`entropy_coding_sync`) or tiles
-> are not yet supported and fail with a slice-header error. x265 enables WPP by
-> default, so encode test material with `--no-wpp`. Tracked as item 0.9 in
-> `docs/roadmap.md`.
+> Wavefront parallel processing (`entropy_coding_sync`) is supported, which is
+> what x265 enables by default, and the SPS conformance window is applied to the
+> output. Tiles are not supported yet. Busy natural content is not yet
+> bit-exact — see item 0.10 in `docs/roadmap.md`.
 
 ### hi265-mp4-extend — Extend a CMAF segment with empty frames
 

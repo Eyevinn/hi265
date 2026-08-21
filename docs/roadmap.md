@@ -195,44 +195,55 @@ naming the nearest usable size instead of panicking. Supporting them needs a
 conformance window (`conf_win_*_offset`), which also means teaching the decoder
 to crop on output; that is a separate piece of work and nothing needs it yet.
 
-### 0.9 WPP / tiles streams fail to parse — blocks most real-world input (M) — **open bug**
+### 0.9 WPP streams (M) — **fixed**
 
-`hi265dec` cannot decode `testdata/hevc_1idr_1p.mp4`, failing with
-`slice header: expected stop bit 1, got 0` on the very first IDR. The same
-stream converted to Annex-B fails identically, so this is not an MP4-path
-problem.
+`hi265dec` could not decode `testdata/hevc_1idr_1p.mp4`, failing with
+`slice header: expected stop bit 1, got 0`. The slice header carries
+`num_entry_point_offsets` (plus `offset_len_minus1` and the offsets) whenever
+tiles or wavefront parallel processing is enabled (spec 7.3.6.1); the decoder
+never read them, so the header misaligned. x265 enables WPP by default, so this
+was most real-world HEVC.
 
-Cause: when `tiles_enabled_flag` or `entropy_coding_sync_enabled_flag` is set,
-the slice segment header carries `num_entry_point_offsets` (plus
-`offset_len_minus1` and the offsets) just before `byte_alignment()`. The decoder
-never reads them, so the header misaligns and the stop-bit check fails.
-Confirmed by parsing the parameter sets of both:
+Three parts to the fix:
 
-| stream | `entropy_coding_sync` (WPP) | decodes |
-|---|---|---|
-| `testdata/hevc_1idr_1p.mp4` | **true** | no |
-| `testdata/sincos_128x64.265` (golden) | false | yes |
+1. **Header.** One shared `finishSliceHeader` parses the entry point offsets,
+   the slice segment header extension and `byte_alignment` for both the IRAP and
+   trailing-slice paths, which had duplicated that tail. It also stopped
+   ignoring `slice_segment_header_extension_length`.
+2. **Substreams.** With WPP each CTU row is its own CABAC substream: the
+   arithmetic engine restarts at the row's entry point and the context state
+   comes from a snapshot taken after the **second** CTU of the row above, not
+   from the end of that row (spec 9.3.1). A picture one CTU wide has no such
+   snapshot and starts each row fresh; `qPY_PREV` resets to SliceQpY per row.
+3. **Offsets count emulation prevention bytes** (7.4.7.1), but the substreams
+   are split out of the stripped buffer. On flat content, which escapes often,
+   the raw offsets ran well past the end of it — 287 into a 231-byte buffer. The
+   offsets are now translated using the positions of the removed bytes.
 
-This matters more than the single test file suggests: **x265 enables WPP by
-default**, so most real-world HEVC fails here. The golden vectors were all
-generated with it off, which is why the decoder never saw it.
+Verified bit-exact against FFmpeg on flat content, all with WPP on:
 
-Two levels of fix:
+| case | result |
+|---|---|
+| CTU 16, 640x352 (22 CTU rows) | exact |
+| CTU 32 / CTU 64 | exact |
+| single CTU column (no snapshot to inherit) | exact |
+| `cu_qp_delta` enabled | exact |
+| x265 defaults (WPP + SAO + sign hiding + 32x32 TBs), 256x192 | exact |
+| x265 defaults, 1280x720 | exact |
 
-1. **Parse the fields** (small). For a picture with a single CTU row
-   `num_entry_point_offsets` is 0 and there are no substreams, so parsing alone
-   makes those streams decodable.
-2. **Actually support WPP** (larger). More than one CTU row means real
-   substreams: per-CTU-row CABAC context save/restore at the second CTU of the
-   row above, and decoding each substream from its entry point.
+**Tiles** are still unsupported: the entry point offsets now parse, but tile
+scan order and per-tile CABAC reset are not implemented.
 
-Do (1) with a clear "WPP with multiple CTU rows not supported" error for the
-multi-row case, then (2) as a separate piece of work.
+### 0.12 Conformance window was ignored (S) — **fixed**
 
-The slice header parser also skips `num_extra_slice_header_bits`
-(`slice_reserved_flag[i]`) — harmless today because every encoder we see writes
-0, but the same class of gap and worth fixing alongside. `tools/gen_test_bitstream.sh`
-should record `--no-wpp`, which is what the vectors were actually made with.
+Found while fixing 0.9. An encoder that pads the coded picture up to a whole
+number of CTUs signals the padding in the SPS conformance window — x265 codes a
+360-line source as 368 lines — and the decoder returned the coded size, so the
+output had the wrong dimensions and every comparison after the first row of
+padding was meaningless. The output is now cropped while the full coded picture
+stays as the prediction reference. On x265 colour bars this took 640x360 from
+30723 differing samples (max 196) to 1112 (max 3), and 1920x1080 from 99760
+(max 197) to 3336 (max 12) — the remainder being 0.10.
 
 ### 0.10 Real-world content decoding is not yet bit-exact (L) — **open**
 
@@ -251,6 +262,15 @@ So a residual or prediction path still diverges on busy content. This is the
 decoder's core job, so it deserves its own phase; the conformance harness plus
 x265 is the tool for bisecting it. P frames with real motion are far off
 (max > 200), as expected — only zero-motion skip is implemented.
+
+It gets worse with scale and detail. A 1280x720 `testsrc2` frame at x265's
+defaults desynchronises outright (1379837 of 1382400 samples differ, max 245),
+and `testdata/hevc_1idr_1p.mp4` — a real 720p encode — desynchronises far enough
+to derive a negative QP and panic in `Dequantize`. Flat content at the same
+settings and size is bit-exact, so the fault is in coding busy residual, not in
+the picture geometry or the WPP plumbing. Two things to do regardless of the
+root cause: never let a decode panic on input (clamp the QP and return an
+error), and bisect with the smallest divergent block the harness can find.
 
 ### 0.4 `hi265dec` argument handling (S)
 
