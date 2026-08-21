@@ -458,7 +458,8 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 
 	// Decode transform tree
 	tus, err := decodeTransformTree(dec, ctx, x0, y0, x0, y0, log2CbSize, log2CbSize,
-		0, cbSize, true, true, p, cu.IntraLumaMode, x0, y0, qps, intraSplitFlag)
+		0, cbSize, true, true, p, cu.IntraLumaMode, cu.IntraChromaMode, x0, y0, qps,
+		intraSplitFlag)
 	if err != nil {
 		return cu, err
 	}
@@ -472,7 +473,8 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	x0, y0, xBase, yBase int, log2TrafoSize, log2CbSize int,
 	trafoDepth, cbSize int, cbfCb, cbfCr bool, p *Params,
-	lumaIntraModes [4]int, cuX0, cuY0 int, qps *qpState, intraSplitFlag bool) ([]TransformUnit, error) {
+	lumaIntraModes [4]int, intraChromaMode int, cuX0, cuY0 int, qps *qpState,
+	intraSplitFlag bool) ([]TransformUnit, error) {
 
 	log2MaxTrafoSize := p.Log2MaxTrafoSize
 	log2MinTrafoSize := p.Log2MinTrafoSize
@@ -522,7 +524,8 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 		for _, pos := range positions {
 			tus, err := decodeTransformTree(dec, ctx, pos[0], pos[1], x0, y0,
 				newLog2TrafoSize, log2CbSize, trafoDepth+1, cbSize,
-				cbfCb, cbfCr, p, lumaIntraModes, cuX0, cuY0, qps, intraSplitFlag)
+				cbfCb, cbfCr, p, lumaIntraModes, intraChromaMode, cuX0, cuY0, qps,
+				intraSplitFlag)
 			if err != nil {
 				return nil, err
 			}
@@ -566,11 +569,10 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	// Decode residual coefficients
 	trSize := 1 << log2TrafoSize
 
-	// Compute luma scanIdx based on intra mode
-	// HEVC spec: for 4x4 luma TUs, mode 6-14 → horizontal, mode 22-30 → vertical
-	lumaScanIdx := 0
-	if log2TrafoSize == 2 {
-		// Determine which PU this TU belongs to
+	// Luma prediction mode of this TU. Only an NxN partitioning gives the four
+	// quadrants of a CU their own mode; a 2Nx2N CU has one mode for all its TUs.
+	lumaMode := lumaIntraModes[0]
+	if intraSplitFlag {
 		puIdx := 0
 		halfCb := cbSize / 2
 		if x0 >= cuX0+halfCb {
@@ -579,13 +581,11 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 		if y0 >= cuY0+halfCb {
 			puIdx += 2
 		}
-		lumaMode := lumaIntraModes[puIdx]
-		if lumaMode >= 6 && lumaMode <= 14 {
-			lumaScanIdx = 1
-		} else if lumaMode >= 22 && lumaMode <= 30 {
-			lumaScanIdx = 2
-		}
+		lumaMode = lumaIntraModes[puIdx]
 	}
+
+	// Mode-dependent scan (spec 7.4.9.11): 4x4 and 8x8 luma transform blocks.
+	lumaScanIdx := ScanIdxForIntraMode(lumaMode, log2TrafoSize, true)
 
 	if tu.CbfLuma {
 		coeffs, err := decodeResidualCoding(dec, ctx, log2TrafoSize, true, lumaScanIdx, p.SignDataHidingEnabled)
@@ -608,6 +608,20 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	// for the TU at the base position (top-left of the 8x8 group)
 	parseChroma := log2TrafoSize > 2 || (x0 == xBase && y0 == yBase)
 
+	// Chroma prediction mode (IntraPredModeC, spec 8.4.3): mode 4 is DM
+	// (derived from luma), and an explicit mode that collides with the luma
+	// mode is substituted by mode 34. For 4:2:0 the chroma block belongs to the
+	// CU, so the mode comes from the CU's first luma PU.
+	chromaMode := intraChromaMode
+	switch chromaMode {
+	case 4:
+		chromaMode = lumaIntraModes[0]
+	case lumaIntraModes[0]:
+		chromaMode = 34
+	}
+	// Mode-dependent scan (spec 7.4.9.11): 4x4 chroma transform blocks.
+	chromaScanIdx := ScanIdxForIntraMode(chromaMode, chromaLog2TrSize, false)
+
 	// Parse chroma transform_skip_flag for 4x4 chroma TUs
 	if p.TransformSkipEnabled && parseChroma && chromaLog2TrSize == 2 {
 		if tu.CbfCb {
@@ -621,7 +635,7 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	}
 
 	if parseChroma && tu.CbfCb {
-		coeffs, err := decodeResidualCoding(dec, ctx, chromaLog2TrSize, false, 0, p.SignDataHidingEnabled)
+		coeffs, err := decodeResidualCoding(dec, ctx, chromaLog2TrSize, false, chromaScanIdx, p.SignDataHidingEnabled)
 		if err != nil {
 			return nil, fmt.Errorf("cb residual: %w", err)
 		}
@@ -631,7 +645,7 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	}
 
 	if parseChroma && tu.CbfCr {
-		coeffs, err := decodeResidualCoding(dec, ctx, chromaLog2TrSize, false, 0, p.SignDataHidingEnabled)
+		coeffs, err := decodeResidualCoding(dec, ctx, chromaLog2TrSize, false, chromaScanIdx, p.SignDataHidingEnabled)
 		if err != nil {
 			return nil, fmt.Errorf("cr residual: %w", err)
 		}
@@ -655,6 +669,13 @@ func decodeResidualCoding(dec *cabac.Decoder, ctx []cabac.CtxState,
 	lastSigCoeffYPrefix := decodeLastSigCoeffPrefix(dec, ctx, log2TrafoSize, isLuma, false)
 	lastSigCoeffX := decodeLastSigCoeffSuffix(dec, lastSigCoeffXPrefix)
 	lastSigCoeffY := decodeLastSigCoeffSuffix(dec, lastSigCoeffYPrefix)
+
+	// Spec 7.3.8.11: for the vertical scan the coded x and y are swapped, so
+	// that one set of context models serves both scan directions.
+	if scanIdx == 2 {
+		lastSigCoeffX, lastSigCoeffY = lastSigCoeffY, lastSigCoeffX
+	}
+
 	// Convert to sub-block coordinates
 	log2SbSize := 2 // 4x4 sub-blocks
 	if log2TrafoSize == 2 {
@@ -1192,6 +1213,30 @@ func verticalScanOrder(width, height int) [][2]int {
 		}
 	}
 	return order
+}
+
+// ScanIdxForIntraMode returns the residual scan order of an intra transform
+// block per HEVC spec 7.4.9.11. The scan is prediction-mode dependent for 4x4
+// transform blocks of any component and for 8x8 luma transform blocks; all
+// other sizes use the up-right diagonal scan. Near-horizontal prediction
+// (modes 6-14) uses the vertical scan, near-vertical prediction (modes 22-30)
+// the horizontal scan.
+//
+// log2TrafoSize is the size of the transform block of the component itself
+// (so 2 for the 4x4 chroma block of an 8x8 luma block in 4:2:0), and mode is
+// that component's intra prediction mode (IntraPredModeY or IntraPredModeC).
+func ScanIdxForIntraMode(mode, log2TrafoSize int, isLuma bool) int {
+	modeDependent := log2TrafoSize == 2 || (log2TrafoSize == 3 && isLuma)
+	if !modeDependent {
+		return 0 // diagonal
+	}
+	switch {
+	case mode >= 6 && mode <= 14:
+		return 2 // vertical
+	case mode >= 22 && mode <= 30:
+		return 1 // horizontal
+	}
+	return 0 // diagonal
 }
 
 // ScanOrder returns the scan order for the given scanIdx.
