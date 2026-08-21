@@ -34,6 +34,9 @@ go run ./cmd/hi265dec input.265 output.yuv
 # Generate HEVC bitstream from grid pattern
 go run ./cmd/hi265gen -gp "AB,CD" -gc A=16,128,128 -gc B=235,128,128 -o test.265
 
+# Generate with a per-picture Time Code SEI (payload type 136)
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 75 -fps 25 -timecode -o timecode.265
+
 # Generate gray IDR frame from external VPS/SPS/PPS (any chroma format/bit depth)
 go run ./cmd/hi265gray -f params.json -o gray.265
 ```
@@ -60,6 +63,7 @@ External SPS/PPS support (for injecting frames into existing streams):
 pkg/decoder/       — Public: top-level decoder API (DecodeAnnexB)
 pkg/encode/        — Public: bitstream generator API (GenerateIDR, GeneratePSkip, FrameEncoder)
 pkg/frame/         — Public: Frame type (decoded output)
+pkg/timecode/      — Public: SMPTE timecode arithmetic and text formatting
 internal/cabac/    — Internal: CABAC arithmetic decoder and encoder engines
 internal/context/  — Internal: Context model initialization (170 contexts)
 internal/slice/    — Internal: Slice data parsing, CTU/CU/TU quadtree

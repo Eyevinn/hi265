@@ -108,6 +108,27 @@ go run ./cmd/hi265gen -w 192 -h 96 -n 5 -text "%03d" -o frame_%03d.png
 ```
 
 ```bash
+# Time Code SEI: embed an HH:MM:SS:FF timecode per picture (IDR and P-skip alike).
+# HEVC carries the timecode in SEI 136, not in pic_timing as H.264 does, so no
+# SPS/VUI change is needed. Verify with `mp4ff-nallister -annexb -c hevc -sei 1`.
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 75 -fps 25 -timecode -o timecode.265
+
+# Read the timecode back with ffprobe (SMPTE 12M side data):
+#   ffprobe -loglevel error -select_streams v:0 \
+#     -show_entries frame_tags=timecode -of default=nw=1:nk=1 timecode.265
+
+# Start the counter/timecode at a given frame, so independently generated
+# segments (-start-frame 0, 48, 96, ...) concatenate into one continuous run.
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 48 -fps 25 -timecode -start-frame 76 -o seg.265
+
+# Fractional frame rate (29.97 = 30000/1001): MP4 timescale 30000, sample duration 1001.
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 60 -fps 30000/1001 -timecode -o ntsc.mp4
+
+# NTSC drop-frame counting (valid only for 29.97/59.94).
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 60 -fps 29.97 -drop-frame -timecode -o df.265
+```
+
+```bash
 # Color space: generate BT.709 stream (VUI signaled in SPS)
 go run ./cmd/hi265gen -gi examples/logo.gridimg -colorspace bt709 -o logo_709.265
 
@@ -140,7 +161,10 @@ Flags:
 | `-kbps` | Target bitrate in kbit/s (converted to `-bpp` using `-fps`) | 0 (off) |
 | `-colorspace` | Color space (`bt601`/`bt709`/`bt2020`) | `bt601` |
 | `-full-range` | Full-range YCbCr (0-255) | off (limited) |
-| `-fps` | Framerate for MP4 and timestamp specifiers | 25 |
+| `-timecode` | Emit a Time Code SEI (payload type 136) per picture (`265`/`mp4` only) | off |
+| `-start-frame` | Starting frame number; offsets counters, timecodes and the MP4 timeline | 0 |
+| `-drop-frame` | NTSC drop-frame timecode counting (only with `-fps 29.97`/`59.94`) | off |
+| `-fps` | Framerate: integer (`25`), rational (`30000/1001`) or NTSC decimal (`29.97`) | 25 |
 | `-frag-dur` | MP4 fragment duration in frames | 25 |
 | `-o` | Output file (`-` for stdout, requires `-f`) | — |
 | `-version` | Print version | — |
