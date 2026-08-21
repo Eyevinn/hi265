@@ -129,6 +129,40 @@ Interim: the README now documents the constraint. The fix should land after 4.3,
 since the minCb choice determines which of the two mechanisms is needed. At
 minimum, validate the dimensions and return a clear error instead of panicking.
 
+### 0.9 WPP / tiles streams fail to parse — blocks most real-world input (M) — **open bug**
+
+`hi265dec` cannot decode `testdata/hevc_1idr_1p.mp4`, failing with
+`slice header: expected stop bit 1, got 0` on the very first IDR. The same
+stream converted to Annex-B fails identically, so this is not an MP4-path
+problem.
+
+Cause: when `tiles_enabled_flag` or `entropy_coding_sync_enabled_flag` is set,
+the slice segment header carries `num_entry_point_offsets` (plus
+`offset_len_minus1` and the offsets) just before `byte_alignment()`. The decoder
+never reads them, so the header misaligns and the stop-bit check fails.
+Confirmed by parsing the parameter sets of both:
+
+| stream | `entropy_coding_sync` (WPP) | decodes |
+|---|---|---|
+| `testdata/hevc_1idr_1p.mp4` | **true** | no |
+| `testdata/sincos_128x64.265` (golden) | false | yes |
+
+This matters more than the single test file suggests: **x265 enables WPP by
+default**, so most real-world HEVC fails here. The golden vectors were all
+generated with it off, which is why the decoder never saw it.
+
+Two levels of fix:
+
+1. **Parse the fields** (small). For a picture with a single CTU row
+   `num_entry_point_offsets` is 0 and there are no substreams, so parsing alone
+   makes those streams decodable.
+2. **Actually support WPP** (larger). More than one CTU row means real
+   substreams: per-CTU-row CABAC context save/restore at the second CTU of the
+   row above, and decoding each substream from its entry point.
+
+Do (1) with a clear "WPP with multiple CTU rows not supported" error for the
+multi-row case, then (2) as a separate piece of work.
+
 ### 0.4 `hi265dec` argument handling (S)
 
 `go run ./cmd/hi265dec in.265 -o out.yuv` silently ignores `-o` — Go's `flag`
@@ -281,13 +315,16 @@ frame (freeze) or to gray (CRA refresh).
 
 ## Phase 4 — CLI parity
 
-### 4.1 `hi265dec` (M)
+### 4.1 `hi265dec` (M) — **done**, except `-no-deblock`
 
-- MP4 / `.m4v` input via mp4ff (currently Annex-B only)
-- `-n` to extract N keyframes in one call
-- `.jpg` and `.y4m` output (currently `.yuv` and `.png` only)
-- `-no-deblock`
-- `-colorspace` override for PNG/JPEG conversion
+- MP4 / `.m4v` / `.m4s` input via mp4ff, progressive and fragmented, parameter
+  sets from `hvcC`. Samples decode in order rather than jumping between sync
+  samples, so P-skip frames resolve against their reference.
+- `-n` frame limit; image output writes one numbered file per frame
+- `.y4m` and `.jpg` output, plus `-q`, `-colorspace`, `-full-range`, `-version`
+- Still to do: `-no-deblock`
+
+Real-world MP4 input is blocked by 0.9 (WPP), not by the MP4 plumbing.
 
 ### 4.2 `hi265gen` (M)
 
