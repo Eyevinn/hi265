@@ -7,12 +7,13 @@ import (
 
 // HEVC NALU types
 const (
-	naluTrailR   = 1
-	naluIDRWRadl = 19
-	naluVPS      = 32
-	naluSPS      = 33
-	naluPPS      = 34
-	NaluFiller   = 38
+	naluTrailR    = 1
+	naluIDRWRadl  = 19
+	naluVPS       = 32
+	naluSPS       = 33
+	naluPPS       = 34
+	NaluFiller    = 38
+	naluPrefixSEI = 39
 )
 
 // WriteNALU writes a complete HEVC NALU to w: start code + 2-byte header + EBSP.
