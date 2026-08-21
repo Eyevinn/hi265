@@ -191,7 +191,7 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 	// through edge filtering at color boundaries.
 	lumaMode := chooseBestLumaMode(reconFrame, ctuX, ctuY, ctuSize, width, y)
 
-	mpm := deriveMPM(ctuX, ctuY, ctuSize, width, lumaModesMap)
+	mpm := deriveMPM(ctuX, ctuY, ctuSize, width, ceilLog2(ctuSize), lumaModesMap)
 
 	// Encode intra luma mode
 	mpmIdx := -1
@@ -291,7 +291,13 @@ func encBool(enc *cabac.Encoder, ctx *cabac.CtxState, val bool) {
 }
 
 // deriveMPM computes the Most Probable Modes for the CU at (x0,y0).
-func deriveMPM(x0, y0, cuSize, picWidth int, modeMap map[[2]int]int) [3]int {
+//
+// log2CtbSize is the CTB size of the picture. Intra mode prediction does not
+// cross a horizontal CTB boundary: per spec 8.4.2 the above candidate is
+// INTRA_DC whenever y0-1 falls outside the current CTB. Omitting that rule
+// keeps encoder and decoder self-consistent but makes the bitstream decode
+// differently in every conforming decoder.
+func deriveMPM(x0, y0, cuSize, picWidth, log2CtbSize int, modeMap map[[2]int]int) [3]int {
 	cuX := x0 / cuSize
 	cuY := y0 / cuSize
 
@@ -303,7 +309,7 @@ func deriveMPM(x0, y0, cuSize, picWidth int, modeMap map[[2]int]int) [3]int {
 	}
 
 	aboveMode := -1
-	if y0 > 0 {
+	if y0 > 0 && y0-1 >= (y0>>log2CtbSize)<<log2CtbSize {
 		if m, ok := modeMap[[2]int{cuX, cuY - 1}]; ok {
 			aboveMode = m
 		}

@@ -407,6 +407,11 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 		// Derive MPM list from left and above neighbors (HEVC spec 8.4.2)
 		candA := modeMap.get(px-1, py) // left neighbor
 		candB := modeMap.get(px, py-1) // above neighbor
+		// Intra mode prediction does not cross a horizontal CTB boundary:
+		// candB is INTRA_DC when py-1 lies outside the current CTB.
+		if py-1 < (py>>p.Log2CtbSize)<<p.Log2CtbSize {
+			candB = -1
+		}
 		mpmList := deriveMPM(candA, candB)
 		if prevFlags[i] {
 			// mpm_idx: decoded as truncated unary, max 2
