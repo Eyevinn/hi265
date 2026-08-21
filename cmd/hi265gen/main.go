@@ -95,6 +95,7 @@ type options struct {
 	fg          string
 	bg          string
 	qp          int
+	use8x8      bool
 	idrInterval int
 	bpp         int
 	kbps        int
@@ -130,6 +131,8 @@ func parseOptions(fs *flag.FlagSet, args []string) (*options, error) {
 	fs.StringVar(&opts.fg, "fg", "255,255,255", "foreground RGB color for text (R,G,B)")
 	fs.StringVar(&opts.bg, "bg", "0,0,0", "background RGB color for text (R,G,B)")
 	fs.IntVar(&opts.qp, "qp", 26, "quantization parameter (0-51)")
+	fs.BoolVar(&opts.use8x8, "8x8", false,
+		"code each 16x16 CTU as four independent 8x8 CUs (finer coding granularity)")
 	fs.IntVar(&opts.idrInterval, "idr-interval", 0, "frames between IDR frames (0 = every frame is IDR)")
 	fs.IntVar(&opts.bpp, "bpp", 0, "target bytes per picture (pad with filler NALUs)")
 	fs.IntVar(&opts.kbps, "kbps", 0, "target bitrate in kbit/s (converted to bytes per picture using -fps)")
@@ -607,6 +610,7 @@ func generateH265(opts *options, frameW, frameH, mbWidth, mbHeight int,
 		Grid:       grid,
 		Colors:     colors,
 		QP:         opts.qp,
+		Use8x8CU:   opts.use8x8,
 		Width:      frameW,
 		Height:     frameH,
 		ColorSpace: cs,
@@ -658,6 +662,7 @@ func generateH265AllIDR(f io.Writer, opts *options, frameW, frameH, mbWidth, mbH
 			Grid:       grid,
 			Colors:     colors,
 			QP:         opts.qp,
+			Use8x8CU:   opts.use8x8,
 			Width:      frameW,
 			Height:     frameH,
 			ColorSpace: cs,
@@ -749,6 +754,7 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 		Grid:       grid,
 		Colors:     colors,
 		QP:         opts.qp,
+		Use8x8CU:   opts.use8x8,
 		Width:      frameW,
 		Height:     frameH,
 		ColorSpace: cs,
@@ -824,6 +830,7 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 				Grid:       g,
 				Colors:     c,
 				QP:         opts.qp,
+				Use8x8CU:   opts.use8x8,
 				Width:      frameW,
 				Height:     frameH,
 				ColorSpace: cs,

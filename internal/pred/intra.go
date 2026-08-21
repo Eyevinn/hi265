@@ -258,7 +258,10 @@ type Neighbors struct {
 // in-place. filterFlag depends on mode, block size, and component type.
 // strongSmooth enables strong intra smoothing for 32x32 luma (SPS flag).
 func FilterRefSamples(n *Neighbors, mode, size int, isLuma bool, strongSmooth bool) {
-	if n == nil || size <= 4 {
+	if n == nil {
+		return
+	}
+	if size <= 4 {
 		return
 	}
 

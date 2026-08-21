@@ -176,8 +176,16 @@ foundLast:
 	if lastX < 0 {
 		return
 	}
-	// Encode last_sig_coeff_x_prefix/suffix and y_prefix/suffix
-	encodeLastSigCoeff(enc, models, lastX, lastY, log2TrafoSize, isLuma)
+	// Encode last_sig_coeff_x_prefix/suffix and y_prefix/suffix.
+	// Spec 7.3.8.11: for the vertical scan the coded x and y are swapped (the
+	// decoder swaps them back after reading), so that one set of context models
+	// serves both scan directions. Without the swap encoder and decoder stay
+	// self-consistent but every conforming decoder disagrees.
+	encLastX, encLastY := lastX, lastY
+	if scanIdx == 2 {
+		encLastX, encLastY = lastY, lastX
+	}
+	encodeLastSigCoeff(enc, models, encLastX, encLastY, log2TrafoSize, isLuma)
 
 	// coded_sub_block_flag tracking
 	codedSbFlags := make([][]bool, numSbY)

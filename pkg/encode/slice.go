@@ -4,6 +4,7 @@ import (
 	"github.com/Eyevinn/hi265/internal/cabac"
 	"github.com/Eyevinn/hi265/internal/context"
 	"github.com/Eyevinn/hi265/internal/pred"
+	"github.com/Eyevinn/hi265/internal/slice"
 	"github.com/Eyevinn/hi265/internal/transform"
 	"github.com/Eyevinn/hi265/pkg/frame"
 	"github.com/Eyevinn/mp4ff/hevc"
@@ -15,6 +16,7 @@ type idrSliceParams struct {
 	width                           int
 	height                          int
 	qp                              int
+	use8x8CU                        bool
 	ppsID                           uint32
 	numExtraSliceHeaderBits         uint8
 	outputFlagPresent               bool
@@ -122,10 +124,12 @@ func writePOCAndRefPicSets(w *BitWriter, p pocRefPicSetParams) {
 
 func idrSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) idrSliceParams {
 	qp := 26 + int(pps.InitQpMinus26) // slice_qp_delta = 0
+	minCbSize := 1 << (int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3)
 	return idrSliceParams{
 		width:                           int(sps.PicWidthInLumaSamples),
 		height:                          int(sps.PicHeightInLumaSamples),
 		qp:                              qp,
+		use8x8CU:                        minCbSize == 8,
 		ppsID:                           pps.PicParameterSetID,
 		numExtraSliceHeaderBits:         pps.NumExtraSliceHeaderBits,
 		outputFlagPresent:               pps.OutputFlagPresentFlag,
@@ -198,8 +202,7 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 	headerBytes := w.Bytes()
 
 	// === Slice data (CABAC) ===
-	// IDR encoding only supports 16x16 CUs (CTU = minCb = 16)
-	cabacBytes := encodeIDRSliceData(p.width, p.height, p.qp, y, cb, cr)
+	cabacBytes := encodeIDRSliceData(p.width, p.height, p.qp, p.use8x8CU, y, cb, cr)
 
 	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
 	result = append(result, headerBytes...)
@@ -208,7 +211,7 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 }
 
 // encodeIDRSlice generates the IDR slice RBSP (header + CABAC data).
-func encodeIDRSlice(width, height, qp int, y, cb, cr []uint8) []byte {
+func encodeIDRSlice(width, height, qp int, use8x8CU bool, y, cb, cr []uint8) []byte {
 	w := NewBitWriter()
 
 	// === Slice header ===
@@ -231,7 +234,7 @@ func encodeIDRSlice(width, height, qp int, y, cb, cr []uint8) []byte {
 	headerBytes := w.Bytes()
 
 	// === Slice data (CABAC) ===
-	cabacBytes := encodeIDRSliceData(width, height, qp, y, cb, cr)
+	cabacBytes := encodeIDRSliceData(width, height, qp, use8x8CU, y, cb, cr)
 
 	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
 	result = append(result, headerBytes...)
@@ -240,8 +243,10 @@ func encodeIDRSlice(width, height, qp int, y, cb, cr []uint8) []byte {
 }
 
 // encodeIDRSliceData encodes the CABAC slice data for an IDR I-slice.
-// ctuSize must be 16 (the only supported CU size for IDR encoding).
-func encodeIDRSliceData(width, height, qp int, y, cb, cr []uint8) []byte {
+// The CTU size is always 16. With use8x8CU each CTU is split by the coding
+// quadtree into four independently predicted 8x8 CUs (SPS minCbSize = 8),
+// otherwise the CTU is one 16x16 CU (SPS minCbSize = 16).
+func encodeIDRSliceData(width, height, qp int, use8x8CU bool, y, cb, cr []uint8) []byte {
 	enc := cabac.NewEncoder()
 	models := context.InitModels(context.SliceTypeI, qp)
 
@@ -256,8 +261,31 @@ func encodeIDRSliceData(width, height, qp int, y, cb, cr []uint8) []byte {
 	ctuIdx := 0
 	for ctuY := 0; ctuY < height; ctuY += ctuSize {
 		for ctuX := 0; ctuX < width; ctuX += ctuSize {
-			encodeIDRCU(enc, models, ctuX, ctuY, ctuSize, width, height, qp,
-				y, cb, cr, reconFrame, lumaModesMap)
+			if use8x8CU {
+				// split_cu_flag = 1 at depth 0. Context per spec 9.3.4.2.2:
+				// ctxInc = condL + condA, where each condition holds when the
+				// neighbouring CU is deeper than the current depth. Every CTU is
+				// split here, so an existing neighbour is always at depth 1 > 0.
+				ctxInc := 0
+				if ctuX > 0 {
+					ctxInc++
+				}
+				if ctuY > 0 {
+					ctxInc++
+				}
+				enc.EncodeDecision(1, &models[context.CtxSplitCuFlag+ctxInc])
+
+				// Four 8x8 CUs in z-order. No split_cu_flag at depth 1: the
+				// children are already at minCbSize.
+				half := ctuSize / 2
+				for _, off := range [4][2]int{{0, 0}, {half, 0}, {0, half}, {half, half}} {
+					encodeIDRCU(enc, models, ctuX+off[0], ctuY+off[1], half, ctuSize,
+						width, height, qp, y, cb, cr, reconFrame, lumaModesMap)
+				}
+			} else {
+				encodeIDRCU(enc, models, ctuX, ctuY, ctuSize, ctuSize, width, height, qp,
+					y, cb, cr, reconFrame, lumaModesMap)
+			}
 
 			// end_of_slice_segment_flag
 			ctuIdx++
@@ -272,12 +300,15 @@ func encodeIDRSliceData(width, height, qp int, y, cb, cr []uint8) []byte {
 	return enc.Flush()
 }
 
-// encodeIDRCU encodes a single 16x16 intra CU.
+// encodeIDRCU encodes a single intra CU of size cuSize (8 or 16) at (cuX, cuY),
+// as one PART_2Nx2N partition with one luma and two chroma transform blocks.
+// ctuSize is the CTU size (16), used for reference sample availability and for
+// the CTB boundary rule in the MPM derivation.
 func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
-	ctuX, ctuY, ctuSize, width, height, qp int,
+	cuX, cuY, cuSize, ctuSize, width, height, qp int,
 	y, cb, cr []uint8, reconFrame *frame.Frame, lumaModesMap map[[2]int]int) {
 
-	// No split_cu_flag (CTU = minCbSize = 16, implicitly no split)
+	// split_cu_flag is written by the caller (the CU is at minCbSize here)
 	// No pred_mode_flag (I-slice, implicitly intra)
 
 	// part_mode: decoded when log2CbSize == log2MinCbSize
@@ -285,13 +316,13 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 	enc.EncodeDecision(1, &models[context.CtxPartMode])
 
 	// Choose the best intra prediction mode for this flat-color block.
-	// For flat 16x16 blocks, vertical (26) or horizontal (10) can produce
-	// zero residual when the block color matches the top or left neighbor,
-	// while DC (1) averages both neighbors and also introduces AC energy
-	// through edge filtering at color boundaries.
-	lumaMode := chooseBestLumaMode(reconFrame, ctuX, ctuY, ctuSize, width, y)
+	// For a flat block, vertical (26) or horizontal (10) can produce zero
+	// residual when the block color matches the top or left neighbor, while
+	// DC (1) averages both neighbors and also introduces AC energy through
+	// edge filtering at color boundaries.
+	lumaMode := chooseBestLumaMode(reconFrame, cuX, cuY, cuSize, width, y)
 
-	mpm := deriveMPM(ctuX, ctuY, ctuSize, width, ceilLog2(ctuSize), lumaModesMap)
+	mpm := deriveMPM(cuX, cuY, cuSize, width, ceilLog2(ctuSize), lumaModesMap)
 
 	// Encode intra luma mode
 	mpmIdx := -1
@@ -325,40 +356,46 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 			enc.EncodeBypass(uint8((rem >> k) & 1))
 		}
 	}
-	lumaModesMap[[2]int{ctuX / ctuSize, ctuY / ctuSize}] = lumaMode
+	lumaModesMap[[2]int{cuX / cuSize, cuY / cuSize}] = lumaMode
 
 	// intra_chroma_pred_mode = 4 (DM mode)
 	// First bin = 0 means "use DM mode"
 	enc.EncodeDecision(0, &models[context.CtxIntraChromaPredMode])
 
-	// Transform tree (no split, TU = CU = 16x16)
+	// Transform tree (no split, TU = CU: 16x16 luma with 8x8 chroma, or
+	// 8x8 luma with 4x4 chroma)
+	log2TrSize := ceilLog2(cuSize)
+	log2ChromaTrSize := log2TrSize - 1
+
 	// cbf_cb at depth 0
-	cbfCb := hasNonZeroChroma(ctuX, ctuY, ctuSize, width, cb, qp, lumaMode, reconFrame, 0)
+	cbfCb := hasNonZeroChroma(cuX, cuY, cuSize, width, cb, qp, lumaMode, reconFrame, 0)
 	encBool(enc, &models[context.CtxCbfCb], cbfCb)
 
 	// cbf_cr at depth 0
-	cbfCr := hasNonZeroChroma(ctuX, ctuY, ctuSize, width, cr, qp, lumaMode, reconFrame, 1)
+	cbfCr := hasNonZeroChroma(cuX, cuY, cuSize, width, cr, qp, lumaMode, reconFrame, 1)
 	encBool(enc, &models[context.CtxCbfCr], cbfCr)
 
 	// Compute luma residual
 	lumaResidual, lumaLevels, cbfLuma := computeLumaResidual(
-		ctuX, ctuY, ctuSize, width, y, qp, lumaMode, reconFrame)
+		cuX, cuY, cuSize, width, y, qp, lumaMode, reconFrame)
 
 	// cbf_luma at depth 0 (context = !trafoDepth = 1, so ctxIdx = CtxCbfLuma + 1)
 	encBool(enc, &models[context.CtxCbfLuma+1], cbfLuma)
 
 	// Encode residual if any cbf is set
 	if cbfLuma {
-		encodeResidualCoding(enc, models, lumaLevels, 4, true, 0)
+		scanIdx := slice.ScanIdxForIntraMode(lumaMode, log2TrSize, true)
+		encodeResidualCoding(enc, models, lumaLevels, log2TrSize, true, scanIdx)
 	}
 
 	// Reconstruct luma
-	reconstructLuma(reconFrame, ctuX, ctuY, ctuSize, width, height,
+	reconstructLuma(reconFrame, cuX, cuY, cuSize, width, height,
 		lumaMode, lumaResidual, cbfLuma, lumaLevels, qp)
 
 	// Encode and reconstruct chroma
-	chromaTrSize := ctuSize / 2
+	chromaTrSize := cuSize / 2
 	chromaMode := lumaMode // DM mode
+	chromaScanIdx := slice.ScanIdxForIntraMode(chromaMode, log2ChromaTrSize, false)
 
 	for comp := range 2 {
 		var chromaSrc []uint8
@@ -370,13 +407,14 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 		hasCbf := (comp == 0 && cbfCb) || (comp == 1 && cbfCr)
 
 		if hasCbf {
-			chromaLevels := computeChromaLevels(ctuX, ctuY, ctuSize, width,
+			chromaLevels := computeChromaLevels(cuX, cuY, cuSize, width,
 				chromaSrc, qp, chromaMode, reconFrame, comp)
-			encodeResidualCoding(enc, models, chromaLevels, 3, false, 0) // log2(8)=3
-			reconstructChroma(reconFrame, comp, ctuX/2, ctuY/2, chromaTrSize,
+			encodeResidualCoding(enc, models, chromaLevels, log2ChromaTrSize, false,
+				chromaScanIdx)
+			reconstructChroma(reconFrame, comp, cuX/2, cuY/2, chromaTrSize,
 				width/2, height/2, chromaMode, chromaLevels, qp)
 		} else {
-			reconstructChroma(reconFrame, comp, ctuX/2, ctuY/2, chromaTrSize,
+			reconstructChroma(reconFrame, comp, cuX/2, cuY/2, chromaTrSize,
 				width/2, height/2, chromaMode, nil, qp)
 		}
 	}
@@ -805,16 +843,25 @@ type pSkipSliceParams struct {
 }
 
 // encodePSkipSlice generates a P-skip slice RBSP (header + CABAC data).
-// Uses the default encoder parameters: CTU=16, minCb=16.
-func encodePSkipSlice(width, height, qp, poc int) []byte {
+// Uses the default encoder parameters: CTU=16, minCb=16, or minCb=8 with
+// use8x8CU to match the SPS written for 8x8 coding granularity. The picture is
+// one 16x16 skip CU per CTU either way; with minCb=8 that needs an explicit
+// split_cu_flag = 0 at depth 0.
+func encodePSkipSlice(width, height, qp, poc int, use8x8CU bool) []byte {
+	log2MinCbMinus3 := 1 // minCb=16
+	log2Diff := 0        // CTU=16
+	if use8x8CU {
+		log2MinCbMinus3 = 0 // minCb=8
+		log2Diff = 1        // CTU=16
+	}
 	return encodePSkipSliceWithParams(pSkipSliceParams{
 		width:                             width,
 		height:                            height,
 		qp:                                qp,
 		poc:                               poc,
 		log2MaxPicOrderCntLsb:             4,
-		log2MinCodingBlockSizeMinus3:      1, // minCb=16
-		log2DiffMaxMinLumaCodingBlockSize: 0, // CTU=16
+		log2MinCodingBlockSizeMinus3:      log2MinCbMinus3,
+		log2DiffMaxMinLumaCodingBlockSize: log2Diff,
 	})
 }
 
