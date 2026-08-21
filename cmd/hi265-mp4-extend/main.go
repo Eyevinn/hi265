@@ -31,7 +31,10 @@ duration.
 By default the appended frames are P-skip copies of the source's last
 reference picture (a freeze). With -gray-idr the first appended frame is a
 mid-gray IDR and the rest are P-skip copies of it; note that an IDR resets POC
-to 0 for everything after it.
+to 0 for everything after it. With -gray-cra the refresh picture is a CRA
+instead, which carries slice_pic_order_cnt_lsb and so continues the source's
+POC — the right choice for splicing a refresh point into a running stream, and
+something H.264 cannot express at all.
 
 The appended slice headers reuse the source's SPS and PPS verbatim, so the
 output decodes with no parameter-set change — which a normal encoder run
@@ -41,7 +44,7 @@ the init segment:
     cat init.mp4 out.m4s | ffplay -i -
 
 Usage:
-  %s -frames N [-gray-idr] [-timecode] <init.mp4> <in.m4s> <out.m4s>
+  %s -frames N [-gray-idr|-gray-cra] [-timecode] <init.mp4> <in.m4s> <out.m4s>
 
 Flags:
 `
@@ -56,6 +59,7 @@ func main() {
 type options struct {
 	frames   int
 	grayIDR  bool
+	grayCRA  bool
 	timeCode bool
 	version  bool
 }
@@ -65,7 +69,9 @@ func run(args []string) error {
 	fs := flag.NewFlagSet(appName, flag.ContinueOnError)
 	fs.IntVar(&opts.frames, "frames", 0, "number of frames to append (required)")
 	fs.BoolVar(&opts.grayIDR, "gray-idr", false,
-		"start the appended span with a mid-gray IDR (default: all P-skip)")
+		"start the appended span with a mid-gray IDR (resets POC to 0)")
+	fs.BoolVar(&opts.grayCRA, "gray-cra", false,
+		"start the appended span with a mid-gray CRA, continuing the source POC")
 	fs.BoolVar(&opts.timeCode, "timecode", false,
 		"attach a Time Code SEI (payload type 136) to each appended frame")
 	fs.BoolVar(&opts.version, "version", false, "print version")
@@ -89,6 +95,9 @@ func run(args []string) error {
 	}
 	if opts.frames <= 0 {
 		return errors.New("-frames must be a positive integer")
+	}
+	if opts.grayIDR && opts.grayCRA {
+		return errors.New("-gray-idr and -gray-cra are mutually exclusive")
 	}
 	return extendSegment(fs.Arg(0), fs.Arg(1), fs.Arg(2), &opts)
 }
@@ -148,20 +157,31 @@ func extendSegment(initPath, inSegPath, outSegPath string, opts *options) error 
 	poc := state.POC
 	remaining := opts.frames
 
-	if opts.grayIDR {
+	if opts.grayIDR || opts.grayCRA {
 		// The gray encoder is chroma-format and bit-depth agnostic, so this
 		// works for 4:2:0/4:2:2/4:4:4 at 8/10/12 bits.
-		idr, err := encode.EncodeGrayIDRSliceFromSPSPPS(state.SPS, state.PPS)
-		if err != nil {
-			return fmt.Errorf("encode gray IDR: %w", err)
+		var refresh []byte
+		if opts.grayCRA {
+			// A CRA carries slice_pic_order_cnt_lsb, so it continues the
+			// source's POC instead of resetting it.
+			refresh, err = encode.EncodeGrayCRASliceFromSPSPPS(state.SPS, state.PPS, poc+1)
+		} else {
+			refresh, err = encode.EncodeGrayIDRSliceFromSPSPPS(state.SPS, state.PPS)
 		}
-		if idr, err = maybePrependTimeCode(opts, idr, nextDecodeTime, sampleDur, timescale); err != nil {
-			return fmt.Errorf("gray IDR timecode: %w", err)
+		if err != nil {
+			return fmt.Errorf("encode gray refresh picture: %w", err)
+		}
+		if refresh, err = maybePrependTimeCode(opts, refresh, nextDecodeTime, sampleDur, timescale); err != nil {
+			return fmt.Errorf("gray refresh timecode: %w", err)
 		}
 		newSamples = append(newSamples,
-			fullSample(idr, mp4.SyncSampleFlags, sampleDur, nextDecodeTime))
+			fullSample(refresh, mp4.SyncSampleFlags, sampleDur, nextDecodeTime))
 		nextDecodeTime += uint64(sampleDur)
-		poc = 0 // an IDR resets POC
+		if opts.grayCRA {
+			poc++ // the CRA occupies the next POC; trailing pictures continue from it
+		} else {
+			poc = 0 // an IDR resets POC
+		}
 		remaining--
 	}
 
@@ -184,8 +204,11 @@ func extendSegment(initPath, inSegPath, outSegPath string, opts *options) error 
 	}
 
 	mode := "P-skip"
-	if opts.grayIDR {
+	switch {
+	case opts.grayIDR:
 		mode = "gray IDR + P-skip"
+	case opts.grayCRA:
+		mode = "gray CRA + P-skip"
 	}
 	fmt.Printf("appended %d sample(s) (%s, dur=%d each) to %d input sample(s) -> %s\n",
 		len(newSamples), mode, sampleDur, len(inputSamples), outSegPath)

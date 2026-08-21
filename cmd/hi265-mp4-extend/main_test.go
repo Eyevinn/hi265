@@ -9,9 +9,11 @@ import (
 	"testing"
 
 	"github.com/Eyevinn/mp4ff/avc"
+	"github.com/Eyevinn/mp4ff/hevc"
 	"github.com/Eyevinn/mp4ff/mp4"
 
 	"github.com/Eyevinn/hi265/pkg/decoder"
+	"github.com/Eyevinn/hi265/pkg/encode"
 	"github.com/Eyevinn/hi265/pkg/frame"
 )
 
@@ -21,8 +23,12 @@ func makeInitAndSegment(t *testing.T, dir string, frames int) (initPath, segPath
 	t.Helper()
 
 	src := filepath.Join(dir, "src.mp4")
+	// -idr-interval makes the source one IDR followed by P-skip frames, which is
+	// what a real media segment looks like; without it every frame is an IDR and
+	// the last picture's POC is always 0.
 	cmd := exec.Command("go", "run", "../hi265gen",
-		"-smpte", "-w", "192", "-h", "96", "-n", strconv.Itoa(frames), "-o", src)
+		"-smpte", "-w", "192", "-h", "96", "-n", strconv.Itoa(frames),
+		"-idr-interval", strconv.Itoa(frames), "-o", src)
 	cmd.Dir = mustWD(t)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("could not generate source mp4 (%v): %s", err, out)
@@ -235,5 +241,95 @@ func TestRunArgValidation(t *testing.T) {
 	}
 	if err := run([]string{appName, "-frames", "2", "only-one-arg"}); err == nil {
 		t.Error("expected an error for too few positional arguments")
+	}
+}
+
+// TestExtendSegmentGrayCRA checks the CRA refresh path: the appended pictures
+// are gray, the CRA is a sync sample, and — the reason CRA exists here — the
+// POCs run continuously across the splice instead of resetting to 0 the way an
+// IDR forces.
+func TestExtendSegmentGrayCRA(t *testing.T) {
+	dir := t.TempDir()
+	const srcFrames = 3
+	const appended = 3
+
+	initPath, segPath := makeInitAndSegment(t, dir, srcFrames)
+	outPath := filepath.Join(dir, "out.m4s")
+
+	if err := extendSegment(initPath, segPath, outPath,
+		&options{frames: appended, grayCRA: true}); err != nil {
+		t.Fatalf("extendSegment: %v", err)
+	}
+
+	frames := decodeSegment(t, initPath, outPath)
+	if len(frames) != srcFrames+appended {
+		t.Fatalf("decoded %d frames, want %d", len(frames), srcFrames+appended)
+	}
+	for i := srcFrames; i < len(frames); i++ {
+		f := frames[i]
+		for y := 0; y < f.Height; y++ {
+			for x := 0; x < f.Width; x++ {
+				if got := f.Y[y*f.StrideY+x]; got != 128 {
+					t.Fatalf("frame %d luma at (%d,%d) = %d, want 128", i, x, y, got)
+				}
+			}
+		}
+	}
+
+	// Walk the output's slice headers and assert POC continuity across the CRA.
+	initData, err := os.ReadFile(initPath)
+	if err != nil {
+		t.Fatalf("read init: %v", err)
+	}
+	initParsed, err := mp4.DecodeFile(bytes.NewReader(initData))
+	if err != nil {
+		t.Fatalf("parse init: %v", err)
+	}
+	paramSets, err := hvcCParamSets(initParsed.Init)
+	if err != nil {
+		t.Fatalf("param sets: %v", err)
+	}
+	outData, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	outParsed, err := mp4.DecodeFile(bytes.NewReader(outData))
+	if err != nil {
+		t.Fatalf("parse output: %v", err)
+	}
+	samples, err := allSamples(outParsed)
+	if err != nil {
+		t.Fatalf("samples: %v", err)
+	}
+	if samples[srcFrames].Flags != mp4.SyncSampleFlags {
+		t.Errorf("appended CRA flags = %#x, want SyncSampleFlags %#x",
+			samples[srcFrames].Flags, mp4.SyncSampleFlags)
+	}
+
+	var annexB bytes.Buffer
+	annexB.Write(annexBParameterSets(paramSets))
+	for _, s := range samples {
+		annexB.Write(avc.ConvertSampleToByteStream(append([]byte(nil), s.Data...)))
+	}
+	craSeen := false
+	for _, nalu := range avc.ExtractNalusFromByteStream(annexB.Bytes()) {
+		if len(nalu) < 2 {
+			continue
+		}
+		if hevc.GetNaluType(nalu[0]) == hevc.NALU_CRA {
+			craSeen = true
+		}
+	}
+	if !craSeen {
+		t.Error("no CRA NAL unit (type 21) in the output")
+	}
+
+	// The final picture's POC must be srcFrames+appended-1: nothing reset it.
+	state, err := encode.LastFrameState(annexB.Bytes())
+	if err != nil {
+		t.Fatalf("LastFrameState: %v", err)
+	}
+	if want := srcFrames + appended - 1; state.POC != want {
+		t.Errorf("last POC = %d, want %d (a CRA must not reset POC)", state.POC, want)
 	}
 }
