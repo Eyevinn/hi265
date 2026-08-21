@@ -30,6 +30,7 @@ import (
 	"github.com/Eyevinn/hi264/pkg/yuv"
 	"github.com/Eyevinn/hi265/internal"
 	"github.com/Eyevinn/hi265/pkg/encode"
+	"github.com/Eyevinn/hi265/pkg/timecode"
 	"github.com/Eyevinn/mp4ff/avc"
 	"github.com/Eyevinn/mp4ff/mp4"
 )
@@ -55,6 +56,12 @@ Output format is detected from the file extension, or set explicitly with -f:
   %%          Numbered images (e.g. frame_%%03d.png or frame_%%03d.jpg)
 
 Use -o - to write to stdout (requires -f to set the format).
+
+Time Code SEI (-timecode) embeds the same HH:MM:SS:FF timecode as SEI NAL units
+(payload type 136, in a PREFIX_SEI NALU per picture) for 265/mp4 output; read it
+back with ffprobe's per-frame timecode tag. -start-frame N offsets the timecode,
+the text counters, and (mp4) the media timeline and fragment sequence numbers so
+independently generated segments concatenate continuously.
 
 Options:
 `
@@ -92,6 +99,8 @@ type options struct {
 	fragDur     int
 	colorspace  string
 	fullRange   bool
+	timecode    bool
+	startFrame  int
 	output      string
 }
 
@@ -121,6 +130,12 @@ func parseOptions(fs *flag.FlagSet, args []string) (*options, error) {
 	fs.IntVar(&opts.fragDur, "frag-dur", 25, "fragment duration in frames for MP4 output")
 	fs.StringVar(&opts.colorspace, "colorspace", "bt601", "color space (bt601, bt709, bt2020)")
 	fs.BoolVar(&opts.fullRange, "full-range", false, "use full-range YCbCr (0-255)")
+	fs.BoolVar(&opts.timecode, "timecode", false,
+		"emit a Time Code SEI (payload type 136, timecode HH:MM:SS:FF derived from -fps) "+
+			"per picture (265/mp4 only)")
+	fs.IntVar(&opts.startFrame, "start-frame", 0,
+		"starting frame number: offsets frame counters, timecodes, the Time Code SEI, "+
+			"and (mp4) the media timeline, so segments concatenate continuously")
 	fs.StringVar(&opts.output, "o", "", "output file (required)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, usg, appName, appName, appName, appName, appName)
@@ -318,6 +333,9 @@ func run(args []string) error {
 	if opts.fps <= 0 {
 		return fmt.Errorf("fps must be positive, got %d", opts.fps)
 	}
+	if opts.startFrame < 0 {
+		return fmt.Errorf("start-frame must be non-negative, got %d", opts.startFrame)
+	}
 	if opts.kbps > 0 {
 		opts.bpp = opts.kbps * 1000 / 8 / opts.fps
 	}
@@ -355,7 +373,9 @@ func run(args []string) error {
 
 	textScale := opts.textScale
 	if textScale == 0 && opts.text != "" {
-		sampleText := yuv.FormatText(opts.text, 0, opts.fps)
+		// Scale for the widest overlay in the sequence (the last frame number
+		// has the most digits), so -start-frame and large counters still fit.
+		sampleText := yuv.FormatText(opts.text, opts.startFrame+opts.numFrames-1, opts.fps)
 		textScale = yuv.AutoTextScale(sampleText, mbWidth, mbHeight)
 	}
 
@@ -372,6 +392,16 @@ func run(args []string) error {
 	outFmt, err := resolveFormat(opts.output, opts.format)
 	if err != nil {
 		return err
+	}
+
+	// The Time Code SEI is a bitstream feature: it only exists for the coded
+	// output formats.
+	if opts.timecode {
+		switch outFmt {
+		case "265", "hevc", "mp4":
+		default:
+			return fmt.Errorf("-timecode requires 265/hevc or mp4 output, got %q", outFmt)
+		}
 	}
 
 	// Validate stdout restrictions
@@ -459,6 +489,28 @@ func buildFrameGrid(i int, patGrid *yuv.Grid, patColors yuv.ColorMap,
 	return grid, colors, nil
 }
 
+// withTimeCode prepends a Time Code SEI NALU (payload type 136 in a PREFIX_SEI
+// NALU, timecode for frameIdx at opts.fps) to an Annex-B slice when -timecode is
+// set. The SEI precedes the VCL slice in the access unit and composes with both
+// IDR and P_Skip slices. When -timecode is off it returns slice unchanged.
+func withTimeCode(opts *options, frameIdx int, slice []byte) ([]byte, error) {
+	if !opts.timecode {
+		return slice, nil
+	}
+	h, m, s, fr, dropped := timecode.Components(int64(opts.startFrame+frameIdx), opts.fps, false)
+	seiNALU, err := encode.GenerateTimeCodeSEI(encode.TimeCode{
+		Hours: uint8(h), Minutes: uint8(m), Seconds: uint8(s), Frames: uint16(fr),
+		Dropped: dropped,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("frame %d: time code SEI: %w", frameIdx, err)
+	}
+	out := make([]byte, 0, len(seiNALU)+len(slice))
+	out = append(out, seiNALU...)
+	out = append(out, slice...)
+	return out, nil
+}
+
 func padSlice(slice []byte, bpp int, frameIdx int) ([]byte, error) {
 	if bpp <= 0 {
 		return slice, nil
@@ -480,7 +532,7 @@ func generateH265(opts *options, frameW, frameH, mbWidth, mbHeight int,
 	}
 	defer f.Close()
 
-	grid, colors, err := buildFrameGrid(0, patGrid, patColors,
+	grid, colors, err := buildFrameGrid(opts.startFrame, patGrid, patColors,
 		mbWidth, mbHeight, textScale, opts.fps, opts.text, bg, fg, textBg, tiled)
 	if err != nil {
 		return err
@@ -532,7 +584,7 @@ func generateH265AllIDR(f io.Writer, opts *options, frameW, frameH, mbWidth, mbH
 	textScale int, textBg *yuv.Color, cs yuv.ColorSpace, rng yuv.Range) error {
 
 	for i := range opts.numFrames {
-		grid, colors, err := buildFrameGrid(i, patGrid, patColors,
+		grid, colors, err := buildFrameGrid(opts.startFrame+i, patGrid, patColors,
 			mbWidth, mbHeight, textScale, opts.fps, opts.text, bg, fg, textBg, tiled)
 		if err != nil {
 			return err
@@ -549,6 +601,9 @@ func generateH265AllIDR(f io.Writer, opts *options, frameW, frameH, mbWidth, mbH
 		slice, err := enc.EncodeIDRSlice()
 		if err != nil {
 			return fmt.Errorf("frame %d: %w", i, err)
+		}
+		if slice, err = withTimeCode(opts, i, slice); err != nil {
+			return err
 		}
 		if slice, err = padSlice(slice, opts.bpp, i); err != nil {
 			return err
@@ -568,7 +623,7 @@ func generateH265WithPSkip(f io.Writer, opts *options, mbWidth, mbHeight int,
 
 	for i := range opts.numFrames {
 		if i%opts.idrInterval == 0 {
-			grid, colors, err := buildFrameGrid(i, patGrid, patColors,
+			grid, colors, err := buildFrameGrid(opts.startFrame+i, patGrid, patColors,
 				mbWidth, mbHeight, textScale, opts.fps, opts.text, bg, fg, textBg, tiled)
 			if err != nil {
 				return err
@@ -578,6 +633,9 @@ func generateH265WithPSkip(f io.Writer, opts *options, mbWidth, mbHeight int,
 			slice, err := enc.EncodeIDRSlice()
 			if err != nil {
 				return fmt.Errorf("frame %d (IDR): %w", i, err)
+			}
+			if slice, err = withTimeCode(opts, i, slice); err != nil {
+				return err
 			}
 			if slice, err = padSlice(slice, opts.bpp, i); err != nil {
 				return err
@@ -590,6 +648,9 @@ func generateH265WithPSkip(f io.Writer, opts *options, mbWidth, mbHeight int,
 			slice, err := enc.EncodePSkipSlice(poc)
 			if err != nil {
 				return fmt.Errorf("frame %d (P_Skip): %w", i, err)
+			}
+			if slice, err = withTimeCode(opts, i, slice); err != nil {
+				return err
 			}
 			if slice, err = padSlice(slice, opts.bpp, i); err != nil {
 				return err
@@ -613,7 +674,7 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 	}
 	defer f.Close()
 
-	grid, colors, err := buildFrameGrid(0, patGrid, patColors,
+	grid, colors, err := buildFrameGrid(opts.startFrame, patGrid, patColors,
 		mbWidth, mbHeight, textScale, opts.fps, opts.text, bg, fg, textBg, tiled)
 	if err != nil {
 		return err
@@ -651,7 +712,7 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 		poc := 1
 		for i := range opts.numFrames {
 			if i%opts.idrInterval == 0 {
-				g, c, err := buildFrameGrid(i, patGrid, patColors,
+				g, c, err := buildFrameGrid(opts.startFrame+i, patGrid, patColors,
 					mbWidth, mbHeight, textScale, opts.fps, opts.text, bg, fg, textBg, tiled)
 				if err != nil {
 					return err
@@ -661,6 +722,9 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 				slice, err := enc.EncodeIDRSlice()
 				if err != nil {
 					return fmt.Errorf("frame %d (IDR): %w", i, err)
+				}
+				if slice, err = withTimeCode(opts, i, slice); err != nil {
+					return err
 				}
 				if slice, err = padSlice(slice, opts.bpp, i); err != nil {
 					return err
@@ -672,6 +736,9 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 				if err != nil {
 					return fmt.Errorf("frame %d (P_Skip): %w", i, err)
 				}
+				if slice, err = withTimeCode(opts, i, slice); err != nil {
+					return err
+				}
 				if slice, err = padSlice(slice, opts.bpp, i); err != nil {
 					return err
 				}
@@ -681,7 +748,7 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 		}
 	} else {
 		for i := range opts.numFrames {
-			g, c, err := buildFrameGrid(i, patGrid, patColors,
+			g, c, err := buildFrameGrid(opts.startFrame+i, patGrid, patColors,
 				mbWidth, mbHeight, textScale, opts.fps, opts.text, bg, fg, textBg, tiled)
 			if err != nil {
 				return err
@@ -699,6 +766,9 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 			if err != nil {
 				return fmt.Errorf("frame %d: %w", i, err)
 			}
+			if slice, err = withTimeCode(opts, i, slice); err != nil {
+				return err
+			}
 			if slice, err = padSlice(slice, opts.bpp, i); err != nil {
 				return err
 			}
@@ -706,8 +776,10 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 		}
 	}
 
-	// Write samples as fragmented MP4
-	seqNum := uint32(1)
+	// Write samples as fragmented MP4. start-frame offsets the media timeline
+	// (sample decode times) and the fragment sequence numbers so independently
+	// generated segments concatenate continuously.
+	seqNum := uint32(opts.startFrame/opts.fragDur) + 1
 	for fragStart := 0; fragStart < len(samples); fragStart += opts.fragDur {
 		fragEnd := min(fragStart+opts.fragDur, len(samples))
 
@@ -729,7 +801,7 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 					Size:                  uint32(len(sampleData)),
 					CompositionTimeOffset: 0,
 				},
-				DecodeTime: uint64(i),
+				DecodeTime: uint64(opts.startFrame + i),
 				Data:       sampleData,
 			})
 		}
@@ -770,7 +842,7 @@ func generateY4M(opts *options, frameW, frameH, mbWidth, mbHeight int,
 	}
 
 	for i := range opts.numFrames {
-		grid, colors, err := buildFrameGrid(i, patGrid, patColors,
+		grid, colors, err := buildFrameGrid(opts.startFrame+i, patGrid, patColors,
 			mbWidth, mbHeight, textScale, opts.fps, opts.text, bg, fg, textBg, tiled)
 		if err != nil {
 			return err
@@ -803,7 +875,7 @@ func generateYUV(opts *options, frameW, frameH, mbWidth, mbHeight int,
 	defer f.Close()
 
 	for i := range opts.numFrames {
-		grid, colors, err := buildFrameGrid(i, patGrid, patColors,
+		grid, colors, err := buildFrameGrid(opts.startFrame+i, patGrid, patColors,
 			mbWidth, mbHeight, textScale, opts.fps, opts.text, bg, fg, textBg, tiled)
 		if err != nil {
 			return err
@@ -831,7 +903,7 @@ func generateFormattedImages(opts *options, frameW, frameH, mbWidth, mbHeight in
 	isJPEG := ext == ".jpg" || ext == ".jpeg"
 
 	for i := range opts.numFrames {
-		grid, colors, err := buildFrameGrid(i, patGrid, patColors,
+		grid, colors, err := buildFrameGrid(opts.startFrame+i, patGrid, patColors,
 			mbWidth, mbHeight, textScale, opts.fps, opts.text, bg, fg, textBg, tiled)
 		if err != nil {
 			return err
@@ -871,7 +943,7 @@ func generateNumberedImages(opts *options, frameW, frameH, mbWidth, mbHeight int
 	isJPEG := ext == ".jpg" || ext == ".jpeg"
 
 	for i := range opts.numFrames {
-		grid, colors, err := buildFrameGrid(i, patGrid, patColors,
+		grid, colors, err := buildFrameGrid(opts.startFrame+i, patGrid, patColors,
 			mbWidth, mbHeight, textScale, opts.fps, opts.text, bg, fg, textBg, tiled)
 		if err != nil {
 			return err
