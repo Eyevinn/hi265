@@ -13,6 +13,7 @@ type EncodeParams struct {
 	Width      int            // must be multiple of 16
 	Height     int            // must be multiple of 16
 	QP         int            // 0-51, default 26
+	Use8x8CU   bool           // code each 16x16 CTU as four 8x8 CUs
 	ColorSpace yuv.ColorSpace // default BT601
 	Range      yuv.Range      // default LimitedRange
 }
@@ -28,7 +29,7 @@ func (p EncodeParams) qp() int {
 func GenerateVPSSPSPPS(p EncodeParams) ([]byte, error) {
 	var buf bytes.Buffer
 	WriteNALU(&buf, naluVPS, generateVPS())
-	WriteNALU(&buf, naluSPS, generateSPS(p.Width, p.Height, p.ColorSpace, p.Range))
+	WriteNALU(&buf, naluSPS, generateSPS(p.Width, p.Height, p.ColorSpace, p.Range, p.Use8x8CU))
 	WriteNALU(&buf, naluPPS, generatePPS(p.qp()))
 	return buf.Bytes(), nil
 }
@@ -44,7 +45,7 @@ func GenerateIDR(p EncodeParams, grid *yuv.Grid, colors yuv.ColorMap) ([]byte, e
 	f.Height = p.Height
 
 	var buf bytes.Buffer
-	WriteNALU(&buf, naluIDRWRadl, encodeIDRSlice(p.Width, p.Height, p.qp(), f.Y, f.Cb, f.Cr))
+	WriteNALU(&buf, naluIDRWRadl, encodeIDRSlice(p.Width, p.Height, p.qp(), p.Use8x8CU, f.Y, f.Cb, f.Cr))
 	return buf.Bytes(), nil
 }
 
@@ -52,7 +53,7 @@ func GenerateIDR(p EncodeParams, grid *yuv.Grid, colors yuv.ColorMap) ([]byte, e
 // All CUs copy from the reference frame with zero motion.
 func GeneratePSkip(p EncodeParams, poc int) ([]byte, error) {
 	var buf bytes.Buffer
-	WriteNALU(&buf, naluTrailR, encodePSkipSlice(p.Width, p.Height, p.qp(), poc))
+	WriteNALU(&buf, naluTrailR, encodePSkipSlice(p.Width, p.Height, p.qp(), poc, p.Use8x8CU))
 	return buf.Bytes(), nil
 }
 
@@ -109,12 +110,17 @@ func validateSPSPPSForIDR(sps *hevc.SPS, pps *hevc.PPS) error {
 	if err := validateSPSPPS(sps, pps); err != nil {
 		return err
 	}
-	// IDR encoding only supports 16x16 CUs (log2MinCb=4, log2Diff=0 → CTU=16)
+	// IDR encoding only supports CTU size 16, with 16x16 CUs (minCb=16) or
+	// four 8x8 CUs per CTU (minCb=8)
 	log2MinCbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3
 	ctuLog2 := log2MinCbSize + int(sps.Log2DiffMaxMinLumaCodingBlockSize)
 	ctuSize := 1 << ctuLog2
 	if ctuSize != 16 {
 		return fmt.Errorf("IDR encoding only supports CTU size 16, got %d", ctuSize)
+	}
+	minCbSize := 1 << log2MinCbSize
+	if minCbSize != 8 && minCbSize != 16 {
+		return fmt.Errorf("IDR encoding only supports min CB size 8 or 16, got %d", minCbSize)
 	}
 	return nil
 }
@@ -149,6 +155,7 @@ type FrameEncoder struct {
 	Grid       *yuv.Grid
 	Colors     yuv.ColorMap
 	QP         int
+	Use8x8CU   bool           // code each 16x16 CTU as four 8x8 CUs
 	Width      int            // pixel width (0 = Grid.Width*16)
 	Height     int            // pixel height (0 = Grid.Height*16)
 	ColorSpace yuv.ColorSpace // default BT601
@@ -172,7 +179,7 @@ func (e *FrameEncoder) Encode() ([]byte, error) {
 // EncodeVPSSPSPPS writes the VPS, SPS, and PPS NALUs to buf.
 func (e *FrameEncoder) EncodeVPSSPSPPS(buf *bytes.Buffer) {
 	WriteNALU(buf, naluVPS, generateVPS())
-	WriteNALU(buf, naluSPS, generateSPS(e.frameWidth(), e.frameHeight(), e.ColorSpace, e.Range))
+	WriteNALU(buf, naluSPS, generateSPS(e.frameWidth(), e.frameHeight(), e.ColorSpace, e.Range, e.Use8x8CU))
 	WriteNALU(buf, naluPPS, generatePPS(e.qp()))
 }
 
@@ -203,7 +210,8 @@ func (e *FrameEncoder) VPSNALUs() [][]byte {
 
 // SPSNALUs returns the raw SPS NALU (with 2-byte header, no start code) for MP4.
 func (e *FrameEncoder) SPSNALUs() [][]byte {
-	return [][]byte{buildNALU(naluSPS, generateSPS(e.frameWidth(), e.frameHeight(), e.ColorSpace, e.Range))}
+	return [][]byte{buildNALU(naluSPS,
+		generateSPS(e.frameWidth(), e.frameHeight(), e.ColorSpace, e.Range, e.Use8x8CU))}
 }
 
 // PPSNALUs returns the raw PPS NALU (with 2-byte header, no start code) for MP4.
@@ -216,6 +224,7 @@ func (e *FrameEncoder) encodeParams() EncodeParams {
 		Width:      e.frameWidth(),
 		Height:     e.frameHeight(),
 		QP:         e.qp(),
+		Use8x8CU:   e.Use8x8CU,
 		ColorSpace: e.ColorSpace,
 		Range:      e.Range,
 	}
