@@ -568,14 +568,9 @@ func TestGeneratorConformance(t *testing.T) {
 // deblockCase is one QP of the two-flat-halves deblocking probe.
 type deblockCase struct {
 	qp int
-	// Recorded FFmpeg-vs-hi265 mismatch with deblocking enabled. Without
-	// deblocking this content decodes bit-exactly at every QP, which is what
-	// makes it a clean isolation of the loop filter.
-	maxSamples int
-	maxDelta   int
 }
 
-// TestDeblockExactnessKnownDefect pins the deblocking filter defect.
+// TestDeblockExactness pins the deblocking filter defect.
 //
 // The content is two flat halves separated by one hard vertical edge at
 // x=64. Without deblocking hi265dec matches FFmpeg exactly at every QP, so any
@@ -585,7 +580,7 @@ type deblockCase struct {
 // clips delta to [-tC, tC] *before* testing abs(delta) < 10*tC, so the
 // spec 8.7.2.5.7 gate can never fire and hi265dec filters edges the spec
 // leaves untouched. FFmpeg leaves this edge alone; hi265dec smooths it.
-func TestDeblockExactnessKnownDefect(t *testing.T) {
+func TestDeblockExactness(t *testing.T) {
 	ffmpeg := ffmpegBin(t)
 	x265 := x265Bin(t)
 
@@ -593,11 +588,7 @@ func TestDeblockExactnessKnownDefect(t *testing.T) {
 	src := twoHalvesYUV(w, h, 1)
 
 	cases := []deblockCase{
-		{qp: 22, maxSamples: 128, maxDelta: 1},
-		{qp: 26, maxSamples: 128, maxDelta: 1},
-		{qp: 30, maxSamples: 256, maxDelta: 2},
-		{qp: 34, maxSamples: 256, maxDelta: 3},
-		{qp: 40, maxSamples: 256, maxDelta: 5},
+		{qp: 22}, {qp: 26}, {qp: 30}, {qp: 34}, {qp: 40},
 	}
 
 	for _, c := range cases {
@@ -615,28 +606,16 @@ func TestDeblockExactnessKnownDefect(t *testing.T) {
 
 			ffDb := decodeWithFFmpeg(t, ffmpeg, deblock)
 			hiDb := decodeWithHi265(t, deblock, w, h, 1)
-			rep := compareYUV(t, hiDb, ffDb, w, h, 1)
-			if rep.exact() {
-				t.Logf("KNOWN DEFECT now passes exactly at QP %d — tighten the "+
-					"recorded budget", c.qp)
-				return
-			}
-			t.Logf("KNOWN DEFECT: deblocking filter is not bit-exact at QP %d "+
-				"(internal/deblock/deblock.go:332 clips delta before the "+
-				"abs(delta) < 10*tC gate, so the gate never fires): %s",
-				c.qp, rep)
-			if rep.total > c.maxSamples || rep.maxDelta > c.maxDelta {
-				t.Errorf("deblocking mismatch got worse at QP %d: %d samples / "+
-					"max delta %d, recorded budget %d samples / max delta %d",
-					c.qp, rep.total, rep.maxDelta, c.maxSamples, c.maxDelta)
+			if rep := compareYUV(t, hiDb, ffDb, w, h, 1); !rep.exact() {
+				t.Errorf("deblocking filter is not bit-exact at QP %d: %s", c.qp, rep)
 			}
 		})
 	}
 
-	// The same defect on a static P-frame run. Each frame re-filters an edge
-	// that is already over-smoothed in the reference picture, so the error
-	// grows linearly with the distance from the IDR: at QP 26 the worst luma
-	// delta is 1, 3, 5, 7 over four frames.
+	// Regression guard on a static P-frame run. While the gate was vacuous each
+	// frame re-filtered an edge already over-smoothed in the reference picture,
+	// so the error grew linearly with distance from the IDR — 1, 3, 5, 7 over
+	// four frames at QP 26, and 3, 7, 11, 15 at QP 34.
 	t.Run("accumulation_over_p_frames", func(t *testing.T) {
 		const qp, frames = 26, 4
 		staticSrc := twoHalvesYUV(w, h, frames)
@@ -652,18 +631,8 @@ func TestDeblockExactnessKnownDefect(t *testing.T) {
 
 		ffDb := decodeWithFFmpeg(t, ffmpeg, deblock)
 		hiDb := decodeWithHi265(t, deblock, w, h, frames)
-		rep := compareYUV(t, hiDb, ffDb, w, h, frames)
-		if rep.exact() {
-			t.Log("KNOWN DEFECT now passes exactly — tighten the recorded budget")
-			return
-		}
-		t.Logf("KNOWN DEFECT: the deblocking error accumulates across P frames "+
-			"on static content: %s", rep)
-		const maxSamples, maxDelta = 896, 7
-		if rep.total > maxSamples || rep.maxDelta > maxDelta {
-			t.Errorf("accumulated deblocking mismatch got worse: %d samples / "+
-				"max delta %d, recorded budget %d samples / max delta %d",
-				rep.total, rep.maxDelta, maxSamples, maxDelta)
+		if rep := compareYUV(t, hiDb, ffDb, w, h, frames); !rep.exact() {
+			t.Errorf("deblocking error accumulates across P frames: %s", rep)
 		}
 	})
 }

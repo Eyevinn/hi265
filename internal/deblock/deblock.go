@@ -329,8 +329,15 @@ func filterLumaEdge(f *frame.Frame, px, py int, vertical bool, beta, tC int) {
 			q1 := q[k][1]
 			q2 := q[k][2]
 
-			delta := clip3(-tC, tC, (9*(q0-p0)-3*(q1-p1)+8)>>4)
+			// Spec 8.7.2.5.7: the abs(delta) < 10*tC gate is tested on the
+			// RAW delta, and the clip to [-tC, tC] happens only inside the
+			// branch. Clipping first makes the gate vacuous — abs is then at
+			// most tC, always below 10*tC — so every edge that passed the
+			// d < beta decision got filtered, including the hard edges the
+			// spec deliberately leaves alone.
+			delta := (9*(q0-p0) - 3*(q1-p1) + 8) >> 4
 			if abs(delta) < tC*10 {
+				delta = clip3(-tC, tC, delta)
 				pNew0 := clip3(0, 255, p0+delta)
 				qNew0 := clip3(0, 255, q0-delta)
 				writeLumaPixel(f, px, py, k, vertical, -1, pNew0)
