@@ -164,8 +164,9 @@ func generatePPS(qp int) []byte {
 	w.WriteBit(0) // entropy_coding_sync_enabled_flag = 0
 	// no tile/WPP info
 	w.WriteBit(0) // loop_filter_across_slices_enabled_flag = 0
-	w.WriteBit(0) // deblocking_filter_control_present_flag = 0
-	// no deblocking syntax
+	w.WriteBit(1) // deblocking_filter_control_present_flag = 1
+	w.WriteBit(0) // deblocking_filter_override_enabled_flag = 0
+	w.WriteBit(1) // pps_deblocking_filter_disabled_flag = 1
 	w.WriteBit(0) // pps_scaling_list_data_present_flag = 0
 	w.WriteBit(0) // lists_modification_present_flag = 0
 	w.WriteUE(0)  // log2_parallel_merge_level_minus2 = 0
