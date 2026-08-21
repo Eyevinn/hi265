@@ -9,8 +9,8 @@ import (
 	"github.com/Eyevinn/mp4ff/hevc"
 )
 
-// idrSliceParams holds the parameters needed to write an IDR slice header
-// when using external SPS/PPS.
+// idrSliceParams holds the parameters needed to write an IRAP (IDR or CRA)
+// slice header when using external SPS/PPS.
 type idrSliceParams struct {
 	width                           int
 	height                          int
@@ -23,6 +23,101 @@ type idrSliceParams struct {
 	deblockingFilterOverrideEnabled bool
 	deblockingFilterDisabled        bool
 	loopFilterAcrossSlicesEnabled   bool
+
+	// refPicSet is nil for an IDR slice and non-nil for a CRA slice, which
+	// carries the POC and reference picture set fields an IDR header omits.
+	refPicSet *pocRefPicSetParams
+}
+
+// pocRefPicSetParams holds the slice header fields that every picture except an
+// IDR carries right after pic_output_flag (spec 7.3.6.1): the picture order
+// count LSB, the short-term and long-term reference picture sets, and the
+// slice-level temporal MVP flag.
+type pocRefPicSetParams struct {
+	poc                    int
+	log2MaxPicOrderCntLsb  int  // log2_max_pic_order_cnt_lsb_minus4 + 4
+	numShortTermRefPicSets int  // sps.NumShortTermRefPicSets
+	numLongTermRefPics     int  // sps.NumLongTermRefPics (num_long_term_ref_pics_sps)
+	longTermRefPicsPresent bool // sps.LongTermRefPicsPresentFlag
+	spsTemporalMvpEnabled  bool // sps.SpsTemporalMvpEnabledFlag
+
+	// intraRefresh marks a picture that references nothing (a CRA): an empty
+	// inline short-term RPS is written and temporal MVP is switched off.
+	intraRefresh bool
+}
+
+// craRefPicSetParams derives the CRA-specific slice header fields from the SPS.
+func craRefPicSetParams(sps *hevc.SPS, poc int) pocRefPicSetParams {
+	return pocRefPicSetParams{
+		poc:                    poc,
+		log2MaxPicOrderCntLsb:  int(sps.Log2MaxPicOrderCntLsbMinus4) + 4,
+		numShortTermRefPicSets: int(sps.NumShortTermRefPicSets),
+		numLongTermRefPics:     int(sps.NumLongTermRefPics),
+		longTermRefPicsPresent: sps.LongTermRefPicsPresentFlag,
+		spsTemporalMvpEnabled:  sps.SpsTemporalMvpEnabledFlag,
+		intraRefresh:           true,
+	}
+}
+
+// writePOCAndRefPicSets writes slice_pic_order_cnt_lsb, the short-term and
+// long-term reference picture sets and slice_temporal_mvp_enabled_flag
+// (spec 7.3.6.1). Only POC LSBs are coded, so the caller's POC is masked to
+// log2MaxPicOrderCntLsb bits; the decoder derives the MSBs from prevTid0Pic,
+// which is what lets a CRA splice into a running stream without resetting POC.
+func writePOCAndRefPicSets(w *BitWriter, p pocRefPicSetParams) {
+	pocBits := p.log2MaxPicOrderCntLsb
+	pocMask := (1 << pocBits) - 1
+	w.WriteBits(uint32(p.poc&pocMask), pocBits)
+
+	switch {
+	case p.intraRefresh:
+		// An intra refresh picture uses no reference pictures, so an empty RPS
+		// is written inline rather than pointing at one of the SPS sets.
+		w.WriteBit(0) // short_term_ref_pic_set_sps_flag = 0
+		if p.numShortTermRefPicSets > 0 {
+			// Inline RPS in a slice header has stRpsIdx = num_short_term_ref_pic_sets,
+			// and inter_ref_pic_set_prediction_flag is coded when stRpsIdx > 0.
+			w.WriteBit(0) // inter_ref_pic_set_prediction_flag = 0
+		}
+		w.WriteUE(0) // num_negative_pics = 0
+		w.WriteUE(0) // num_positive_pics = 0
+
+	case p.numShortTermRefPicSets > 0:
+		// short_term_ref_pic_set_sps_flag = 1, use SPS index 0
+		w.WriteBit(1)
+		if p.numShortTermRefPicSets > 1 {
+			// short_term_ref_pic_set_idx: u(ceil(log2(numShortTermRefPicSets)))
+			bits := ceilLog2(p.numShortTermRefPicSets)
+			w.WriteBits(0, bits) // index 0
+		}
+
+	default:
+		// short_term_ref_pic_set_sps_flag = 0 (inline)
+		// Inline STRPS: stRpsIdx=0, no inter_ref_pic_set_prediction_flag
+		w.WriteBit(0)
+		w.WriteUE(1)  // num_negative_pics = 1
+		w.WriteUE(0)  // num_positive_pics = 0
+		w.WriteUE(0)  // delta_poc_s0_minus1 = 0 (deltaPOC = -1)
+		w.WriteBit(1) // used_by_curr_pic_s0_flag = 1
+	}
+
+	// Long-term reference pictures are never used.
+	if p.longTermRefPicsPresent {
+		if p.numLongTermRefPics > 0 {
+			w.WriteUE(0) // num_long_term_sps = 0
+		}
+		w.WriteUE(0) // num_long_term_pics = 0
+	}
+
+	// slice_temporal_mvp_enabled_flag. Spec 7.4.7.1 requires it to be 0 when
+	// the current picture is a CRA or BLA picture.
+	if p.spsTemporalMvpEnabled {
+		if p.intraRefresh {
+			w.WriteBit(0)
+		} else {
+			w.WriteBit(1)
+		}
+	}
 }
 
 func idrSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) idrSliceParams {
@@ -42,14 +137,15 @@ func idrSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) idrSliceParams {
 	}
 }
 
-// encodeIDRSliceWithParams generates an IDR slice RBSP respecting all header fields
-// from external SPS/PPS parameters.
+// encodeIDRSliceWithParams generates an IRAP slice RBSP respecting all header fields
+// from external SPS/PPS parameters. It writes an IDR header, or a CRA header when
+// p.refPicSet is set.
 func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 	w := NewBitWriter()
 
 	// === Slice header ===
 	w.WriteBit(1)      // first_slice_segment_in_pic_flag = 1
-	w.WriteBit(0)      // no_output_of_prior_pics_flag = 0 (IDR only)
+	w.WriteBit(0)      // no_output_of_prior_pics_flag = 0 (present for all IRAP)
 	w.WriteUE(p.ppsID) // slice_pic_parameter_set_id
 
 	// num_extra_slice_header_bits: skip N zero bits
@@ -64,7 +160,11 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 		w.WriteBit(1) // pic_output_flag = 1
 	}
 
-	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set
+	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set.
+	// CRA: POC lsb, reference picture sets and temporal MVP flag are present.
+	if p.refPicSet != nil {
+		writePOCAndRefPicSets(w, *p.refPicSet)
+	}
 
 	// SAO flags
 	if p.saoEnabled {
@@ -690,6 +790,8 @@ type pSkipSliceParams struct {
 	outputFlagPresent                 bool
 	log2MaxPicOrderCntLsb             int // log2_max_pic_order_cnt_lsb_minus4 + 4
 	numShortTermRefPicSets            int
+	numLongTermRefPics                int // num_long_term_ref_pics_sps
+	longTermRefPicsPresent            bool
 	spsTemporalMvpEnabled             bool
 	saoEnabled                        bool
 	cabacInitPresent                  bool
@@ -734,33 +836,15 @@ func encodePSkipSliceWithParams(p pSkipSliceParams) []byte {
 		w.WriteBit(1) // pic_output_flag = 1
 	}
 
-	// pic_order_cnt_lsb: u(log2MaxPicOrderCntLsb) bits
-	pocBits := p.log2MaxPicOrderCntLsb
-	pocMask := (1 << pocBits) - 1
-	w.WriteBits(uint32(p.poc&pocMask), pocBits)
-
-	if p.numShortTermRefPicSets > 0 {
-		// short_term_ref_pic_set_sps_flag = 1, use SPS index 0
-		w.WriteBit(1)
-		if p.numShortTermRefPicSets > 1 {
-			// short_term_ref_pic_set_idx: u(ceil(log2(numShortTermRefPicSets)))
-			bits := ceilLog2(p.numShortTermRefPicSets)
-			w.WriteBits(0, bits) // index 0
-		}
-	} else {
-		// short_term_ref_pic_set_sps_flag = 0 (inline)
-		w.WriteBit(0)
-		// Inline STRPS: stRpsIdx=0, no inter_ref_pic_set_prediction
-		w.WriteUE(1)  // num_negative_pics = 1
-		w.WriteUE(0)  // num_positive_pics = 0
-		w.WriteUE(0)  // delta_poc_s0_minus1 = 0 (deltaPOC = -1)
-		w.WriteBit(1) // used_by_curr_pic_s0_flag = 1
-	}
-
-	// slice_temporal_mvp_enabled_flag
-	if p.spsTemporalMvpEnabled {
-		w.WriteBit(1) // slice_temporal_mvp_enabled_flag = 1
-	}
+	// pic_order_cnt_lsb, reference picture sets, slice_temporal_mvp_enabled_flag
+	writePOCAndRefPicSets(w, pocRefPicSetParams{
+		poc:                    p.poc,
+		log2MaxPicOrderCntLsb:  p.log2MaxPicOrderCntLsb,
+		numShortTermRefPicSets: p.numShortTermRefPicSets,
+		numLongTermRefPics:     p.numLongTermRefPics,
+		longTermRefPicsPresent: p.longTermRefPicsPresent,
+		spsTemporalMvpEnabled:  p.spsTemporalMvpEnabled,
+	})
 
 	// SAO flags
 	if p.saoEnabled {

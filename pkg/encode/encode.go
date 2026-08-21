@@ -79,6 +79,41 @@ func EncodeIDRSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, grid *yuv.Grid, colo
 	return buf.Bytes(), nil
 }
 
+// EncodeCRASliceFromSPSPPS encodes a CRA (Clean Random Access) I-slice compatible
+// with external SPS/PPS at the given picture order count.
+// The grid and colors define the per-CTU content (each grid cell is one 16x16 CTU).
+//
+// Unlike an IDR, a CRA does not reset the picture order count: its POC MSBs are
+// derived from the preceding pictures, so a CRA carrying the right
+// slice_pic_order_cnt_lsb can be spliced into a running stream as a refresh point
+// without breaking POC continuity of what follows (Gradual Decoder Refresh).
+//
+// Returns Annex-B framed CRA_NUT NALU.
+func EncodeCRASliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, grid *yuv.Grid, colors yuv.ColorMap,
+	poc int) ([]byte, error) {
+
+	if err := validateSPSPPSForIDR(sps, pps); err != nil {
+		return nil, err
+	}
+
+	w := int(sps.PicWidthInLumaSamples)
+	h := int(sps.PicHeightInLumaSamples)
+	f, err := yuv.BuildFrame(grid, colors)
+	if err != nil {
+		return nil, err
+	}
+	f.Width = w
+	f.Height = h
+
+	sp := idrSliceParamsFromSPSPPS(sps, pps)
+	rps := craRefPicSetParams(sps, poc)
+	sp.refPicSet = &rps
+
+	var buf bytes.Buffer
+	WriteNALU(&buf, naluCRA, encodeIDRSliceWithParams(sp, f.Y, f.Cb, f.Cr))
+	return buf.Bytes(), nil
+}
+
 // EncodePSkipSliceFromSPSPPS encodes a P-skip slice compatible with external SPS/PPS.
 // Returns Annex-B framed TRAIL_R NALU.
 func EncodePSkipSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) ([]byte, error) {
@@ -131,6 +166,8 @@ func pSkipSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) pSkipSlic
 		outputFlagPresent:                 pps.OutputFlagPresentFlag,
 		log2MaxPicOrderCntLsb:             int(sps.Log2MaxPicOrderCntLsbMinus4) + 4,
 		numShortTermRefPicSets:            int(sps.NumShortTermRefPicSets),
+		numLongTermRefPics:                int(sps.NumLongTermRefPics),
+		longTermRefPicsPresent:            sps.LongTermRefPicsPresentFlag,
 		spsTemporalMvpEnabled:             sps.SpsTemporalMvpEnabledFlag,
 		saoEnabled:                        sps.SampleAdaptiveOffsetEnabledFlag,
 		cabacInitPresent:                  pps.CabacInitPresentFlag,
@@ -189,6 +226,12 @@ func (e *FrameEncoder) EncodePSkipSlice(poc int) ([]byte, error) {
 // EncodeIDRSliceFromSPSPPS produces an Annex-B IDR slice compatible with external SPS/PPS.
 func (e *FrameEncoder) EncodeIDRSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) ([]byte, error) {
 	return EncodeIDRSliceFromSPSPPS(sps, pps, e.Grid, e.Colors)
+}
+
+// EncodeCRASliceFromSPSPPS produces an Annex-B CRA slice compatible with external
+// SPS/PPS at the given picture order count.
+func (e *FrameEncoder) EncodeCRASliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) ([]byte, error) {
+	return EncodeCRASliceFromSPSPPS(sps, pps, e.Grid, e.Colors, poc)
 }
 
 // EncodePSkipSliceFromSPSPPS produces an Annex-B P-skip slice compatible with external SPS/PPS.

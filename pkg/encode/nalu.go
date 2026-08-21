@@ -9,6 +9,7 @@ import (
 const (
 	naluTrailR   = 1
 	naluIDRWRadl = 19
+	naluCRA      = 21
 	naluVPS      = 32
 	naluSPS      = 33
 	naluPPS      = 34
