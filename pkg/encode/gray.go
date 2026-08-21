@@ -25,6 +25,31 @@ func EncodeGrayIDRSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) ([]byte, error) 
 	return buf.Bytes(), nil
 }
 
+// EncodeGrayCRASliceFromSPSPPS encodes a gray CRA (Clean Random Access) slice
+// compatible with external SPS/PPS at the given picture order count.
+// It is the Gradual Decoder Refresh primitive: unlike an IDR, a CRA does not
+// reset the picture order count, so a CRA carrying the right
+// slice_pic_order_cnt_lsb splices a refresh point into a running stream without
+// breaking POC continuity of the pictures that follow.
+//
+// Like the gray IDR, the content is uniform mid-gray on all planes and works for
+// any chroma format (4:2:0, 4:2:2, 4:4:4) and bit depth (8, 10, 12), since DC
+// prediction on a uniform surface always yields zero residual.
+// Returns Annex-B framed CRA_NUT NALU.
+func EncodeGrayCRASliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) ([]byte, error) {
+	if err := validateGraySPSPPS(sps, pps); err != nil {
+		return nil, err
+	}
+
+	p := grayIDRSliceParams(sps, pps)
+	rps := craRefPicSetParams(sps, poc)
+	p.refPicSet = &rps
+
+	var buf bytes.Buffer
+	WriteNALU(&buf, naluCRA, encodeGrayIDRSlice(p))
+	return buf.Bytes(), nil
+}
+
 // graySliceParams holds parameters for encoding a gray IDR slice.
 type graySliceParams struct {
 	width  int
@@ -44,6 +69,10 @@ type graySliceParams struct {
 
 	// Chroma format
 	chromaArrayType int // 0=mono, 1=4:2:0, 2=4:2:2, 3=4:4:4
+
+	// refPicSet is nil for an IDR slice and non-nil for a CRA slice, which
+	// carries the POC and reference picture set fields an IDR header omits.
+	refPicSet *pocRefPicSetParams
 
 	// Slice header fields from PPS/SPS
 	ppsID                           uint32
@@ -105,13 +134,14 @@ func validateGraySPSPPS(_ *hevc.SPS, pps *hevc.PPS) error {
 	return nil
 }
 
-// encodeGrayIDRSlice generates the complete IDR slice RBSP for a gray frame.
+// encodeGrayIDRSlice generates the complete IRAP slice RBSP for a gray frame.
+// It writes an IDR header, or a CRA header when p.refPicSet is set.
 func encodeGrayIDRSlice(p graySliceParams) []byte {
 	w := NewBitWriter()
 
 	// === Slice header ===
 	w.WriteBit(1)      // first_slice_segment_in_pic_flag = 1
-	w.WriteBit(0)      // no_output_of_prior_pics_flag = 0 (IDR only)
+	w.WriteBit(0)      // no_output_of_prior_pics_flag = 0 (present for all IRAP)
 	w.WriteUE(p.ppsID) // slice_pic_parameter_set_id
 
 	for range p.numExtraSliceHeaderBits {
@@ -124,7 +154,11 @@ func encodeGrayIDRSlice(p graySliceParams) []byte {
 		w.WriteBit(1) // pic_output_flag = 1
 	}
 
-	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set
+	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set.
+	// CRA: POC lsb, reference picture sets and temporal MVP flag are present.
+	if p.refPicSet != nil {
+		writePOCAndRefPicSets(w, *p.refPicSet)
+	}
 
 	if p.saoEnabled {
 		w.WriteBit(0) // slice_sao_luma_flag = 0

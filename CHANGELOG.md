@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- CRA (Clean Random Access, `nal_unit_type` 21) slice generation at a caller-chosen
+  picture order count — the Gradual Decoder Refresh primitive, since a CRA does not
+  reset the POC the way an IDR does:
+  - `encode.EncodeCRASliceFromSPSPPS(sps, pps, grid, colors, poc)`
+  - `encode.EncodeGrayCRASliceFromSPSPPS(sps, pps, poc)` (any chroma format / bit depth)
+  - `hi265gray -cra -poc N`
+- CRA decoding in `pkg/decoder`: a CRA is decoded as an intra picture and becomes
+  the reference frame for the following P-skip pictures
+
+### Fixed
+- Slice headers now write the long-term reference picture set fields when the SPS
+  has `long_term_ref_pics_present_flag` set (previously omitted, making such
+  P-skip slices unparsable)
+- Slice header parsing of the long-term reference picture set: `num_long_term_sps`
+  is only present when `num_long_term_ref_pics_sps > 0`, and
+  `used_by_curr_pic_lt_flag` / `delta_poc_msb_cycle_lt` were not consumed
+
 ## [0.1.0] - 2026-05-12
 
 Initial release of hi265 — a pure Go HEVC/H.265 frame decoder and bitstream

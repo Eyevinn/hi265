@@ -69,7 +69,18 @@ func (d *Decoder) DecodeNALUs(nalus [][]byte) ([]*frame.Frame, error) {
 			d.ppsMap[pps.PicParameterSetID] = pps
 
 		case hevc.NALU_IDR_N_LP, hevc.NALU_IDR_W_RADL:
-			f, err := d.decodeIDR(nalu)
+			f, err := d.decodeIRAP(nalu, false)
+			if err != nil {
+				return nil, err
+			}
+			d.refFrame = f
+			frames = append(frames, f)
+
+		case hevc.NALU_CRA:
+			// A CRA is an intra picture like an IDR, but its header carries POC
+			// and reference picture set fields. It becomes the new reference
+			// frame for the P-skip pictures that follow.
+			f, err := d.decodeIRAP(nalu, true)
 			if err != nil {
 				return nil, err
 			}
@@ -100,8 +111,86 @@ func (d *Decoder) DecodeNALUs(nalus [][]byte) ([]*frame.Frame, error) {
 	return frames, nil
 }
 
-// decodeIDR decodes an IDR slice NALU.
-func (d *Decoder) decodeIDR(nalu []byte) (*frame.Frame, error) {
+// parsePOCAndRefPicSets parses the slice header fields that every picture except
+// an IDR carries right after pic_output_flag (spec 7.3.6.1): pic_order_cnt_lsb,
+// the short-term and long-term reference picture sets, and
+// slice_temporal_mvp_enabled_flag. It returns the POC LSB and the slice-level
+// temporal MVP flag.
+func parsePOCAndRefPicSets(r *bits.EBSPReader, sps *hevc.SPS) (pocLsb int, temporalMvpEnabled bool, err error) {
+	pocLsbBits := int(sps.Log2MaxPicOrderCntLsbMinus4) + 4
+	pocLsb = int(r.Read(pocLsbBits))
+
+	// short_term_ref_pic_set
+	stRefPicSetSpsFlag := r.ReadFlag()
+	if stRefPicSetSpsFlag {
+		numSets := int(sps.NumShortTermRefPicSets)
+		if numSets > 1 {
+			nBits := ceilLog2(numSets)
+			r.Read(nBits)
+		}
+	} else {
+		// Inline short_term_ref_pic_set (st_rps_idx = num_short_term_ref_pic_sets)
+		stRpsIdx := int(sps.NumShortTermRefPicSets)
+		interRpsPredFlag := false
+		if stRpsIdx != 0 {
+			interRpsPredFlag = r.ReadFlag()
+		}
+		if interRpsPredFlag {
+			// Prediction mode: delta from a reference RPS
+			r.ReadExpGolomb() // delta_idx_minus1
+			r.ReadFlag()      // delta_rps_sign
+			r.ReadExpGolomb() // abs_delta_rps_minus1
+			// Need reference RPS to know num_delta_pocs - not supported yet
+			return 0, false, fmt.Errorf("inter_ref_pic_set_prediction_flag=1 not supported")
+		}
+		// Direct mode: list delta POCs
+		numNegPics := int(r.ReadExpGolomb())
+		numPosPics := int(r.ReadExpGolomb())
+		for range numNegPics {
+			r.ReadExpGolomb() // delta_poc_s0_minus1
+			r.ReadFlag()      // used_by_curr_pic_s0_flag
+		}
+		for range numPosPics {
+			r.ReadExpGolomb() // delta_poc_s1_minus1
+			r.ReadFlag()      // used_by_curr_pic_s1_flag
+		}
+	}
+
+	// long_term_ref_pics
+	if sps.LongTermRefPicsPresentFlag {
+		numLtSps := 0
+		if sps.NumLongTermRefPics > 0 {
+			numLtSps = int(r.ReadExpGolomb()) // num_long_term_sps
+		}
+		numLtPics := int(r.ReadExpGolomb()) // num_long_term_pics
+		for i := range numLtSps + numLtPics {
+			if i < numLtSps {
+				if sps.NumLongTermRefPics > 1 {
+					r.Read(ceilLog2(int(sps.NumLongTermRefPics))) // lt_idx_sps
+				}
+			} else {
+				r.Read(pocLsbBits) // poc_lsb_lt
+				r.ReadFlag()       // used_by_curr_pic_lt_flag
+			}
+			if r.ReadFlag() { // delta_poc_msb_present_flag
+				r.ReadExpGolomb() // delta_poc_msb_cycle_lt
+			}
+		}
+	}
+
+	// slice_temporal_mvp_enabled_flag
+	if sps.SpsTemporalMvpEnabledFlag {
+		temporalMvpEnabled = r.ReadFlag()
+	}
+
+	return pocLsb, temporalMvpEnabled, nil
+}
+
+// decodeIRAP decodes an intra random access point slice NALU: an IDR, or a CRA
+// when isCRA is set. Both are decoded as intra pictures; the CRA header
+// additionally carries slice_pic_order_cnt_lsb, the reference picture sets and
+// slice_temporal_mvp_enabled_flag (spec 7.3.6.1).
+func (d *Decoder) decodeIRAP(nalu []byte, isCRA bool) (*frame.Frame, error) {
 	r := bits.NewEBSPReader(bytes.NewReader(nalu))
 
 	// Skip 2-byte NALU header
@@ -110,7 +199,7 @@ func (d *Decoder) decodeIDR(nalu []byte) (*frame.Frame, error) {
 	// first_slice_segment_in_pic_flag
 	r.ReadFlag()
 
-	// no_output_of_prior_pics_flag (present for IDR)
+	// no_output_of_prior_pics_flag (present for all IRAP pictures)
 	r.ReadFlag()
 
 	// slice_pic_parameter_set_id
@@ -132,7 +221,13 @@ func (d *Decoder) decodeIDR(nalu []byte) (*frame.Frame, error) {
 		r.ReadFlag()
 	}
 
-	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set
+	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set.
+	// CRA: POC lsb, reference picture sets and temporal MVP flag are present.
+	if isCRA {
+		if _, _, err := parsePOCAndRefPicSets(r, sps); err != nil {
+			return nil, err
+		}
+	}
 
 	// SAO flags if enabled
 	var sliceSaoLuma, sliceSaoChroma bool
@@ -259,67 +354,10 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 		r.ReadFlag()
 	}
 
-	// pic_order_cnt_lsb
-	pocLsbBits := int(sps.Log2MaxPicOrderCntLsbMinus4) + 4
-	r.Read(pocLsbBits)
-
-	// short_term_ref_pic_set
-	stRefPicSetSpsFlag := r.ReadFlag()
-	if stRefPicSetSpsFlag {
-		numSets := int(sps.NumShortTermRefPicSets)
-		if numSets > 1 {
-			nBits := ceilLog2(numSets)
-			r.Read(nBits)
-		}
-	} else {
-		// Inline short_term_ref_pic_set (st_rps_idx = num_short_term_ref_pic_sets)
-		stRpsIdx := int(sps.NumShortTermRefPicSets)
-		interRpsPredFlag := false
-		if stRpsIdx != 0 {
-			interRpsPredFlag = r.ReadFlag()
-		}
-		if interRpsPredFlag {
-			// Prediction mode: delta from a reference RPS
-			r.ReadExpGolomb() // delta_idx_minus1
-			r.ReadFlag()      // delta_rps_sign
-			r.ReadExpGolomb() // abs_delta_rps_minus1
-			// Need reference RPS to know num_delta_pocs - not supported yet
-			return nil, fmt.Errorf("inter_ref_pic_set_prediction_flag=1 not supported")
-		} else {
-			// Direct mode: list delta POCs
-			numNegPics := int(r.ReadExpGolomb())
-			numPosPics := int(r.ReadExpGolomb())
-			for range numNegPics {
-				r.ReadExpGolomb() // delta_poc_s0_minus1
-				r.ReadFlag()      // used_by_curr_pic_s0_flag
-			}
-			for range numPosPics {
-				r.ReadExpGolomb() // delta_poc_s1_minus1
-				r.ReadFlag()      // used_by_curr_pic_s1_flag
-			}
-		}
-	}
-
-	// long_term_ref_pics
-	if sps.LongTermRefPicsPresentFlag {
-		numLtSps := r.ReadExpGolomb()
-		numLtPics := r.ReadExpGolomb()
-		numLt := int(numLtSps + numLtPics)
-		pocBits := int(sps.Log2MaxPicOrderCntLsbMinus4) + 4
-		for i := range numLt {
-			if i < int(numLtSps) && sps.NumLongTermRefPics > 1 {
-				r.Read(ceilLog2(int(sps.NumLongTermRefPics)))
-			} else if i >= int(numLtSps) {
-				r.Read(pocBits) // poc_lsb_lt
-			}
-			r.ReadFlag() // delta_poc_msb_present_flag
-		}
-	}
-
-	// slice_temporal_mvp_enabled_flag
-	var sliceTemporalMvpEnabled bool
-	if sps.SpsTemporalMvpEnabledFlag {
-		sliceTemporalMvpEnabled = r.ReadFlag()
+	// pic_order_cnt_lsb, reference picture sets, slice_temporal_mvp_enabled_flag
+	_, sliceTemporalMvpEnabled, err := parsePOCAndRefPicSets(r, sps)
+	if err != nil {
+		return nil, err
 	}
 
 	// SAO flags
