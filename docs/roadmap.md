@@ -106,6 +106,29 @@ moderate QP. 0.5 hides this for *generated* content but it still affects the
 decoder's main job: decoding real-world streams. Needs its own x265/FFmpeg
 vectors at QP 22–30 with deblocking on.
 
+### 0.8 Non-multiple-of-16 frame heights panic the grid encoder (M) — **open bug**
+
+`hi265gen -smpte -w 1920 -h 1080` panics with `index out of range [2073600]
+with length 2073600`. Any dimension that is not a multiple of the 16-pixel CTU
+fails the same way — 640x360, 320x232, 128x72, and 1920x1080 all crash, while
+640x352, 640x368 and 1920x1088 work. That rules out the single most common
+video resolution, and one such example shipped in the README.
+
+Two separate problems:
+
+1. **No boundary handling.** `encodeIDRSliceData` / `encodeIDRCU` index straight
+   past the end of the plane for a partial bottom CTU row. `gray.go` already
+   solves this ("boundary CTUs that extend past the picture edge use implicit
+   splits down to sub-CUs that fit") — reuse that approach.
+2. **Legality.** `pic_height_in_luma_samples` must be a multiple of minCbSize.
+   With minCb 16, 1080 cannot be expressed at all: it needs either minCb 8
+   (1080 % 8 == 0 — which Route A in 4.3 introduces anyway) or coding 1088 and
+   signalling a conformance window (`conf_win_bottom_offset`).
+
+Interim: the README now documents the constraint. The fix should land after 4.3,
+since the minCb choice determines which of the two mechanisms is needed. At
+minimum, validate the dimensions and return a clear error instead of panicking.
+
 ### 0.4 `hi265dec` argument handling (S)
 
 `go run ./cmd/hi265dec in.265 -o out.yuv` silently ignores `-o` — Go's `flag`

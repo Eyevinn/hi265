@@ -70,46 +70,46 @@ same `.gridimg` files and color specs work with both tools.
 
 ```bash
 # Grid-only: single IDR frame from grid pattern (frame size = grid size)
-go run ./cmd/hi265gen -f examples/logo.gridimg -o logo.265
-go run ./cmd/hi265gen -grid "xy,yx" -c x=235,128,128 -c y=16,128,128 -o checker.265
-go run ./cmd/hi265gen -grid "ab" -c a=255,0,0 -c b=0,0,255 -rgb -qp 20 -o test.265
+go run ./cmd/hi265gen -gi examples/logo.gridimg -o logo.265
+go run ./cmd/hi265gen -gp "xy,yx" -gc x=235,128,128 -gc y=16,128,128 -o checker.265
+go run ./cmd/hi265gen -gp "ab" -gc a=255,0,0 -gc b=0,0,255 -rgb -qp 20 -o test.265
 
 # Counter: frame counter digits on solid background
-go run ./cmd/hi265gen -w 192 -h 96 -n 10 -digits 3 -o counter.265
+go run ./cmd/hi265gen -w 192 -h 96 -n 10 -text "%03d" -o counter.265
 
 # With P-skip frames (IDR every 50 frames, P-skip copies between)
-go run ./cmd/hi265gen -w 192 -h 96 -n 100 -digits 3 -idr-interval 50 -o counter.265
+go run ./cmd/hi265gen -w 192 -h 96 -n 100 -text "%03d" -idr-interval 50 -o counter.265
 
 # Fragmented MP4 output (25 fps default, fragment every 25 frames)
-go run ./cmd/hi265gen -w 192 -h 96 -n 50 -digits 3 -o counter.mp4
+go run ./cmd/hi265gen -w 192 -h 96 -n 50 -text "%03d" -o counter.mp4
 
 # MP4 with custom framerate and fragment duration
-go run ./cmd/hi265gen -w 320 -h 240 -n 75 -digits 3 -fps 30 -frag-dur 30 -o counter.mp4
+go run ./cmd/hi265gen -w 320 -h 240 -n 75 -text "%03d" -fps 30 -frag-dur 30 -o counter.mp4
 
 # Tiled: grid pattern tiled to fill custom dimensions, with optional counter
-go run ./cmd/hi265gen -grid "xy,yx" -c x=235,128,128 -c y=16,128,128 -w 192 -h 96 -n 10 -digits 3 -o counter.265
+go run ./cmd/hi265gen -gp "xy,yx" -gc x=235,128,128 -gc y=16,128,128 -w 192 -h 96 -n 10 -text "%03d" -o counter.265
 
 # SMPTE color bars with counter overlay
-go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 10 -digits 3 -o smpte.265
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 10 -text "%03d" -o smpte.265
 
 # SMPTE bars with digit background box and explicit scale
-go run ./cmd/hi265gen -smpte -w 352 -h 288 -n 1 -digits 2 -digit-scale 3 -digit-bg 0,0,0 -o smpte_big.265
+go run ./cmd/hi265gen -smpte -w 352 -h 288 -n 1 -text "%02d" -text-scale 3 -text-bg 0,0,0 -o smpte_big.265
 
 # Fixed bytes per picture (pad with HEVC filler NALUs for CBR-like streams)
 go run ./cmd/hi265gen -smpte -w 192 -h 96 -bpp 5000 -o padded.265
-go run ./cmd/hi265gen -w 320 -h 240 -n 50 -digits 3 -bpp 8000 -o cbr_counter.mp4
+go run ./cmd/hi265gen -w 320 -h 240 -n 50 -text "%03d" -bpp 8000 -o cbr_counter.mp4
 
 # Raw image output (no HEVC encoding, useful as decoder reference)
-go run ./cmd/hi265gen -f examples/logo.gridimg -o logo.png
-go run ./cmd/hi265gen -f examples/logo.gridimg -o logo.yuv
-go run ./cmd/hi265gen -f examples/logo.gridimg -q 95 -o logo.jpg
-go run ./cmd/hi265gen -w 192 -h 96 -n 5 -digits 3 -o output.y4m
-go run ./cmd/hi265gen -w 192 -h 96 -n 5 -digits 3 -o frame_%03d.png
+go run ./cmd/hi265gen -gi examples/logo.gridimg -o logo.png
+go run ./cmd/hi265gen -gi examples/logo.gridimg -o logo.yuv
+go run ./cmd/hi265gen -gi examples/logo.gridimg -q 95 -o logo.jpg
+go run ./cmd/hi265gen -w 192 -h 96 -n 5 -text "%03d" -o output.y4m
+go run ./cmd/hi265gen -w 192 -h 96 -n 5 -text "%03d" -o frame_%03d.png
 ```
 
 ```bash
 # Color space: generate BT.709 stream (VUI signaled in SPS)
-go run ./cmd/hi265gen -f examples/logo.gridimg -colorspace bt709 -o logo_709.265
+go run ./cmd/hi265gen -gi examples/logo.gridimg -colorspace bt709 -o logo_709.265
 
 # Full-range BT.709
 go run ./cmd/hi265gen -smpte -w 320 -h 240 -colorspace bt709 -full-range -o smpte_709.265
@@ -119,28 +119,37 @@ Flags:
 
 | Flag | Description | Default |
 |---|---|---|
-| `-f` | Grid image file (`.gridimg`) | — |
-| `-grid` | Inline grid string (e.g. `"xy,yx"`) | — |
-| `-c` | Color mapping (repeatable, e.g. `x=235,128,128`) | — |
-| `-rgb` | Treat `-c` values as RGB instead of YCbCr | off |
+| `-gi` | Grid image file (`.gridimg`) | — |
+| `-gp` | Inline grid pattern, rows separated by commas (e.g. `"xy,yx"`) | — |
+| `-gc` | Color spec (repeatable, e.g. `x=235,128,128`) | — |
+| `-rgb` | Treat `-gc` values as RGB instead of YCbCr | off |
 | `-smpte` | Use built-in 75% SMPTE color bars pattern | off |
-| `-w` | Frame width in pixels | grid width |
-| `-h` | Frame height in pixels | grid height |
+| `-f` | Output format (`265`, `hevc`, `mp4`, `y4m`, `yuv`, `png`, `jpg`); required with `-o -` | from `-o` extension |
+| `-w` | Frame width in pixels (multiple of 16, see note) | grid width |
+| `-h` | Frame height in pixels (multiple of 16, see note) | grid height |
 | `-n` | Number of frames | 1 |
-| `-digits` | Counter digit count (0 = no counter) | 0 |
-| `-digit-scale` | Digit scale factor (0 = auto-fit) | 0 |
-| `-digit-bg` | Digit background box color (R,G,B) | none |
-| `-fg` | Foreground color (R,G,B) | — |
-| `-bg` | Background color (R,G,B) | — |
-| `-qp` | Quantization parameter | 26 |
-| `-q` | JPEG quality | 85 |
+| `-text` | Text overlay pattern (e.g. `"%03d"`, `"%mm:%ss.%ff"`) | — |
+| `-text-scale` | Text scale factor (0 = auto-fit) | 0 |
+| `-text-bg` | Text background box color (R,G,B) | none |
+| `-fg` | Foreground RGB color for text | `255,255,255` |
+| `-bg` | Background RGB color | `0,0,0` |
+| `-qp` | Quantization parameter (0-51) | 26 |
+| `-q` | JPEG quality (1-100) | 85 |
 | `-idr-interval` | Frames between IDR keyframes (0 = all-IDR) | 0 |
-| `-bpp` | Bytes per picture (filler NAL padding) | 0 (off) |
+| `-bpp` | Target bytes per picture (filler NAL padding) | 0 (off) |
+| `-kbps` | Target bitrate in kbit/s (converted to `-bpp` using `-fps`) | 0 (off) |
 | `-colorspace` | Color space (`bt601`/`bt709`/`bt2020`) | `bt601` |
 | `-full-range` | Full-range YCbCr (0-255) | off (limited) |
-| `-fps` | MP4 framerate | 25 |
+| `-fps` | Framerate for MP4 and timestamp specifiers | 25 |
 | `-frag-dur` | MP4 fragment duration in frames | 25 |
-| `-o` | Output file | — |
+| `-o` | Output file (`-` for stdout, requires `-f`) | — |
+| `-version` | Print version | — |
+
+> **Dimension constraint.** Frame width and height must currently be
+> multiples of 16 (the CTU size). Common heights such as 360 and 1080 are not,
+> and currently crash the encoder rather than producing a clear error — use
+> 352/368 and 1088 instead. Both the missing validation and support for partial
+> boundary CTUs are tracked in `docs/roadmap.md` (item 0.8).
 
 ### Constant bitrate testing with `-bpp`
 
@@ -158,13 +167,13 @@ playback:
 
 ```bash
 # 500 kbit/s tier — green background
-go run ./cmd/hi265gen -w 320 -h 240 -n 50 -digits 3 -bg 0,128,0 -bpp 2500 -o low.mp4
+go run ./cmd/hi265gen -w 320 -h 240 -n 50 -text "%03d" -bg 0,128,0 -bpp 2500 -o low.mp4
 
 # 1500 kbit/s tier — blue background
-go run ./cmd/hi265gen -w 640 -h 360 -n 50 -digits 3 -bg 0,0,200 -bpp 7500 -o mid.mp4
+go run ./cmd/hi265gen -w 640 -h 352 -n 50 -text "%03d" -bg 0,0,200 -bpp 7500 -o mid.mp4
 
 # 3000 kbit/s tier — red background
-go run ./cmd/hi265gen -w 1280 -h 720 -n 50 -digits 3 -bg 200,0,0 -bpp 15000 -o high.mp4
+go run ./cmd/hi265gen -w 1280 -h 720 -n 50 -text "%03d" -bg 200,0,0 -bpp 15000 -o high.mp4
 ```
 
 This makes it easy to verify that an ABR player switches between the correct
@@ -207,13 +216,13 @@ The `examples/` directory contains `.gridimg` files:
 
 ```bash
 # Encode to HEVC
-go run ./cmd/hi265gen -f examples/logo.gridimg -o logo.265
+go run ./cmd/hi265gen -gi examples/logo.gridimg -o logo.265
 
 # Decode to raw YUV
 go run ./cmd/hi265dec logo.265 logo.yuv
 
 # Generate reference PNG for comparison (raw output, no HEVC)
-go run ./cmd/hi265gen -f examples/logo.gridimg -o expected.png
+go run ./cmd/hi265gen -gi examples/logo.gridimg -o expected.png
 
 # Cross-verify with FFmpeg (raw YUV)
 go run ./cmd/hi265dec logo.265 logo.yuv
