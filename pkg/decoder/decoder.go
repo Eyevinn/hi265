@@ -622,20 +622,31 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 			}
 			f.SetLumaBlock(tu.X0, tu.Y0, trSize, recon)
 
-			// Chroma reconstruction
-			if tu.Log2TrSize < 3 && (tu.X0%8 != 0 || tu.Y0%8 != 0) {
+			// Chroma reconstruction. With 4x4 luma TBs only one of the four
+			// TUs in a group carries the chroma block, and it covers the whole
+			// group, so it is reconstructed at ChromaX0/ChromaY0 rather than at
+			// the TU's own position.
+			if !tu.HasChroma {
 				continue
 			}
+			chromaX0, chromaY0 := tu.ChromaX0, tu.ChromaY0
 			chromaTrSize := trSize / 2
 			if chromaTrSize < 4 {
 				chromaTrSize = 4
 			}
 
+			// IntraPredModeC (spec 8.4.3) derives from IntraPredModeY at the
+			// CU's top-left luma location, not from this transform block's PU.
+			// With an NxN partition the four luma PUs share one chroma block, so
+			// using the TU's own mode picks the wrong one for every quadrant but
+			// the first — and produces modes the chroma syntax cannot even
+			// express, such as 23 from a table of {0, 26, 10, 1}.
+			cuLumaMode := cu.IntraLumaMode[0]
 			chromaMode := cu.IntraChromaMode
 			switch chromaMode {
 			case 4:
-				chromaMode = lumaMode
-			case lumaMode:
+				chromaMode = cuLumaMode
+			case cuLumaMode:
 				chromaMode = 34
 			}
 
@@ -649,7 +660,7 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 					chromaCoeffs = tu.CrCoeffs
 				}
 
-				chromaNeighbors := getChromaNeighbors(f, comp, tu.X0/2, tu.Y0/2, chromaTrSize, ctbSize)
+				chromaNeighbors := getChromaNeighbors(f, comp, chromaX0/2, chromaY0/2, chromaTrSize, ctbSize)
 				pred.FilterRefSamples(chromaNeighbors, chromaMode, chromaTrSize, false, false)
 				chromaPred := predictIntra(chromaMode, chromaTrSize, chromaNeighbors, bitDepth, false)
 
@@ -675,7 +686,7 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 				for i := range chromaRecon {
 					chromaRecon[i] = chromaPred[i] + chromaResidual[i]
 				}
-				f.SetChromaBlock(comp, tu.X0/2, tu.Y0/2, chromaTrSize, chromaRecon)
+				f.SetChromaBlock(comp, chromaX0/2, chromaY0/2, chromaTrSize, chromaRecon)
 			}
 		}
 	}

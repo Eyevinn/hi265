@@ -261,6 +261,15 @@ func FilterRefSamples(n *Neighbors, mode, size int, isLuma bool, strongSmooth bo
 	if n == nil {
 		return
 	}
+	// Spec 8.4.4.2.3 invokes the filtering process only for luma, or for chroma
+	// when ChromaArrayType is 3 (4:4:4) — which this decoder does not handle.
+	// Filtering chroma reference samples anyway corrupts every chroma block
+	// whose mode is planar or a sufficiently diagonal angle; the modes a
+	// flat-colour generator picks (DC, 10, 26) are exempt either way, which is
+	// why only real encoder output showed it.
+	if !isLuma {
+		return
+	}
 	if size <= 4 {
 		return
 	}

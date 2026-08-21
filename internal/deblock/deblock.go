@@ -3,6 +3,7 @@ package deblock
 
 import (
 	"github.com/Eyevinn/hi265/internal/slice"
+	"github.com/Eyevinn/hi265/internal/transform"
 	"github.com/Eyevinn/hi265/pkg/frame"
 )
 
@@ -20,14 +21,6 @@ var tcTable = [54]int{
 	0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3,
 	3, 3, 3, 4, 4, 4, 5, 5, 6, 6, 7, 8, 9, 10, 11, 13,
 	14, 16, 18, 20, 22, 24,
-}
-
-// HEVC spec Table 8-22: chroma QP from luma QP.
-var chromaQPTable = [52]int{
-	0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-	16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 29, 30,
-	31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37, 38, 39, 40, 41,
-	42, 43, 44, 45,
 }
 
 func clip3(lo, hi, val int) int {
@@ -216,14 +209,14 @@ func filterEdges(
 	}
 }
 
+// chromaQPFromLuma maps a luma QP to the chroma QP for the deblocking filter.
+// It delegates to the shared table: this file used to carry a third copy, which
+// repeated the off-by-one at qPi 34 that the other two had.
 func chromaQPFromLuma(qpY int) int {
 	if qpY < 0 {
 		return qpY
 	}
-	if qpY >= 52 {
-		return qpY - 6
-	}
-	return chromaQPTable[qpY]
+	return transform.ChromaQPFromLumaQP(qpY)
 }
 
 // filterLumaEdge filters one 4-sample luma edge.
@@ -273,8 +266,13 @@ func filterLumaEdge(f *frame.Frame, px, py int, vertical bool, beta, tC int) {
 
 	// Combined strong filter decision for all 4 lines (matching FFmpeg/spec).
 	// Strong filter requires conditions to pass for BOTH line 0 and line 3.
-	d0 := dp0 + dq0
-	d3 := dp3 + dq3
+	//
+	// Spec 8.7.2.5.6 tests dpq < (beta >> 2) where dpq is 2*(dp+dq), not
+	// (dp+dq): dropping the factor makes the test twice as permissive, so the
+	// bilinear strong filter is chosen where the normal one belongs. That is a
+	// one- or two-level error on the samples either side of such an edge.
+	d0 := 2 * (dp0 + dq0)
+	d3 := 2 * (dp3 + dq3)
 	useStrong := false
 	if d0 < (beta>>2) && d3 < (beta>>2) {
 		if abs(p[0][3]-p[0][0])+abs(q[0][0]-q[0][3]) < (beta>>3) &&
@@ -385,7 +383,12 @@ func filterChromaEdge(f *frame.Frame, comp, cx, cy int, vertical bool, tC int) {
 		plane = f.Cr
 	}
 
-	for k := range 4 {
+	// Two chroma samples per call, not four: the caller walks the 4x4 luma grid,
+	// so consecutive calls are only 2 chroma samples apart. Filtering four would
+	// process every chroma line twice, the second time from already-filtered
+	// samples. On flat content the filter is a no-op, which is why this stayed
+	// hidden until real content was decoded.
+	for k := range 2 {
 		var p0x, p0y, p1x, p1y, q0x, q0y, q1x, q1y int
 		if vertical {
 			p1x = cx - 2

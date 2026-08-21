@@ -26,8 +26,14 @@ type CodingUnit struct {
 
 // TransformUnit holds decoded residual coefficients for one TU.
 type TransformUnit struct {
-	X0, Y0            int
-	Log2TrSize        int
+	X0, Y0     int
+	Log2TrSize int
+	// ChromaX0, ChromaY0 give the luma position the chroma block covers, which
+	// differs from X0, Y0 for 4x4 luma TBs: there one chroma block spans the
+	// whole 8x8 group and is carried by the last of the four TUs.
+	ChromaX0, ChromaY0 int
+	// HasChroma is false for the TUs of a 4x4 group that carry no chroma block.
+	HasChroma         bool
 	CbfLuma           bool
 	CbfCb             bool
 	CbfCr             bool
@@ -79,10 +85,104 @@ type Params struct {
 	EntryPoints []int
 }
 
-// qpState tracks mutable QP state across the quantization group.
+// qpState tracks the QP prediction state of spec 8.6.1.
+//
+// A quantization group is the area sharing one cu_qp_delta. When it is the whole
+// CTB (diff_cu_qp_delta_depth 0) the predicted QP is simply the last QP decoded,
+// which a single running value models fine. When the group is smaller — x265
+// defaults to a 32x32 group with a 64x64 CTB, so most rate-controlled encodes —
+// the prediction averages the QPs of the blocks left of and above the group's
+// origin, and only falls back to the previous group's QP where those are
+// unavailable or in another CTB. Without that, decoded QPs drift, and drift far
+// enough to go negative.
 type qpState struct {
-	currentQP        int  // current QP (starts at sliceQPY)
-	isCuQpDeltaCoded bool // whether cu_qp_delta has been decoded for current QG
+	currentQP        int  // QP of the CU last decoded
+	isCuQpDeltaCoded bool // whether cu_qp_delta has been decoded for this group
+	qpYPrev          int  // QP of the last CU of the previous group
+	qpYPred          int  // predicted QP for the current group
+	// Quantization group origin, in luma samples.
+	xQg, yQg int
+	// qpMap holds the QP of every decoded block at minCb granularity, so the
+	// left and above neighbours of a group origin can be looked up.
+	qpMap      []int
+	qpMapMinCb int
+	qpMapWidth int
+}
+
+// newQpState prepares the QP prediction state for one slice.
+func newQpState(sliceQPY, picW, picH, minCbSize int) *qpState {
+	w := (picW + minCbSize - 1) / minCbSize
+	h := (picH + minCbSize - 1) / minCbSize
+	m := make([]int, w*h)
+	for i := range m {
+		m[i] = -1 // not yet decoded
+	}
+	return &qpState{
+		currentQP:  sliceQPY,
+		qpYPrev:    sliceQPY,
+		qpYPred:    sliceQPY,
+		qpMap:      m,
+		qpMapMinCb: minCbSize,
+		qpMapWidth: w,
+	}
+}
+
+// qpAt returns the QP of the decoded block covering (x, y), or -1.
+func (q *qpState) qpAt(x, y int) int {
+	if x < 0 || y < 0 {
+		return -1
+	}
+	bx, by := x/q.qpMapMinCb, y/q.qpMapMinCb
+	if bx >= q.qpMapWidth || by*q.qpMapWidth+bx >= len(q.qpMap) {
+		return -1
+	}
+	return q.qpMap[by*q.qpMapWidth+bx]
+}
+
+// setQP records a CU's QP over its area.
+func (q *qpState) setQP(x0, y0, size, qp int) {
+	h := len(q.qpMap) / q.qpMapWidth
+	for y := y0 / q.qpMapMinCb; y < (y0+size)/q.qpMapMinCb; y++ {
+		if y < 0 || y >= h {
+			continue
+		}
+		for x := x0 / q.qpMapMinCb; x < (x0+size)/q.qpMapMinCb; x++ {
+			if x < 0 || x >= q.qpMapWidth {
+				continue
+			}
+			q.qpMap[y*q.qpMapWidth+x] = qp
+		}
+	}
+}
+
+// startQuantizationGroup applies spec 8.6.1 at the start of a group: the
+// prediction averages the blocks left of and above the origin, each falling back
+// to the previous group's QP when it is unavailable or lies in another CTB.
+func (q *qpState) startQuantizationGroup(xQg, yQg, log2CtbSize int) {
+	q.isCuQpDeltaCoded = false
+	q.qpYPrev = q.currentQP
+	q.xQg, q.yQg = xQg, yQg
+
+	ctbMask := ^((1 << log2CtbSize) - 1)
+	sameCtb := func(x, y int) bool {
+		return x >= 0 && y >= 0 &&
+			x&ctbMask == xQg&ctbMask && y&ctbMask == yQg&ctbMask
+	}
+
+	qpA := q.qpYPrev
+	if sameCtb(xQg-1, yQg) {
+		if v := q.qpAt(xQg-1, yQg); v >= 0 {
+			qpA = v
+		}
+	}
+	qpB := q.qpYPrev
+	if sameCtb(xQg, yQg-1) {
+		if v := q.qpAt(xQg, yQg-1); v >= 0 {
+			qpB = v
+		}
+	}
+	q.qpYPred = (qpA + qpB + 1) >> 1
+	q.currentQP = q.qpYPred
 }
 
 // DecodeSliceData decodes the slice data segment using CABAC.
@@ -99,7 +199,7 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 	numCTUs := ctbsX * ctbsY
 	sd.SaoParams = make([]SaoParams, numCTUs)
 
-	qps := &qpState{currentQP: p.SliceQPY}
+	qps := newQpState(p.SliceQPY, p.PicWidth, p.PicHeight, 1<<p.Log2MinCbSize)
 
 	// Wavefront parallel processing splits the slice data into one substream per
 	// CTU row. Each substream restarts the arithmetic decoding engine at its
@@ -142,6 +242,8 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 				ctxModels = context.InitModels(p.SliceType, p.SliceQPY)
 			}
 			qps.currentQP = p.SliceQPY
+			qps.qpYPrev = p.SliceQPY
+			qps.qpYPred = p.SliceQPY
 			qps.isCuQpDeltaCoded = false
 		}
 
@@ -316,9 +418,9 @@ func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	modeMap *intraModeMap, depthMap *cuDepthMap, qps *qpState,
 ) ([]CodingUnit, error) {
 
-	// QG boundary reset per HEVC spec 7.3.8.4: at start of coding_quadtree
+	// Quantization group boundary, spec 7.3.8.4.
 	if p.CuQpDeltaEnabled && log2CbSize >= p.Log2MinCuQpDeltaSize {
-		qps.isCuQpDeltaCoded = false
+		qps.startQuantizationGroup(x0, y0, p.Log2CtbSize)
 	}
 
 	// Spec 7.3.8.4: split_cu_flag is only coded when the CU lies entirely inside
@@ -440,6 +542,7 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 			// Store mode in map (use DC as placeholder for intra mode map)
 			modeMap.set(x0, y0, cbSize, 1)
 			cu.QpY = qps.currentQP
+			qps.setQP(x0, y0, cbSize, cu.QpY)
 			return cu, nil
 		}
 	}
@@ -543,12 +646,13 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 	// Decode transform tree
 	tus, err := decodeTransformTree(dec, ctx, x0, y0, x0, y0, log2CbSize, log2CbSize,
 		0, cbSize, true, true, p, cu.IntraLumaMode, cu.IntraChromaMode, x0, y0, qps,
-		intraSplitFlag)
+		intraSplitFlag, 0)
 	if err != nil {
 		return cu, err
 	}
 	cu.TransformUnits = tus
 	cu.QpY = qps.currentQP
+	qps.setQP(x0, y0, cbSize, cu.QpY)
 
 	return cu, nil
 }
@@ -558,7 +662,7 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	x0, y0, xBase, yBase int, log2TrafoSize, log2CbSize int,
 	trafoDepth, cbSize int, cbfCb, cbfCr bool, p *Params,
 	lumaIntraModes [4]int, intraChromaMode int, cuX0, cuY0 int, qps *qpState,
-	intraSplitFlag bool) ([]TransformUnit, error) {
+	intraSplitFlag bool, blkIdx int) ([]TransformUnit, error) {
 
 	log2MaxTrafoSize := p.Log2MaxTrafoSize
 	log2MinTrafoSize := p.Log2MinTrafoSize
@@ -605,11 +709,11 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 			{x0 + halfSize, y0 + halfSize},
 		}
 
-		for _, pos := range positions {
+		for childIdx, pos := range positions {
 			tus, err := decodeTransformTree(dec, ctx, pos[0], pos[1], x0, y0,
 				newLog2TrafoSize, log2CbSize, trafoDepth+1, cbSize,
 				cbfCb, cbfCr, p, lumaIntraModes, intraChromaMode, cuX0, cuY0, qps,
-				intraSplitFlag)
+				intraSplitFlag, childIdx)
 			if err != nil {
 				return nil, err
 			}
@@ -638,7 +742,9 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	// Decode cu_qp_delta if enabled and not yet coded for this QG
 	if p.CuQpDeltaEnabled && !qps.isCuQpDeltaCoded && (tu.CbfLuma || cbfCb || cbfCr) {
 		delta := decodeCuQpDelta(dec, ctx)
-		qps.currentQP = clip3(-12, 51, qps.currentQP+delta)
+		// QpY = ( ( qPY_PRED + CuQpDeltaVal + 52 ) % 52 ) for 8-bit, which wraps
+		// rather than clamping.
+		qps.currentQP = ((qps.qpYPred+delta+52)%52 + 52) % 52
 		qps.isCuQpDeltaCoded = true
 	}
 
@@ -688,9 +794,18 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	}
 	chromaTrSize := 1 << chromaLog2TrSize
 
-	// For 4:2:0, chroma residuals at log2TrafoSize==2 are only present
-	// for the TU at the base position (top-left of the 8x8 group)
-	parseChroma := log2TrafoSize > 2 || (x0 == xBase && y0 == yBase)
+	// Spec 7.3.8.10: with 4x4 luma transform blocks the chroma residual covers
+	// the whole 8x8 group and is coded once, at blkIdx 3 — the LAST of the four
+	// children, not the first — for the area at (xBase, yBase). Reading it at
+	// the first child consumes those bins several blocks too early and
+	// desynchronises everything after. Only 4x4 luma TBs reach this, which no
+	// flat-colour generator produces, so it took real encoder output to show.
+	parseChroma := log2TrafoSize > 2 || blkIdx == 3
+	tu.ChromaX0, tu.ChromaY0 = x0, y0
+	if log2TrafoSize == 2 {
+		tu.ChromaX0, tu.ChromaY0 = xBase, yBase
+	}
+	tu.HasChroma = parseChroma
 
 	// Chroma prediction mode (IntraPredModeC, spec 8.4.3): mode 4 is DM
 	// (derived from luma), and an explicit mode that collides with the luma
@@ -1160,32 +1275,22 @@ func decodeCuQpDelta(dec *cabac.Decoder, ctx []cabac.CtxState) int {
 	return abs
 }
 
-func clip3(lo, hi, val int) int {
-	if val < lo {
-		return lo
-	}
-	if val > hi {
-		return hi
-	}
-	return val
-}
-
 // GetSigCtxInc returns the context index for sig_coeff_flag.
 // Based on HEVC spec 9.3.4.2.6.
 // prevCsbf = csbfRight + 2*csbfBelow (coded_sub_block_flag of right and below neighbors).
 func GetSigCtxInc(cx, cy, log2TrafoSize int, isLuma bool, sbX, sbY, scanIdx, prevCsbf int) int {
 	if log2TrafoSize == 2 {
-		// 4x4 transform: use Table 9-39 context mapping
-		ctxIdxMaps := [3][16]int{
-			{0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8}, // diagonal
-			{0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8}, // horizontal
-			{0, 2, 6, 7, 1, 3, 6, 7, 4, 4, 8, 8, 5, 5, 8, 8}, // vertical
-		}
-		blkPos := cy*4 + cx
+		// 4x4 transform block: spec 9.3.4.2.5 uses one position map, Table 9-42.
+		// It does not depend on the scan: a scan-dependent variant picks the
+		// wrong context for vertically scanned blocks, and while the decoded
+		// bins often still come out right, the arithmetic decoder's state
+		// diverges and every later bin in the slice is affected.
+		ctxIdxMap := [16]int{0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8}
+		sigCtx := ctxIdxMap[cy*4+cx]
 		if isLuma {
-			return ctxIdxMaps[scanIdx][blkPos]
+			return sigCtx
 		}
-		return ctxIdxMaps[scanIdx][blkPos] + 27
+		return sigCtx + 27
 	}
 
 	// For larger blocks (8x8+), per HEVC spec 9.3.4.2.6
