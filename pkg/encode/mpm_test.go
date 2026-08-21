@@ -9,12 +9,16 @@ import "testing"
 func TestDeriveMPMCTBBoundary(t *testing.T) {
 	const dc = 1
 
+	// coded is a block already coded before the one under test: its pixel
+	// origin, size and intra mode.
+	type coded struct {
+		x, y, size, mode int
+	}
 	cases := []struct {
 		name        string
 		x0, y0      int
-		cuSize      int
 		log2CtbSize int
-		modeMap     map[[2]int]int
+		before      []coded
 		want        [3]int
 	}{
 		{
@@ -24,9 +28,8 @@ func TestDeriveMPMCTBBoundary(t *testing.T) {
 			name:        "above outside CTB is ignored",
 			x0:          0,
 			y0:          16,
-			cuSize:      16,
 			log2CtbSize: 4,
-			modeMap:     map[[2]int]int{{0, 0}: 26},
+			before:      []coded{{0, 0, 16, 26}},
 			want:        [3]int{0, dc, 26},
 		},
 		{
@@ -35,9 +38,8 @@ func TestDeriveMPMCTBBoundary(t *testing.T) {
 			name:        "above inside CTB is used",
 			x0:          0,
 			y0:          16,
-			cuSize:      16,
 			log2CtbSize: 5,
-			modeMap:     map[[2]int]int{{0, 0}: 26},
+			before:      []coded{{0, 0, 16, 26}},
 			want:        [3]int{dc, 26, 0},
 		},
 		{
@@ -47,16 +49,33 @@ func TestDeriveMPMCTBBoundary(t *testing.T) {
 			name:        "left kept while above is replaced",
 			x0:          16,
 			y0:          16,
-			cuSize:      16,
 			log2CtbSize: 4,
-			modeMap:     map[[2]int]int{{1, 0}: 26, {0, 1}: 10},
+			before:      []coded{{16, 0, 16, 26}, {0, 16, 16, 10}},
 			want:        [3]int{10, dc, 0},
+		},
+		{
+			// Mixed CU sizes, which a partial bottom CTU row produces: an 8x8 CU
+			// at (8,24) whose left neighbour is another 8x8 CU inside the same
+			// CTB. Addressing by pixel picks up that 8x8 CU's mode 10; keying by
+			// CU index would have divided 8 by the wrong size and looked
+			// somewhere else entirely. The above candidate at y=23 is in the same
+			// CTB (which spans y 16..31), so it is used rather than forced to DC.
+			name:        "mixed CU sizes resolve by pixel",
+			x0:          8,
+			y0:          24,
+			log2CtbSize: 4,
+			before:      []coded{{0, 16, 16, 26}, {0, 24, 8, 10}},
+			want:        [3]int{10, 26, 0},
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := deriveMPM(c.x0, c.y0, c.cuSize, 64, c.log2CtbSize, c.modeMap)
+			modes := newIntraModes()
+			for _, b := range c.before {
+				modes.set(b.x, b.y, b.size, b.mode)
+			}
+			got := deriveMPM(c.x0, c.y0, c.log2CtbSize, modes)
 			if got != c.want {
 				t.Errorf("deriveMPM = %v, want %v", got, c.want)
 			}

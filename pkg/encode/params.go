@@ -85,17 +85,17 @@ func generateSPS(width, height int, cs yuv.ColorSpace, rng yuv.Range, use8x8CU b
 	w.WriteUE(0) // sps_max_num_reorder_pics = 0
 	w.WriteUE(0) // sps_max_latency_increase_plus1 = 0
 
-	// Coding and transform block sizes. MinTbLog2SizeY must stay strictly below
-	// MinCbLog2SizeY, so the 4x4 minimum transform block works for both.
+	// Coding and transform block sizes, from the one place that decides them.
+	// MinTbLog2SizeY must stay strictly below MinCbLog2SizeY, so the 4x4 minimum
+	// transform block works for both. The maximum transform block matches the
+	// largest CU the layout can produce.
+	lay := chooseCodingLayout(width, height, use8x8CU)
+	w.WriteUE(uint32(lay.log2MinCbSize - 3))               // log2_min_luma_coding_block_size_minus3
+	w.WriteUE(uint32(lay.log2CtuSize - lay.log2MinCbSize)) // log2_diff_max_min_luma_coding_block_size
+	w.WriteUE(0)                                           // log2_min_luma_transform_block_size_minus2 (minTbSize=4)
 	if use8x8CU {
-		w.WriteUE(0) // log2_min_luma_coding_block_size_minus3 = 0 (minCbSize=8)
-		w.WriteUE(1) // log2_diff_max_min_luma_coding_block_size = 1 (CTU=16)
-		w.WriteUE(0) // log2_min_luma_transform_block_size_minus2 = 0 (minTbSize=4)
 		w.WriteUE(1) // log2_diff_max_min_luma_transform_block_size = 1 (maxTbSize=8)
 	} else {
-		w.WriteUE(1) // log2_min_luma_coding_block_size_minus3 = 1 (minCbSize=16)
-		w.WriteUE(0) // log2_diff_max_min_luma_coding_block_size = 0 (CTU=16)
-		w.WriteUE(0) // log2_min_luma_transform_block_size_minus2 = 0 (minTbSize=4)
 		w.WriteUE(2) // log2_diff_max_min_luma_transform_block_size = 2 (maxTbSize=16)
 	}
 	w.WriteUE(0) // max_transform_hierarchy_depth_inter = 0

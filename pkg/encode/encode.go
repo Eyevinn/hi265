@@ -10,8 +10,8 @@ import (
 
 // EncodeParams holds parameters for HEVC encoding.
 type EncodeParams struct {
-	Width      int            // must be multiple of 16
-	Height     int            // must be multiple of 16
+	Width      int            // must be a multiple of 8
+	Height     int            // must be a multiple of 8
 	QP         int            // 0-51, default 26
 	Use8x8CU   bool           // code each 16x16 CTU as four 8x8 CUs
 	ColorSpace yuv.ColorSpace // default BT601
@@ -27,6 +27,9 @@ func (p EncodeParams) qp() int {
 
 // GenerateVPSSPSPPS returns Annex-B bytes containing VPS + SPS + PPS NALUs.
 func GenerateVPSSPSPPS(p EncodeParams) ([]byte, error) {
+	if err := validateFrameDimensions(p.Width, p.Height); err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
 	WriteNALU(&buf, naluVPS, generateVPS())
 	WriteNALU(&buf, naluSPS, generateSPS(p.Width, p.Height, p.ColorSpace, p.Range, p.Use8x8CU))
@@ -37,6 +40,9 @@ func GenerateVPSSPSPPS(p EncodeParams) ([]byte, error) {
 // GenerateIDR returns Annex-B bytes containing an IDR slice NALU.
 // The grid and colors define the per-CTU content (each grid cell is one 16x16 CTU).
 func GenerateIDR(p EncodeParams, grid *yuv.Grid, colors yuv.ColorMap) ([]byte, error) {
+	if err := validateFrameDimensions(p.Width, p.Height); err != nil {
+		return nil, err
+	}
 	f, err := yuv.BuildFrame(grid, colors)
 	if err != nil {
 		return nil, err
@@ -52,6 +58,9 @@ func GenerateIDR(p EncodeParams, grid *yuv.Grid, colors yuv.ColorMap) ([]byte, e
 // GeneratePSkip returns Annex-B bytes containing a P-skip slice NALU.
 // All CUs copy from the reference frame with zero motion.
 func GeneratePSkip(p EncodeParams, poc int) ([]byte, error) {
+	if err := validateFrameDimensions(p.Width, p.Height); err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
 	WriteNALU(&buf, naluTrailR, encodePSkipSlice(p.Width, p.Height, p.qp(), poc, p.Use8x8CU))
 	return buf.Bytes(), nil

@@ -1,6 +1,8 @@
 package encode
 
 import (
+	"fmt"
+
 	"github.com/Eyevinn/hi265/internal/cabac"
 	"github.com/Eyevinn/hi265/internal/context"
 	"github.com/Eyevinn/hi265/internal/pred"
@@ -9,6 +11,202 @@ import (
 	"github.com/Eyevinn/hi265/pkg/frame"
 	"github.com/Eyevinn/mp4ff/hevc"
 )
+
+// intraModes records the intra luma mode of coded blocks at 4x4 granularity,
+// mirroring the decoder's map. Keying by CU index instead would break as soon as
+// CUs of two sizes appear in one picture, which is exactly what a partial CTU
+// row at the bottom edge produces.
+type intraModes struct {
+	m map[[2]int]int
+}
+
+func newIntraModes() *intraModes {
+	return &intraModes{m: make(map[[2]int]int)}
+}
+
+func (t *intraModes) set(x0, y0, size, mode int) {
+	for y := y0; y < y0+size; y += 4 {
+		for x := x0; x < x0+size; x += 4 {
+			t.m[[2]int{x / 4, y / 4}] = mode
+		}
+	}
+}
+
+// get returns the mode covering pixel (x, y), or -1 when nothing was coded there.
+func (t *intraModes) get(x, y int) int {
+	if x < 0 || y < 0 {
+		return -1
+	}
+	if m, ok := t.m[[2]int{x / 4, y / 4}]; ok {
+		return m
+	}
+	return -1
+}
+
+// ctuSizeLuma is the coding tree block size the generator always uses.
+const ctuSizeLuma = 16
+
+// codingLayout is the coding block geometry chosen for a picture. It is derived
+// in exactly one place so the SPS and the slice data cannot disagree about it.
+type codingLayout struct {
+	ctuSize       int
+	minCbSize     int
+	log2CtuSize   int
+	log2MinCbSize int
+	// splitToMin means every CU that fits is split all the way to minCbSize,
+	// which is what 8x8 mode asks for. Boundary CUs split regardless.
+	splitToMin bool
+}
+
+// chooseCodingLayout picks the coding block sizes for a picture.
+//
+// pic_width_in_luma_samples and pic_height_in_luma_samples must each be an
+// integer multiple of MinCbSizeY, so a 16x16 minimum CB can only express
+// dimensions that are multiples of 16. Common heights are not — 360 and 1080
+// are both 8 mod 16 — so those pictures use a minimum CB of 8, which makes them
+// legal and costs one split_cu_flag per CTU. Dimensions that are multiples of 16
+// keep the 16x16 minimum, so their bitstreams are unchanged.
+func chooseCodingLayout(width, height int, use8x8CU bool) codingLayout {
+	minCb := 16
+	if use8x8CU || width%16 != 0 || height%16 != 0 {
+		minCb = 8
+	}
+	return codingLayout{
+		ctuSize:       ctuSizeLuma,
+		minCbSize:     minCb,
+		log2CtuSize:   ceilLog2(ctuSizeLuma),
+		log2MinCbSize: ceilLog2(minCb),
+		splitToMin:    use8x8CU,
+	}
+}
+
+// validateFrameDimensions reports whether a picture size can be coded at all.
+// The smallest legal MinCbSizeY is 8 and the picture dimensions must be a
+// multiple of it, so 8 is the granularity floor; 4:2:0 chroma needs even
+// dimensions anyway. Sizes that are neither would need a conformance window,
+// which the generator does not emit.
+func validateFrameDimensions(width, height int) error {
+	if width <= 0 || height <= 0 {
+		return fmt.Errorf("frame size %dx%d: width and height must be positive", width, height)
+	}
+	if width%8 != 0 || height%8 != 0 {
+		return fmt.Errorf("frame size %dx%d: width and height must be multiples of 8 "+
+			"(HEVC requires a multiple of the minimum coding block size, and 8 is the "+
+			"smallest one); nearest usable size is %dx%d",
+			width, height, roundUpTo8(width), roundUpTo8(height))
+	}
+	return nil
+}
+
+func roundUpTo8(v int) int {
+	if v <= 0 {
+		return 8
+	}
+	return (v + 7) / 8 * 8
+}
+
+// cuDepths records the quadtree depth of each coded CU at minCb granularity, so
+// split_cu_flag can be given the context the spec asks for.
+type cuDepths struct {
+	depths     []int
+	minCbSize  int
+	widthMinCb int
+}
+
+func newCuDepths(picW, picH, minCbSize int) *cuDepths {
+	w := (picW + minCbSize - 1) / minCbSize
+	h := (picH + minCbSize - 1) / minCbSize
+	d := make([]int, w*h)
+	for i := range d {
+		d[i] = -1
+	}
+	return &cuDepths{depths: d, minCbSize: minCbSize, widthMinCb: w}
+}
+
+func (m *cuDepths) set(x0, y0, cuSize, depth int) {
+	h := len(m.depths) / m.widthMinCb
+	for y := y0 / m.minCbSize; y < (y0+cuSize)/m.minCbSize; y++ {
+		if y < 0 || y >= h {
+			continue
+		}
+		for x := x0 / m.minCbSize; x < (x0+cuSize)/m.minCbSize; x++ {
+			if x < 0 || x >= m.widthMinCb {
+				continue
+			}
+			m.depths[y*m.widthMinCb+x] = depth
+		}
+	}
+}
+
+func (m *cuDepths) get(x, y int) int {
+	if x < 0 || y < 0 {
+		return -1
+	}
+	bx, by := x/m.minCbSize, y/m.minCbSize
+	if bx >= m.widthMinCb || by*m.widthMinCb+bx >= len(m.depths) {
+		return -1
+	}
+	return m.depths[by*m.widthMinCb+bx]
+}
+
+// splitCuCtxInc is ctxInc for split_cu_flag per spec 9.3.4.2.2: one for each of
+// the left and above neighbours that sits deeper in the quadtree than this CU.
+func splitCuCtxInc(depths *cuDepths, x0, y0, depth int) int {
+	ctxInc := 0
+	if d := depths.get(x0-1, y0); d >= 0 && d > depth {
+		ctxInc++
+	}
+	if d := depths.get(x0, y0-1); d >= 0 && d > depth {
+		ctxInc++
+	}
+	return ctxInc
+}
+
+// encodeCodingQuadtree walks one coding quadtree, writing split_cu_flag exactly
+// where spec 7.3.8.4 codes it and calling code for every CU a decoder will parse.
+//
+// The flag is only coded when the CU lies entirely inside the picture. A CU that
+// crosses the right or bottom edge is split with no flag at all, the split being
+// inferred as long as the size stays above MinCbSizeY, and the children that
+// fall wholly outside the picture are not coded either. That is what lets a
+// 16x16 CTU cover a height like 1080 or 360.
+func encodeCodingQuadtree(enc *cabac.Encoder, models []cabac.CtxState,
+	x0, y0, size, depth int, lay codingLayout, picW, picH int,
+	depths *cuDepths, code func(x0, y0, size int)) {
+
+	if x0 >= picW || y0 >= picH {
+		return // wholly outside the picture: nothing is coded
+	}
+
+	fits := x0+size <= picW && y0+size <= picH
+	canSplit := size > lay.minCbSize
+
+	if canSplit {
+		switch {
+		case !fits:
+			// Implicit split: no flag is coded.
+		case lay.splitToMin:
+			enc.EncodeDecision(1, &models[context.CtxSplitCuFlag+splitCuCtxInc(depths, x0, y0, depth)])
+		default:
+			enc.EncodeDecision(0, &models[context.CtxSplitCuFlag+splitCuCtxInc(depths, x0, y0, depth)])
+			depths.set(x0, y0, size, depth)
+			code(x0, y0, size)
+			return
+		}
+		half := size / 2
+		for _, off := range [4][2]int{{0, 0}, {half, 0}, {0, half}, {half, half}} {
+			encodeCodingQuadtree(enc, models, x0+off[0], y0+off[1], half, depth+1,
+				lay, picW, picH, depths, code)
+		}
+		return
+	}
+
+	// At minCbSize. validateFrameDimensions guarantees the picture is a multiple
+	// of minCbSize, so a CU this size always fits and every sample read below is
+	// inside the plane.
+	depths.set(x0, y0, size, depth)
+	code(x0, y0, size)
+}
 
 // idrSliceParams holds the parameters needed to write an IRAP (IDR or CRA)
 // slice header when using external SPS/PPS.
@@ -250,42 +448,25 @@ func encodeIDRSliceData(width, height, qp int, use8x8CU bool, y, cb, cr []uint8)
 	enc := cabac.NewEncoder()
 	models := context.InitModels(context.SliceTypeI, qp)
 
-	ctuSize := 16
+	lay := chooseCodingLayout(width, height, use8x8CU)
+	ctuSize := lay.ctuSize
 	numCTUx := (width + ctuSize - 1) / ctuSize
 	numCTUy := (height + ctuSize - 1) / ctuSize
 	totalCTUs := numCTUx * numCTUy
 
 	reconFrame := frame.NewFrame(width, height)
-	lumaModesMap := make(map[[2]int]int)
+	modes := newIntraModes()
+	depths := newCuDepths(width, height, lay.minCbSize)
 
 	ctuIdx := 0
 	for ctuY := 0; ctuY < height; ctuY += ctuSize {
 		for ctuX := 0; ctuX < width; ctuX += ctuSize {
-			if use8x8CU {
-				// split_cu_flag = 1 at depth 0. Context per spec 9.3.4.2.2:
-				// ctxInc = condL + condA, where each condition holds when the
-				// neighbouring CU is deeper than the current depth. Every CTU is
-				// split here, so an existing neighbour is always at depth 1 > 0.
-				ctxInc := 0
-				if ctuX > 0 {
-					ctxInc++
-				}
-				if ctuY > 0 {
-					ctxInc++
-				}
-				enc.EncodeDecision(1, &models[context.CtxSplitCuFlag+ctxInc])
-
-				// Four 8x8 CUs in z-order. No split_cu_flag at depth 1: the
-				// children are already at minCbSize.
-				half := ctuSize / 2
-				for _, off := range [4][2]int{{0, 0}, {half, 0}, {0, half}, {half, half}} {
-					encodeIDRCU(enc, models, ctuX+off[0], ctuY+off[1], half, ctuSize,
-						width, height, qp, y, cb, cr, reconFrame, lumaModesMap)
-				}
-			} else {
-				encodeIDRCU(enc, models, ctuX, ctuY, ctuSize, ctuSize, width, height, qp,
-					y, cb, cr, reconFrame, lumaModesMap)
-			}
+			encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
+				width, height, depths,
+				func(x0, y0, cuSize int) {
+					encodeIDRCU(enc, models, x0, y0, cuSize, ctuSize, lay.minCbSize,
+						width, height, qp, y, cb, cr, reconFrame, modes)
+				})
 
 			// end_of_slice_segment_flag
 			ctuIdx++
@@ -305,15 +486,18 @@ func encodeIDRSliceData(width, height, qp int, use8x8CU bool, y, cb, cr []uint8)
 // ctuSize is the CTU size (16), used for reference sample availability and for
 // the CTB boundary rule in the MPM derivation.
 func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
-	cuX, cuY, cuSize, ctuSize, width, height, qp int,
-	y, cb, cr []uint8, reconFrame *frame.Frame, lumaModesMap map[[2]int]int) {
+	cuX, cuY, cuSize, ctuSize, minCbSize, width, height, qp int,
+	y, cb, cr []uint8, reconFrame *frame.Frame, modes *intraModes) {
 
-	// split_cu_flag is written by the caller (the CU is at minCbSize here)
+	// split_cu_flag is written by the caller.
 	// No pred_mode_flag (I-slice, implicitly intra)
 
-	// part_mode: decoded when log2CbSize == log2MinCbSize
-	// bin=1 → 2Nx2N, bin=0 → NxN
-	enc.EncodeDecision(1, &models[context.CtxPartMode])
+	// part_mode is only coded at the minimum CB size (spec 7.3.8.5); above it,
+	// PART_2Nx2N is inferred. Writing it unconditionally desynchronises CABAC
+	// for a 16x16 CU in a picture whose minimum CB is 8.
+	if cuSize == minCbSize {
+		enc.EncodeDecision(1, &models[context.CtxPartMode]) // part_mode = 2Nx2N
+	}
 
 	// Choose the best intra prediction mode for this flat-color block.
 	// For a flat block, vertical (26) or horizontal (10) can produce zero
@@ -322,7 +506,7 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 	// edge filtering at color boundaries.
 	lumaMode := chooseBestLumaMode(reconFrame, cuX, cuY, cuSize, width, y)
 
-	mpm := deriveMPM(cuX, cuY, cuSize, width, ceilLog2(ctuSize), lumaModesMap)
+	mpm := deriveMPM(cuX, cuY, ceilLog2(ctuSize), modes)
 
 	// Encode intra luma mode
 	mpmIdx := -1
@@ -356,7 +540,7 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 			enc.EncodeBypass(uint8((rem >> k) & 1))
 		}
 	}
-	lumaModesMap[[2]int{cuX / cuSize, cuY / cuSize}] = lumaMode
+	modes.set(cuX, cuY, cuSize, lumaMode)
 
 	// intra_chroma_pred_mode = 4 (DM mode)
 	// First bin = 0 means "use DM mode"
@@ -435,22 +619,12 @@ func encBool(enc *cabac.Encoder, ctx *cabac.CtxState, val bool) {
 // INTRA_DC whenever y0-1 falls outside the current CTB. Omitting that rule
 // keeps encoder and decoder self-consistent but makes the bitstream decode
 // differently in every conforming decoder.
-func deriveMPM(x0, y0, cuSize, picWidth, log2CtbSize int, modeMap map[[2]int]int) [3]int {
-	cuX := x0 / cuSize
-	cuY := y0 / cuSize
-
-	leftMode := -1
-	if x0 > 0 {
-		if m, ok := modeMap[[2]int{cuX - 1, cuY}]; ok {
-			leftMode = m
-		}
-	}
+func deriveMPM(x0, y0, log2CtbSize int, modes *intraModes) [3]int {
+	leftMode := modes.get(x0-1, y0)
 
 	aboveMode := -1
-	if y0 > 0 && y0-1 >= (y0>>log2CtbSize)<<log2CtbSize {
-		if m, ok := modeMap[[2]int{cuX, cuY - 1}]; ok {
-			aboveMode = m
-		}
+	if y0-1 >= (y0>>log2CtbSize)<<log2CtbSize {
+		aboveMode = modes.get(x0, y0-1)
 	}
 
 	// HEVC spec 8.4.2
@@ -848,12 +1022,9 @@ type pSkipSliceParams struct {
 // one 16x16 skip CU per CTU either way; with minCb=8 that needs an explicit
 // split_cu_flag = 0 at depth 0.
 func encodePSkipSlice(width, height, qp, poc int, use8x8CU bool) []byte {
-	log2MinCbMinus3 := 1 // minCb=16
-	log2Diff := 0        // CTU=16
-	if use8x8CU {
-		log2MinCbMinus3 = 0 // minCb=8
-		log2Diff = 1        // CTU=16
-	}
+	lay := chooseCodingLayout(width, height, use8x8CU)
+	log2MinCbMinus3 := lay.log2MinCbSize - 3
+	log2Diff := lay.log2CtuSize - lay.log2MinCbSize
 	return encodePSkipSliceWithParams(pSkipSliceParams{
 		width:                             width,
 		height:                            height,
@@ -967,34 +1138,35 @@ func encodePSkipSliceData(width, height, qp, ctuSize, log2MinCbSize int) []byte 
 	numCTUy := (height + ctuSize - 1) / ctuSize
 	totalCTUs := numCTUx * numCTUy
 
-	log2CtuSize := 0
-	for s := ctuSize; s > 1; s >>= 1 {
-		log2CtuSize++
+	// The layout comes from the SPS the caller is matching, not from
+	// chooseCodingLayout: an external SPS may use any minimum CB size.
+	lay := codingLayout{
+		ctuSize:       ctuSize,
+		minCbSize:     1 << log2MinCbSize,
+		log2CtuSize:   ceilLog2(ctuSize),
+		log2MinCbSize: log2MinCbSize,
 	}
+	depths := newCuDepths(width, height, lay.minCbSize)
 
 	ctuIdx := 0
 	for ctuY := 0; ctuY < height; ctuY += ctuSize {
 		for ctuX := 0; ctuX < width; ctuX += ctuSize {
-			// Write split_cu_flag=0 when CTU > minCB to signal no quadtree split.
-			// Context for split_cu_flag: ctxInc = condL + condA.
-			// For all-skip with no splits, neighbor depths are always 0 (CTU level),
-			// same as current depth, so condL=condA=0, ctxInc=0.
-			if log2CtuSize > log2MinCbSize {
-				enc.EncodeDecision(0, &models[context.CtxSplitCuFlag]) // split_cu_flag = 0
-			}
-
-			// cu_skip_flag = 1
-			// Context: ctxInc from left + above skip CU availability
-			ctxInc := 0
-			if ctuX > 0 {
-				ctxInc++ // left available and is skip
-			}
-			if ctuY > 0 {
-				ctxInc++ // above available and is skip
-			}
-			enc.EncodeDecision(1, &models[context.CtxCuSkipFlag+ctxInc])
-
-			// merge_idx = 0: when maxMergeCand=1, no bins coded
+			encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
+				width, height, depths,
+				func(x0, y0, _ int) {
+					// cu_skip_flag = 1. ctxInc counts the left and above
+					// neighbours that are skipped; every coded CU here is, so
+					// availability alone decides it.
+					ctxInc := 0
+					if x0 > 0 {
+						ctxInc++
+					}
+					if y0 > 0 {
+						ctxInc++
+					}
+					enc.EncodeDecision(1, &models[context.CtxCuSkipFlag+ctxInc])
+					// merge_idx = 0: when maxMergeCand=1, no bins coded
+				})
 
 			// end_of_slice_segment_flag
 			ctuIdx++

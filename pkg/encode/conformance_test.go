@@ -465,6 +465,29 @@ func conformanceCases() []conformanceCase {
 			name: "tiles_qp40", width: 192, height: 96, qp: 40, frames: 1,
 			pattern: patTiles, maxPatternDelta: 12, maxPatternMean: 2.0,
 		},
+		// Frame sizes that are not a multiple of the 16x16 CTU. The bottom CTU
+		// row is partial, so those CTUs are split without a coded
+		// split_cu_flag (spec 7.3.8.4) and the picture uses a minimum CB of 8.
+		// These sizes used to panic the encoder outright, and 360 and 1080 are
+		// two of the most common heights in use.
+		{
+			name: "partial_ctu_row_128x72", width: 128, height: 72, qp: 26, frames: 1,
+			pattern: patSMPTE, maxPatternDelta: 4, maxPatternMean: 0.5,
+		},
+		{
+			name: "partial_ctu_row_320x232", width: 320, height: 232, qp: 26, frames: 1,
+			pattern: patTiles, maxPatternDelta: 4, maxPatternMean: 0.5,
+		},
+		{
+			name: "partial_ctu_row_640x360", width: 640, height: 360, qp: 30, frames: 1,
+			pattern: patSMPTE, maxPatternDelta: 8, maxPatternMean: 1.0,
+		},
+		// Partial CTU row plus P-skip: the skip path has to split at the
+		// boundary too, and every appended picture must still be an exact copy.
+		{
+			name: "partial_ctu_row_pskip", width: 320, height: 168, qp: 26, frames: 3,
+			idrInterval: 3, pattern: patSMPTE, maxPatternDelta: 4, maxPatternMean: 0.5,
+		},
 		// P-skip structure: IDR, then P-skip frames that must reproduce the
 		// reference picture exactly in both decoders.
 		{

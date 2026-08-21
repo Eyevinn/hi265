@@ -248,8 +248,20 @@ func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 		qps.isCuQpDeltaCoded = false
 	}
 
+	// Spec 7.3.8.4: split_cu_flag is only coded when the CU lies entirely inside
+	// the picture. A CU that crosses the right or bottom edge is split without a
+	// flag, inferred as 1 for as long as the size stays above MinCbLog2SizeY.
+	// This is what makes heights like 360 and 1080 codable with a 16x16 CTU.
+	cbSize := 1 << log2CbSize
+	fits := x0+cbSize <= p.PicWidth && y0+cbSize <= p.PicHeight
+
 	split := false
-	if log2CbSize > p.Log2MinCbSize {
+	switch {
+	case log2CbSize <= p.Log2MinCbSize:
+		// At the minimum CB size there is nothing left to split.
+	case !fits:
+		split = true
+	default:
 		// Determine context for split_cu_flag per HEVC spec 9.3.4.2.2 Table 9-37
 		ctxInc := 0
 		// condL: left neighbor at (x0-1, y0) has depth > current depth
@@ -293,8 +305,7 @@ func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	}
 
 	// Store CU depth in map
-	cuSize := 1 << log2CbSize
-	depthMap.set(x0, y0, cuSize, depth)
+	depthMap.set(x0, y0, cbSize, depth)
 
 	// Decode coding unit
 	cu, err := decodeCodingUnit(dec, ctx, x0, y0, log2CbSize, p, modeMap, qps)
@@ -1284,10 +1295,19 @@ func newCuDepthMap(picW, picH, minCbSize int) *cuDepthMap {
 	return &cuDepthMap{depths: depths, minCbSize: minCbSize, widthMinCb: w}
 }
 
-// set stores the depth for all minCb blocks covered by the CU at (x0,y0) of given size.
+// set stores the depth for all minCb blocks covered by the CU at (x0,y0) of given
+// size. Writes outside the map are dropped rather than panicking, so a malformed
+// stream cannot take the decoder down.
 func (m *cuDepthMap) set(x0, y0, cuSize, depth int) {
+	heightMinCb := len(m.depths) / m.widthMinCb
 	for y := y0 / m.minCbSize; y < (y0+cuSize)/m.minCbSize; y++ {
+		if y < 0 || y >= heightMinCb {
+			continue
+		}
 		for x := x0 / m.minCbSize; x < (x0+cuSize)/m.minCbSize; x++ {
+			if x < 0 || x >= m.widthMinCb {
+				continue
+			}
 			m.depths[y*m.widthMinCb+x] = depth
 		}
 	}
@@ -1320,8 +1340,15 @@ func newIntraModeMap(picW, picH int) *intraModeMap {
 
 // set stores a mode for all 4x4 blocks within the PU at (x0, y0) of given size.
 func (m *intraModeMap) set(x0, y0, puSize, mode int) {
+	height4 := len(m.modes) / m.width4
 	for y := y0 / 4; y < (y0+puSize)/4; y++ {
+		if y < 0 || y >= height4 {
+			continue
+		}
 		for x := x0 / 4; x < (x0+puSize)/4; x++ {
+			if x < 0 || x >= m.width4 {
+				continue
+			}
 			m.modes[y*m.width4+x] = mode
 		}
 	}
