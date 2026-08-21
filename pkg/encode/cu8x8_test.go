@@ -353,3 +353,66 @@ func TestSPSBlockSizes(t *testing.T) {
 		})
 	}
 }
+
+// TestEncodeIDRFromSPSPPS8x8 covers the external parameter set path: when the
+// caller's SPS says minCbSize 8, the IDR slice must split every CTU, which
+// idrSliceParamsFromSPSPPS derives from the SPS alone.
+func TestEncodeIDRFromSPSPPS8x8(t *testing.T) {
+	p := EncodeParams{Width: 32, Height: 32, QP: 26, Use8x8CU: true}
+	ps, err := GenerateVPSSPSPPS(p)
+	if err != nil {
+		t.Fatalf("GenerateVPSSPSPPS: %v", err)
+	}
+
+	spsMap := make(map[uint32]*hevc.SPS)
+	var sps *hevc.SPS
+	var pps *hevc.PPS
+	for _, nalu := range avc.ExtractNalusFromByteStream(ps) {
+		if len(nalu) < 2 {
+			continue
+		}
+		switch hevc.GetNaluType(nalu[0]) {
+		case hevc.NALU_SPS:
+			sps, err = hevc.ParseSPSNALUnit(nalu)
+			if err != nil {
+				t.Fatalf("ParseSPSNALUnit: %v", err)
+			}
+			spsMap[uint32(sps.SpsID)] = sps
+		case hevc.NALU_PPS:
+			pps, err = hevc.ParsePPSNALUnit(nalu, spsMap)
+			if err != nil {
+				t.Fatalf("ParsePPSNALUnit: %v", err)
+			}
+		}
+	}
+	if sps == nil || pps == nil {
+		t.Fatal("failed to parse SPS/PPS from generated parameter sets")
+	}
+
+	grid, err := yuv.ParseGrid("AB,CD")
+	if err != nil {
+		t.Fatalf("ParseGrid: %v", err)
+	}
+	idr, err := EncodeIDRSliceFromSPSPPS(sps, pps, grid, quadrantColors)
+	if err != nil {
+		t.Fatalf("EncodeIDRSliceFromSPSPPS: %v", err)
+	}
+	stream := append(append([]byte{}, ps...), idr...)
+
+	ff := cuFFmpegDecode(t, stream)
+	own := cuHi265Decode(t, stream, 1)
+	if !bytes.Equal(ff, own) {
+		mean, maxDiff := cuPlaneDiff(t, own, ff)
+		t.Fatalf("hi265dec and FFmpeg disagree: mean=%.3f max=%d", mean, maxDiff)
+	}
+
+	f, err := yuv.BuildFrame(grid, quadrantColors)
+	if err != nil {
+		t.Fatalf("BuildFrame: %v", err)
+	}
+	mean, maxDiff := cuPlaneDiff(t, own, cuIntendedYUV(f.Y, f.Cb, f.Cr))
+	t.Logf("external SPS/PPS 8x8 vs intended pattern: mean=%.3f max=%d", mean, maxDiff)
+	if maxDiff > 12 {
+		t.Errorf("max error %d vs intended pattern is too large", maxDiff)
+	}
+}
