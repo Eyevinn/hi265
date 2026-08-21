@@ -245,32 +245,63 @@ stays as the prediction reference. On x265 colour bars this took 640x360 from
 30723 differing samples (max 196) to 1112 (max 3), and 1920x1080 from 99760
 (max 197) to 3336 (max 12) — the remainder being 0.10.
 
-### 0.10 Real-world content decoding is not yet bit-exact (L) — **open**
+### 0.10 Real-world content decoding (L) — **fixed**
 
-With 0.6 and 0.7 fixed, x265-coded natural content is much closer but still not
-exact. Measured on 128x64 single-frame x265 output (`--no-wpp --no-sao
---no-deblock --no-signhide --ctu 16`), FFmpeg vs `hi265dec`:
+x265 output was not bit-exact, and got worse with detail and scale: a 720p
+`testsrc2` frame at x265's defaults had 1379837 of 1382400 samples differing at
+max 245, and rate-controlled streams panicked on a negative QP. Six defects plus
+one missing derivation, none of them visible to the existing tests — the
+generator emits flat colours, three intra modes and one transform size, while a
+real encoder uses everything.
 
-| content | QP | samples differing | max delta | before 0.6/0.7 |
-|---|---|---|---|---|
-| `gradients` | 26 | 29 / 12288 | 1 | max 3–4 |
-| `gradients` | 34 | 841 / 12288 | 3 | max 3–4 |
-| `testsrc2` | 26 | 1624 / 12288 | 18 | max 39–55 |
-| `testsrc2` | 34 | 1011 / 12288 | 17 | max 39–55 |
+1. **Chroma reference samples were filtered.** Spec 8.4.4.2.3 invokes the
+   smoothing filter for luma only (or 4:4:4 chroma, unsupported here). The
+   DC/horizontal/vertical modes a flat-colour generator picks are exempt either
+   way, so only planar and diagonal chroma showed it.
+2. **The chroma residual of a 4x4 luma group was parsed at the first transform
+   unit.** Spec 7.3.8.10 codes it at `blkIdx == 3`, the last one, for the area at
+   (xBase, yBase). Only 4x4 luma TBs reach this path, which the generator never
+   produces.
+3. **The 4x4 `sig_coeff_flag` context map was indexed by scan order.** Spec
+   9.3.4.2.5 has one position map (Table 9-42) with no scan dependence. The
+   decoded bins often still came out right and only the arithmetic decoder's
+   state diverged, so the damage appeared bins later — the hardest of the six to
+   localise.
+4. **`IntraPredModeC` came from the transform block's own PU.** Spec 8.4.3
+   derives it from `IntraPredModeY` at the CU's top-left; with an NxN partition
+   the four luma PUs share one chroma block. Every quadrant but the first got the
+   wrong mode, including modes the chroma syntax cannot express — 23 from a table
+   of {0, 26, 10, 1} was the giveaway.
+5. **Chroma deblocking filtered four samples per call** while the caller walked
+   the 4x4 luma grid, two chroma samples apart, so every chroma line was filtered
+   twice — the second time from already-filtered input.
+6. **The luma strong/normal filter decision** tested `(dp+dq) < beta >> 2` where
+   spec 8.7.2.5.6 tests `2*(dp+dq)`, choosing the bilinear filter where the
+   normal one belongs.
 
-So a residual or prediction path still diverges on busy content. This is the
-decoder's core job, so it deserves its own phase; the conformance harness plus
-x265 is the tool for bisecting it. P frames with real motion are far off
-(max > 200), as expected — only zero-motion skip is implemented.
+And the **QP prediction of spec 8.6.1**, which was a single running value. That
+models a quantization group equal to the CTB but not a smaller one, where the
+prediction averages the QPs left of and above the group origin and falls back to
+the previous group only where those are unavailable or in another CTB. x265
+defaults to a 32x32 group with a 64x64 CTB, so every rate-controlled encode
+drifted — far enough to derive a negative QP and panic.
 
-It gets worse with scale and detail. A 1280x720 `testsrc2` frame at x265's
-defaults desynchronises outright (1379837 of 1382400 samples differ, max 245),
-and `testdata/hevc_1idr_1p.mp4` — a real 720p encode — desynchronises far enough
-to derive a negative QP and panic in `Dequantize`. Flat content at the same
-settings and size is bit-exact, so the fault is in coding busy residual, not in
-the picture geometry or the WPP plumbing. Two things to do regardless of the
-root cause: never let a decode panic on input (clamp the QP and return an
-error), and bisect with the smallest divergent block the harness can find.
+Verified against FFmpeg:
+
+| case | before | after |
+|---|---|---|
+| sweep: 3 contents x 5 rate modes x 4 geometries | mostly desync | **60/60 bit-exact** |
+| `testsrc2` 720p, x265 full defaults | 1379837 differ, max 245 | exact |
+| `testdata/hevc_1idr_1p.mp4` (real 720p encode) | panic | exact |
+| colour bars 640x352 / 640x360 / 1920x1080 | 1311–99760 differ | exact |
+| `gradients`, `testsrc2` 128x64, QP 26/34 | 29–1624 differ | exact |
+
+48 of the sweep configurations are now a regression test
+(`TestDecodeRealContent`), skipped when x265 or FFmpeg is absent.
+
+What is still out of scope: **P and B frames with real motion** — only
+zero-motion skip is implemented, so inter pictures beyond a freeze are far off,
+as designed. Tiles are also still unsupported (see 0.9).
 
 ### 0.4 `hi265dec` argument handling (S)
 

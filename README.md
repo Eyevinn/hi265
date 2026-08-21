@@ -69,10 +69,13 @@ go run ./cmd/hi265dec -colorspace bt709 input.265 out.png
 | `-colorspace` | Color space for RGB conversion (`bt601`/`bt709`/`bt2020`) | `bt601` |
 | `-full-range` | Treat input as full-range YCbCr | off |
 
-> Wavefront parallel processing (`entropy_coding_sync`) is supported, which is
-> what x265 enables by default, and the SPS conformance window is applied to the
-> output. Tiles are not supported yet. Busy natural content is not yet
-> bit-exact — see item 0.10 in `docs/roadmap.md`.
+> Real encoder output decodes bit-exactly: wavefront parallel processing
+> (x265's default), SAO, deblocking, sign data hiding, every intra mode, NxN
+> partitions, transform trees down to 4x4, 32x32 transforms, per-quantization-
+> group QP, and the SPS conformance window. Verified against FFmpeg across 60
+> x265 configurations. Not supported: tiles, and P/B frames with real motion —
+> only zero-motion skip is implemented, so inter pictures beyond a freeze are out
+> of scope.
 
 ### hi265-mp4-extend — Extend a CMAF segment with empty frames
 
