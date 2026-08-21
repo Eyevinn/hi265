@@ -9,12 +9,30 @@ Phases are ordered by dependency. Sizes are rough: **S** ≈ half a day,
 
 ---
 
-## Phase 0 — Correctness first (blocks everything else)
+## Phase 0 — Correctness first (blocks everything else) — **complete**
 
-Nothing else is worth building until generated bitstreams decode identically in
-a conforming decoder. They currently do not.
+Nothing else was worth building until generated bitstreams decoded identically in
+a conforming decoder, and until real streams decoded at all.
 
-### 0.1 MPM candidate-B CTB boundary rule (S) — **bug**
+All twelve items are closed. The phase started with two known defects and grew to
+twelve: each fix made the next one visible, and the conformance harness (0.2) is
+what turned "FFmpeg disagrees" into a specific spec clause every time. Generated
+content and real x265 output are both bit-exact against FFmpeg now.
+
+Two things were deliberately left out of scope rather than half-built, and are
+recorded where they belong:
+
+- **Tiles** (see 0.9): the entry point offsets parse, but tile scan order and
+  per-tile CABAC reset are not implemented.
+- **A conformance window on the encoder side** (see 0.8): the decoder applies
+  one, but the generator cannot emit dimensions finer than a multiple of 8, so
+  those are rejected with a clear error instead.
+
+Ordered by dependency, the fixes were: 0.1 → 0.5 → 0.2 (the harness) → 0.6, 0.7
+(which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11. The three small
+items 0.3, 0.4 and 0.11 were housekeeping alongside.
+
+### 0.1 MPM candidate-B CTB boundary rule (S) — **fixed**
 
 Spec 8.4.2 forces `candIntraPredModeB = INTRA_DC` when `yPb − 1` lies outside
 the current CTB ("intra mode prediction does not cross the vertical CTB
@@ -74,11 +92,13 @@ The harness was validated by reverse-applying 0.1, which makes the SMPTE cases
 fail at max delta 107 and mean 18.41 — reproducing the original bug. It then
 immediately earned its keep by localising 0.6 and 0.7.
 
-### 0.3 README flag drift (S)
+### 0.3 README flag drift (S) — **fixed**
 
-Every `hi265gen` example in `README.md` fails as written: the documented `-f`,
+Every `hi265gen` example in `README.md` failed as written: the documented `-f`,
 `-grid`, `-c`, `-digits` are actually `-gi`, `-gp`, `-gc`, `-text` (and `-f` is
-now the output format). Regenerate the examples from `parseOptions`.
+now the output format). The examples and the flag table are regenerated from
+`parseOptions`, and every example in the README is run as part of verifying a
+docs change — which is how the `-w 640 -h 360` crash behind 0.8 was found.
 
 ### 0.5 Deblocking was enabled in the generated PPS by accident (S) — **done**
 
@@ -234,6 +254,22 @@ Verified bit-exact against FFmpeg on flat content, all with WPP on:
 **Tiles** are still unsupported: the entry point offsets now parse, but tile
 scan order and per-tile CABAC reset are not implemented.
 
+### 0.11 Chroma QP table was off by one at qPi 34 (S) — **fixed**
+
+Spec Table 8-10 maps qPi 34 to chroma QP 33; both copies of the mapping said 32,
+giving a chroma-only mismatch against FFmpeg at exactly QP 34 (mean 1.6, max 14)
+while every neighbouring QP was exact. The table lived twice, once in
+`pkg/encode` and once in `pkg/decoder`, which is what allowed the drift; it now
+lives in `internal/transform` with a test pinning the whole table and
+monotonicity.
+
+---
+
+## Phase 5 — Ahead of hi264
+
+hi264 is permanently 8-bit 4:2:0; these are the items HEVC lets us take
+further.
+
 ### 0.12 Conformance window was ignored (S) — **fixed**
 
 Found while fixing 0.9. An encoder that pads the coded picture up to a whole
@@ -303,11 +339,12 @@ What is still out of scope: **P and B frames with real motion** — only
 zero-motion skip is implemented, so inter pictures beyond a freeze are far off,
 as designed. Tiles are also still unsupported (see 0.9).
 
-### 0.4 `hi265dec` argument handling (S)
+### 0.4 `hi265dec` argument handling (S) — **fixed**
 
-`go run ./cmd/hi265dec in.265 -o out.yuv` silently ignores `-o` — Go's `flag`
-stops at the first positional. Either parse flags before positionals or accept
-the output path positionally.
+`go run ./cmd/hi265dec in.265 -o out.yuv` silently ignored `-o` — Go's `flag`
+stops at the first positional. Flags and positionals are now parsed interleaved,
+and the output may be given either with `-o` or as a second positional (matching
+hi264dec); giving it both ways is an error rather than a silent preference.
 
 ---
 
@@ -535,22 +572,6 @@ Still to do: `-8x8` changes the coding structure, not the content. Wiring 8x8
 output paths, or `-8x8` would mean different pixels for `.265` than for `.yuv`.
 The vendored hi264 does support the `@8x8` gridimg directive, so the helpers are
 there.
-
-### 0.11 Chroma QP table was off by one at qPi 34 (S) — **fixed**
-
-Spec Table 8-10 maps qPi 34 to chroma QP 33; both copies of the mapping said 32,
-giving a chroma-only mismatch against FFmpeg at exactly QP 34 (mean 1.6, max 14)
-while every neighbouring QP was exact. The table lived twice, once in
-`pkg/encode` and once in `pkg/decoder`, which is what allowed the drift; it now
-lives in `internal/transform` with a test pinning the whole table and
-monotonicity.
-
----
-
-## Phase 5 — Ahead of hi264
-
-hi264 is permanently 8-bit 4:2:0; these are the items HEVC lets us take
-further.
 
 ### 5.1 High bit depth / non-4:2:0 decoding (L)
 
