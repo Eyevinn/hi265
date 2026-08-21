@@ -95,7 +95,11 @@ func PredictPlanar(size int, neighbors *Neighbors, bitDepth int) []int32 {
 // PredictAngular performs angular intra prediction (modes 2-34) per HEVC spec 8.4.4.2.6.
 // Modes 2-17 are primarily horizontal, modes 18-34 are primarily vertical.
 // Mode 10 = exact horizontal, mode 26 = exact vertical.
-func PredictAngular(mode, size int, neighbors *Neighbors, bitDepth int) []int32 {
+// PredictAngular performs angular intra prediction (spec 8.4.4.2.6). For the
+// purely vertical (26) and horizontal (10) modes it also applies the boundary
+// filter that the same clause specifies as its final step, which only applies
+// to luma blocks smaller than 32x32.
+func PredictAngular(mode, size int, neighbors *Neighbors, bitDepth int, isLuma bool) []int32 {
 	p := make([]int32, size*size)
 
 	if neighbors == nil {
@@ -199,7 +203,46 @@ func PredictAngular(mode, size int, neighbors *Neighbors, bitDepth int) []int32 
 		}
 	}
 
+	filterIntraBoundary(p, mode, size, neighbors, bitDepth, isLuma)
 	return p
+}
+
+// filterIntraBoundary applies the final step of spec 8.4.4.2.6: for the purely
+// vertical and horizontal modes the first column resp. first row of the
+// prediction is nudged by half the gradient of the perpendicular neighbours.
+// It applies to luma only, and only below 32x32.
+//
+// Omitting it is invisible on column-uniform content for mode 26 and on
+// row-uniform content for mode 10, because the gradient term is then exactly
+// zero — which is why flat and colour-bar patterns decode correctly without it.
+func filterIntraBoundary(p []int32, mode, size int, n *Neighbors, bitDepth int, isLuma bool) {
+	if !isLuma || size >= 32 || n == nil {
+		return
+	}
+	maxVal := int32(1<<bitDepth) - 1
+	topLeft := int32(n.TopLeft)
+
+	// The reference samples have already been substituted for unavailable
+	// neighbours by this point, so the filter applies unconditionally — it is
+	// gated only on having the samples in hand.
+	switch mode {
+	case 26: // vertical: adjust the left column
+		if len(n.Left) < size {
+			return
+		}
+		for y := range size {
+			v := p[y*size] + ((int32(n.Left[y]) - topLeft) >> 1)
+			p[y*size] = min(max(v, 0), maxVal)
+		}
+	case 10: // horizontal: adjust the top row
+		if len(n.Top) < size {
+			return
+		}
+		for x := range size {
+			v := p[x] + ((int32(n.Top[x]) - topLeft) >> 1)
+			p[x] = min(max(v, 0), maxVal)
+		}
+	}
 }
 
 // Neighbors holds the reference samples for intra prediction.

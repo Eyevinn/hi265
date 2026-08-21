@@ -475,32 +475,20 @@ func conformanceCases() []conformanceCase {
 			name: "flat_pskip_idr4", width: 128, height: 64, qp: 30, frames: 4,
 			idrInterval: 4, pattern: patFlat, maxPatternDelta: 4, maxPatternMean: 0.5,
 		},
-		// Known defect, minimal form: 4x4 CTUs, one bright CTU per row
-		// stepping right. Small enough to reason about CTU by CTU.
+		// Regression guards for the mode 10/26 intra boundary filter
+		// (spec 8.4.4.2.6). Both were the reproduction cases for its absence:
+		// only content that is neither column- nor row-uniform exposes it,
+		// because the gradient term is exactly zero otherwise.
+		//
+		// diagonal is the minimal form — 4x4 CTUs, one bright CTU per row
+		// stepping right, small enough to reason about CTU by CTU.
 		{
 			name: "diagonal_qp26", width: 64, height: 64, qp: 26, frames: 1,
-			pattern: patDiagonal, maxPatternDelta: 255, maxPatternMean: 255,
-			defect: &knownDefect{
-				maxSamples: 576, maxDelta: 100,
-				note: "see smpte_text_overlay_qp26: same missing mode 10/26 " +
-					"boundary filter, minimal reproduction. The delta map is " +
-					"the full left column of every mode-26 block, the full top " +
-					"row of every mode-10 block, and a uniform offset over the " +
-					"blocks that predict from them",
-			},
+			pattern: patDiagonal, maxPatternDelta: 4, maxPatternMean: 0.5,
 		},
-		// Known defect: CTUs whose neighbours are a different colour code real
-		// AC residual, and FFmpeg then disagrees with hi265dec.
 		{
 			name: "smpte_text_overlay_qp26", width: 192, height: 96, qp: 26, frames: 1,
-			pattern: patSMPTEText, maxPatternDelta: 255, maxPatternMean: 255,
-			defect: &knownDefect{
-				maxSamples: 2112, maxDelta: 76,
-				note: "missing intra boundary smoothing for prediction modes 10 " +
-					"and 26 (spec 8.4.4.2.6, cIdx==0 && nTbS<32) in " +
-					"internal/pred.PredictAngular; encoder and decoder share the " +
-					"omission so they agree with each other and not with FFmpeg",
-			},
+			pattern: patSMPTEText, maxPatternDelta: 4, maxPatternMean: 0.5,
 		},
 	}
 }

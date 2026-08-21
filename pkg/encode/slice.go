@@ -603,7 +603,7 @@ func predictIntra(mode, size int, neighbors *pred.Neighbors, bitDepth int, isLum
 	case 1:
 		return pred.PredictDC(size, neighbors, bitDepth, isLuma)
 	default:
-		return pred.PredictAngular(mode, size, neighbors, bitDepth)
+		return pred.PredictAngular(mode, size, neighbors, bitDepth, isLuma)
 	}
 }
 
