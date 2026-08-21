@@ -6,11 +6,12 @@
 [![license](https://img.shields.io/github/license/Eyevinn/hi265.svg)](https://github.com/Eyevinn/hi265/blob/main/LICENSE)
 [![Badge OSC](https://img.shields.io/badge/Evaluate-24243B?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTIiIGZpbGw9InVybCgjcGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyKSIvPgo8Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI3IiBzdHJva2U9ImJsYWNrIiBzdHJva2Utd2lkdGg9IjIiLz4KPGRlZnM+CjxsaW5lYXJHcmFkaWVudCBpZD0icGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyIiB4MT0iMTIiIHkxPSIwIiB4Mj0iMTIiIHkyPSIyNCIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPgo8c3RvcCBzdG9wLWNvbG9yPSIjQzE4M0ZGIi8+CjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzREQzlGRiIvPgo8L2xpbmVhckdyYWRpZW50Pgo8L2RlZnM+Cjwvc3ZnPgo=)](https://app.osaas.io/browse/eyevinn-mp4ff)
 
-## Pure Go HEVC/H.265 IDR Decoder & Bitstream Generator
+## Pure Go HEVC/H.265 Decoder & Bitstream Generator
 
-A pure Go HEVC/H.265 decoder for IDR and P-skip frames, plus a bitstream
-generator for producing valid HEVC test content from flat-color 16x16 CTU
-patterns. Sister project to [hi264](https://github.com/Eyevinn/hi264) (H.264/AVC).
+A pure Go HEVC/H.265 decoder for intra pictures (IDR and CRA) and P-skip
+frames, plus a bitstream generator for producing valid HEVC test content from
+flat-color 16x16 CTU patterns. Sister project to
+[hi264](https://github.com/Eyevinn/hi264) (H.264/AVC).
 
 This is **not** a general-purpose video encoder — it does not accept arbitrary
 pixel input or perform motion estimation. The encoder produces intra DC
@@ -21,9 +22,16 @@ counters, and reference content for decoder verification.
 Decoding is 8-bit 4:2:0 only. The gray IDR generator (`hi265gray`) supports
 any chroma format and bit depth (4:2:0, 4:2:2, 4:4:4; 8-bit, 10-bit, 12-bit).
 
-Pixel-perfect match with FFmpeg decoding across 16+ golden test cases covering
-SAO, sign hiding, transform skip, deblocking, P-frames, varied QP ranges, and
-complex content.
+Pixel-perfect against FFmpeg in both directions. Intra pictures from a real
+encoder decode bit-exactly — wavefront parallel processing (x265's default),
+SAO, deblocking, sign data hiding, every intra mode, NxN partitions, transform
+trees from 4x4 to 32x32, per-quantization-group QP and the conformance window —
+verified across 48 x265 configurations. Everything the generator produces
+decodes identically in FFmpeg and in this decoder, which is checked on every
+`go test` run. See [Build & Test](#build--test).
+
+Not supported: tiles, and P/B frames with real motion (only zero-motion skip,
+so inter pictures beyond a freeze are out of scope).
 
 ## Build & Test
 
@@ -390,6 +398,7 @@ details are in `internal/` and not accessible to external callers.
 import (
     "github.com/Eyevinn/hi265/pkg/decoder"
     "github.com/Eyevinn/hi265/pkg/encode"
+    "github.com/Eyevinn/hi265/pkg/timecode"
     "github.com/Eyevinn/hi264/pkg/yuv"
 )
 
@@ -425,6 +434,18 @@ grayIDR, err := encode.EncodeGrayIDRSliceFromSPSPPS(sps, pps)
 // POC continuity of the pictures that follow.
 craSlice, err := encode.EncodeCRASliceFromSPSPPS(sps, pps, grid, colors, poc)
 grayCRA, err := encode.EncodeGrayCRASliceFromSPSPPS(sps, pps, poc)
+
+// Extend an existing stream: read the tail state, then append empty frames that
+// continue its POC. The source SPS/PPS are reused, so nothing is re-emitted.
+state, err := encode.LastFrameState(annexB)   // POC, NAL unit type, active SPS/PPS
+extended, err := encode.AppendEmptyFrames(annexB, 25)
+
+// Time Code SEI (payload type 136). HEVC carries the SMPTE timecode here rather
+// than in pic_timing, so no SPS/VUI change is needed to attach one.
+h, m, sec, fr, _ := timecode.Components(frameNum, 25, false)
+sei, err := encode.GenerateTimeCodeSEI(encode.TimeCode{
+    Hours: uint8(h), Minutes: uint8(m), Seconds: uint8(sec), Frames: uint16(fr),
+})
 ```
 
 ### Appending frames to an existing bitstream
@@ -482,22 +503,26 @@ stream = append(stream, pSkipSlice...)
 ## Architecture
 
 ```
-pkg/decoder/       — Public: top-level decoder API (DecodeAnnexB)
-pkg/encode/        — Public: bitstream generator API (GenerateIDR, GeneratePSkip, FrameEncoder)
-pkg/frame/         — Public: Frame type (decoded output)
-internal/cabac/    — Internal: CABAC arithmetic decoder and encoder engines
-internal/context/  — Internal: Context model initialization (170 contexts)
-internal/slice/    — Internal: Slice data parsing, CTU/CU/TU quadtree
-internal/transform/— Internal: Inverse quantization and transform (4x4, 8x8, 16x16)
-internal/pred/     — Internal: Intra prediction modes (planar, DC, angular)
-internal/deblock/  — Internal: Deblocking filter
-internal/sao/      — Internal: Sample Adaptive Offset
-cmd/hi265dec/      — CLI: decode HEVC from raw .265
-cmd/hi265gen/      — CLI: generate HEVC bitstreams or raw images from grid patterns
-cmd/hi265gray/     — CLI: generate gray IDR/CRA frames from external VPS/SPS/PPS
-examples/          — Example grid image files
-tools/             — Test generation scripts
-testdata/          — Golden HEVC bitstreams for regression testing
+pkg/decoder/          — Public: top-level decoder API (DecodeAnnexB, DecodeNALUs)
+pkg/encode/           — Public: bitstream generator API (GenerateIDR, GeneratePSkip,
+                        CRA and gray slices from external SPS/PPS, Time Code SEI,
+                        stream extension, FrameEncoder)
+pkg/frame/            — Public: Frame type (decoded output)
+pkg/timecode/         — Public: SMPTE timecode arithmetic and text formatting
+internal/cabac/       — Internal: CABAC arithmetic decoder and encoder engines
+internal/context/     — Internal: Context model initialization (170 contexts)
+internal/slice/       — Internal: Slice data parsing, CTU/CU/TU quadtree, WPP substreams
+internal/transform/   — Internal: Inverse quantization and transform (4x4 to 32x32, DST-VII)
+internal/pred/        — Internal: Intra prediction modes (planar, DC, angular)
+internal/deblock/     — Internal: Deblocking filter
+internal/sao/         — Internal: Sample Adaptive Offset
+cmd/hi265dec/         — CLI: decode HEVC from Annex-B or MP4 to YUV/Y4M/PNG/JPEG
+cmd/hi265gen/         — CLI: generate HEVC bitstreams or raw images from grid patterns
+cmd/hi265gray/        — CLI: generate gray IDR/CRA frames from external VPS/SPS/PPS
+cmd/hi265-mp4-extend/ — CLI: extend a CMAF media segment with empty frames
+examples/             — Example grid image files
+tools/                — Test generation scripts
+testdata/             — Golden HEVC bitstreams for regression testing
 ```
 
 ## Related Projects

@@ -67,6 +67,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### hi265gen
 - `-8x8`: each 16x16 CTU is coded as four independent 8x8 CUs, each with its own
   intra mode. Changes the coding structure, not yet the pixel granularity.
+  Exposed on the library API as `EncodeParams.Use8x8CU` and
+  `FrameEncoder.Use8x8CU`.
 
 #### Verification
 - `TestGeneratorConformance`: every generated stream is decoded by both FFmpeg and
@@ -136,8 +138,14 @@ size, while a real encoder uses everything.
 - Generated bitstreams differ from v0.1.0 for non-flat content, deliberately: the
   intra boundary filter and the MPM CTB rule both change what a conforming decoder
   reads. Flat-colour output at multiple-of-16 dimensions is unchanged byte for
-  byte.
+  byte, pinned by a digest test.
 - `pkg/decoder` output is the conformance window rather than the coded picture.
+- `hi265dec` image output starts at the first decoded frame and writes one
+  numbered file per frame when there is more than one; it previously wrote the
+  last decoded frame to a single file.
+- Frame dimensions must be a multiple of 8 rather than 16, and sizes that cannot
+  be coded now return an error naming the nearest usable size instead of
+  panicking.
 
 ### Known limitations
 - Tiles are not supported: the entry point offsets parse, but tile scan order and
