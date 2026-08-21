@@ -69,3 +69,21 @@ func Dequantize(coeffs []int32, size, qp int) []int32 {
 	}
 	return out
 }
+
+// ChromaQPFromLumaQP maps a luma QP to the chroma QP for ChromaArrayType 1
+// (4:2:0) per spec Table 8-10. Below 30 the mapping is the identity, above 43
+// it is qPi-6, and in between it follows the table.
+//
+// This lives here so the encoder and the decoder cannot drift apart: they each
+// had their own copy, and both carried the same off-by-one at qPi 34.
+func ChromaQPFromLumaQP(qpY int) int {
+	if qpY < 30 {
+		return qpY
+	}
+	// qPi:  30  31  32  33  34  35  36  37  38  39  40  41  42  43
+	table := []int{29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37}
+	if qpY-30 < len(table) {
+		return table[qpY-30]
+	}
+	return qpY - 6
+}

@@ -172,11 +172,9 @@ func TestEncode8x8QuadrantsMatchFFmpeg(t *testing.T) {
 	// Tolerances against the intended pattern are pure quantization error, with
 	// roughly a factor two of headroom over the measured values.
 	//
-	// QP 34 is deliberately absent: chromaQPFromLumaQP maps luma QP 34 to
-	// chroma QP 32 in both the generator and the decoder while spec Table 8-10
-	// says 33, so chroma differs from FFmpeg at that one QP (measured mean 1.6,
-	// max 14). That is a pre-existing defect of the shared chroma QP table,
-	// unrelated to coding granularity.
+	// QP 34 is included on purpose: the shared chroma QP table used to map luma
+	// QP 34 to chroma QP 32 where spec Table 8-10 says 33, which showed up as a
+	// chroma-only mismatch at that one QP and nowhere else.
 	cases := []struct {
 		qp      int
 		maxDiff int
@@ -185,6 +183,7 @@ func TestEncode8x8QuadrantsMatchFFmpeg(t *testing.T) {
 		{20, 6, 0.5},
 		{26, 12, 1.5},
 		{30, 14, 3.0},
+		{34, 30, 5.0},
 		{40, 60, 7.0},
 	}
 	for _, c := range cases {

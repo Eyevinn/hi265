@@ -517,7 +517,7 @@ func hasNonZeroChroma(ctuX, ctuY, ctuSize, picWidth int, chromaSrc []uint8,
 	qp, lumaMode int, recon *frame.Frame, comp int) bool {
 
 	chromaTrSize := ctuSize / 2
-	chromaQP := chromaQPFromLumaQP(qp)
+	chromaQP := transform.ChromaQPFromLumaQP(qp)
 	cx := ctuX / 2
 	cy := ctuY / 2
 
@@ -589,7 +589,7 @@ func computeChromaLevels(ctuX, ctuY, ctuSize, picWidth int, chromaSrc []uint8,
 	qp, chromaMode int, recon *frame.Frame, comp int) []int32 {
 
 	chromaTrSize := ctuSize / 2
-	chromaQP := chromaQPFromLumaQP(qp)
+	chromaQP := transform.ChromaQPFromLumaQP(qp)
 	cx := ctuX / 2
 	cy := ctuY / 2
 
@@ -799,7 +799,7 @@ func reconstructLuma(f *frame.Frame, x0, y0, size, picW, picH, mode int,
 func reconstructChroma(f *frame.Frame, comp, cx, cy, chromaTrSize, chromaW, chromaH,
 	mode int, levels []int32, qp int) {
 
-	chromaQP := chromaQPFromLumaQP(qp)
+	chromaQP := transform.ChromaQPFromLumaQP(qp)
 	chromaPred := predictChromaBlock(f, comp, cx, cy, chromaTrSize, mode)
 
 	var residual []int32
@@ -1018,19 +1018,4 @@ func ceilLog2(n int) int {
 		bits++
 	}
 	return bits
-}
-
-func chromaQPFromLumaQP(qpY int) int {
-	if qpY < 30 {
-		return qpY
-	}
-	table := []int{
-		29, 30, 31, 32, 32, 33, 34, 34, 35, 35,
-		36, 36, 37, 37, 38, 39, 40, 41, 42, 43,
-		44, 45, 46,
-	}
-	if qpY-30 < len(table) {
-		return table[qpY-30]
-	}
-	return qpY - 6
 }

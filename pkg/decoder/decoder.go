@@ -597,7 +597,7 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 				chromaMode = 34
 			}
 
-			chromaQP := chromaQPFromLumaQP(cu.QpY)
+			chromaQP := transform.ChromaQPFromLumaQP(cu.QpY)
 
 			for comp := range 2 {
 				var chromaCoeffs []int32
@@ -782,21 +782,6 @@ func removeEmulationPreventionBytes(data []byte) []byte {
 		}
 	}
 	return out
-}
-
-func chromaQPFromLumaQP(qpY int) int {
-	if qpY < 30 {
-		return qpY
-	}
-	table := []int{
-		29, 30, 31, 32, 32, 33, 34, 34, 35, 35,
-		36, 36, 37, 37, 38, 39, 40, 41, 42, 43,
-		44, 45, 46,
-	}
-	if qpY-30 < len(table) {
-		return table[qpY-30]
-	}
-	return qpY - 6
 }
 
 // ceilLog2 returns ceil(log2(n)), minimum 1.
