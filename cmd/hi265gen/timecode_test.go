@@ -236,6 +236,125 @@ func TestTimeCodeSEIInMP4(t *testing.T) {
 	}
 }
 
+// TestFractionalFPSMP4Timescale verifies that -fps 30000/1001 gives an MP4 with
+// media timescale 30000 and per-sample duration 1001, while the timecode counts
+// at the nominal integer rate of 30.
+func TestFractionalFPSMP4Timescale(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "f.mp4")
+	if err := run([]string{appName, "-smpte", "-w", "176", "-h", "80", "-n", "31",
+		"-fps", "30000/1001", "-timecode", "-o", out}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	f, err := os.Open(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	parsed, err := mp4.DecodeFile(f)
+	if err != nil {
+		t.Fatalf("DecodeFile: %v", err)
+	}
+	if ts := parsed.Init.Moov.Trak.Mdia.Mdhd.Timescale; ts != 30000 {
+		t.Errorf("media timescale = %d, want 30000", ts)
+	}
+	var tcs []string
+	for _, seg := range parsed.Segments {
+		for _, frag := range seg.Fragments {
+			samples, err := frag.GetFullSamples(nil)
+			if err != nil {
+				t.Fatalf("GetFullSamples: %v", err)
+			}
+			for i, s := range samples {
+				if s.Dur != 1001 {
+					t.Errorf("sample %d dur = %d, want 1001", i, s.Dur)
+				}
+				tcs = append(tcs, seiTimecodes(t, naluSampleToByteStream(s.Data))...)
+			}
+		}
+	}
+	if len(tcs) != 31 {
+		t.Fatalf("got %d SEI timecodes, want 31", len(tcs))
+	}
+	// Nominal rate 30: frame 29 is the last of second 0, frame 30 starts second 1.
+	if tcs[0] != "00:00:00:00" || tcs[29] != "00:00:00:29" || tcs[30] != "00:00:01:00" {
+		t.Errorf("timecodes[0,29,30] = %s,%s,%s, want 00:00:00:00,00:00:00:29,00:00:01:00",
+			tcs[0], tcs[29], tcs[30])
+	}
+}
+
+// TestTimeCodeDropFrame verifies 29.97 drop-frame counting across a minute
+// boundary: labels ;00 and ;01 are skipped, the SEI signals counting_type 4,
+// and cnt_dropped_flag marks the frame where the skip happens (which is why
+// ffprobe renders that one frame with a ';' separator).
+func TestTimeCodeDropFrame(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "df.265")
+	if err := run([]string{appName, "-smpte", "-w", "176", "-h", "80", "-n", "5",
+		"-fps", "29.97", "-drop-frame", "-timecode", "-start-frame", "1798",
+		"-o", out}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"00:00:59:28", "00:00:59:29", "00:01:00:02", "00:01:00:03", "00:01:00:04"}
+	if got := seiTimecodes(t, data); !equalStrings(got, want) {
+		t.Errorf("SEI timecodes = %v, want %v", got, want)
+	}
+	clock := firstSEIClock(t, data)
+	if clock.CountingType != 4 {
+		t.Errorf("counting_type = %d, want 4 (drop-frame)", clock.CountingType)
+	}
+	// ffprobe writes drop-frame timecodes with a ';' before the frame field;
+	// normalise it so the comparison is about the counting, not the notation.
+	probed := ffprobeTimecodes(t, out)
+	for i := range probed {
+		probed[i] = strings.ReplaceAll(probed[i], ";", ":")
+	}
+	if !equalStrings(probed, want) {
+		t.Errorf("ffprobe timecodes = %v, want %v", probed, want)
+	}
+}
+
+// TestDropFrameRejectsNonNTSCRate verifies -drop-frame is rejected outside the
+// NTSC rates it is defined for.
+func TestDropFrameRejectsNonNTSCRate(t *testing.T) {
+	for _, fps := range []string{"25", "30", "24000/1001"} {
+		out := filepath.Join(t.TempDir(), "x.265")
+		err := run([]string{appName, "-smpte", "-w", "176", "-h", "80", "-n", "2",
+			"-fps", fps, "-drop-frame", "-timecode", "-o", out})
+		if err == nil || !strings.Contains(err.Error(), "drop-frame") {
+			t.Errorf("-fps %s: expected drop-frame rejection error, got %v", fps, err)
+		}
+	}
+}
+
+func TestParseFPS(t *testing.T) {
+	ok := []struct {
+		in       string
+		num, den int
+	}{
+		{"25", 25, 1},
+		{"30", 30, 1},
+		{"30000/1001", 30000, 1001},
+		{"29.97", 30000, 1001},
+		{"59.94", 60000, 1001},
+		{"23.976", 24000, 1001},
+		{"119.88", 120000, 1001},
+	}
+	for _, c := range ok {
+		n, d, err := parseFPS(c.in)
+		if err != nil || n != c.num || d != c.den {
+			t.Errorf("parseFPS(%q) = %d/%d, %v; want %d/%d", c.in, n, d, err, c.num, c.den)
+		}
+	}
+	for _, bad := range []string{"abc", "30/0", "30/-1", "24.5", ""} {
+		if _, _, err := parseFPS(bad); err == nil {
+			t.Errorf("parseFPS(%q) expected error", bad)
+		}
+	}
+}
+
 // TestTimeCodeRejectsRawFormats verifies -timecode is rejected for the raw
 // (non-bitstream) output formats.
 func TestTimeCodeRejectsRawFormats(t *testing.T) {
