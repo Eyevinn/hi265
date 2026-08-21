@@ -210,8 +210,8 @@ Flags:
 | `-rgb` | Treat `-gc` values as RGB instead of YCbCr | off |
 | `-smpte` | Use built-in 75% SMPTE color bars pattern | off |
 | `-f` | Output format (`265`, `hevc`, `mp4`, `y4m`, `yuv`, `png`, `jpg`); required with `-o -` | from `-o` extension |
-| `-w` | Frame width in pixels (multiple of 16, see note) | grid width |
-| `-h` | Frame height in pixels (multiple of 16, see note) | grid height |
+| `-w` | Frame width in pixels (multiple of 8) | grid width |
+| `-h` | Frame height in pixels (multiple of 8) | grid height |
 | `-n` | Number of frames | 1 |
 | `-text` | Text overlay pattern (e.g. `"%03d"`, `"%mm:%ss.%ff"`) | — |
 | `-text-scale` | Text scale factor (0 = auto-fit) | 0 |
@@ -234,11 +234,13 @@ Flags:
 | `-o` | Output file (`-` for stdout, requires `-f`) | — |
 | `-version` | Print version | — |
 
-> **Dimension constraint.** Frame width and height must currently be
-> multiples of 16 (the CTU size). Common heights such as 360 and 1080 are not,
-> and currently crash the encoder rather than producing a clear error — use
-> 352/368 and 1088 instead. Both the missing validation and support for partial
-> boundary CTUs are tracked in `docs/roadmap.md` (item 0.8).
+> **Dimension constraint.** Frame width and height must be multiples of 8.
+> Sizes that are not a multiple of the 16x16 CTU — 1920x1080 and 640x360 among
+> them — are fully supported: the picture uses an 8-sample minimum coding block
+> and the partial bottom CTU row is split implicitly, as the spec requires.
+> Sizes that are not a multiple of 8 cannot be expressed with a 16x16 CTU
+> without a conformance window, and are rejected with an error naming the
+> nearest usable size.
 
 ### Constant bitrate testing with `-bpp`
 
@@ -259,7 +261,7 @@ playback:
 go run ./cmd/hi265gen -w 320 -h 240 -n 50 -text "%03d" -bg 0,128,0 -bpp 2500 -o low.mp4
 
 # 1500 kbit/s tier — blue background
-go run ./cmd/hi265gen -w 640 -h 352 -n 50 -text "%03d" -bg 0,0,200 -bpp 7500 -o mid.mp4
+go run ./cmd/hi265gen -w 640 -h 360 -n 50 -text "%03d" -bg 0,0,200 -bpp 7500 -o mid.mp4
 
 # 3000 kbit/s tier — red background
 go run ./cmd/hi265gen -w 1280 -h 720 -n 50 -text "%03d" -bg 200,0,0 -bpp 15000 -o high.mp4

@@ -144,28 +144,56 @@ throughout because they are flat or smooth-gradient content, where the raw delta
 never approaches 10*tC; the `--qp 40` choice in the project notes turns out to
 be unrelated — on this content the error grew with QP.
 
-### 0.8 Non-multiple-of-16 frame heights panic the grid encoder (M) — **open bug**
+### 0.8 Frame heights not a multiple of the CTU size (M) — **fixed**
 
-`hi265gen -smpte -w 1920 -h 1080` panics with `index out of range [2073600]
-with length 2073600`. Any dimension that is not a multiple of the 16-pixel CTU
-fails the same way — 640x360, 320x232, 128x72, and 1920x1080 all crash, while
-640x352, 640x368 and 1920x1088 work. That rules out the single most common
-video resolution, and one such example shipped in the README.
+`hi265gen -w 1920 -h 1080` panicked with an index out of range, as did every
+size that is not a multiple of 16: 640x360, 320x232, 128x72. The decoder was
+worse — it panicked on a real x265 640x360 stream and produced garbage from CTU
+row 15 on another. Both of the most common heights in use, 1080 and 360, are
+8 mod 16.
 
-Two separate problems:
+Three parts to the fix:
 
-1. **No boundary handling.** `encodeIDRSliceData` / `encodeIDRCU` index straight
-   past the end of the plane for a partial bottom CTU row. `gray.go` already
-   solves this ("boundary CTUs that extend past the picture edge use implicit
-   splits down to sub-CUs that fit") — reuse that approach.
-2. **Legality.** `pic_height_in_luma_samples` must be a multiple of minCbSize.
-   With minCb 16, 1080 cannot be expressed at all: it needs either minCb 8
-   (1080 % 8 == 0 — which Route A in 4.3 introduces anyway) or coding 1088 and
-   signalling a conformance window (`conf_win_bottom_offset`).
+1. **Decoder.** Spec 7.3.8.4 codes `split_cu_flag` only when the CU lies
+   entirely inside the picture; a CU crossing the right or bottom edge is split
+   with no flag, inferred while the size stays above MinCbSizeY. The decoder
+   read the flag unconditionally, desynchronising on the first partial CTU. Its
+   CU-depth and intra-mode map writes are now bounds-checked as well — a
+   malformed stream should not be able to panic a decoder.
+2. **Encoder.** One shared `encodeCodingQuadtree` writes the flag exactly where
+   the spec codes it and calls back for each CU a decoder will parse, so the IDR
+   and P-skip paths cannot diverge. `chooseCodingLayout` drops MinCbSizeY to 8
+   when either dimension is not a multiple of 16, in one place consulted by both
+   the SPS writer and the slice data.
+3. **Two bugs only a mixed-CU-size picture could expose**: `part_mode` is only
+   coded at the minimum CB size (7.3.8.5) and was written unconditionally, which
+   desynchronises CABAC for a 16x16 CU when MinCbSizeY is 8; and the encoder's
+   intra mode map was keyed by CU index (`x/cuSize`), addressing the wrong block
+   as soon as 16x16 and 8x8 CUs coexist. It is now addressed by pixel at 4x4
+   granularity, mirroring the decoder.
 
-Interim: the README now documents the constraint. The fix should land after 4.3,
-since the minCb choice determines which of the two mechanisms is needed. At
-minimum, validate the dimensions and return a clear error instead of panicking.
+Verified against FFmpeg — every case bit-exact and within 1 of the intended
+pattern:
+
+| size | minCbSize | result |
+|---|---|---|
+| 1920x1080 | 8 | exact |
+| 640x360 | 8 | exact |
+| 320x232 | 8 | exact |
+| 128x72 | 8 | exact |
+| 640x360 with P-skip | 8 | exact, appended frames exact copies |
+| 640x360 with `-8x8` | 8 | exact |
+| 1920x1088, 640x352 | 16 | exact, bitstreams unchanged |
+
+Two real x265 streams at 640x360 and 1920x1080 that previously panicked the
+decoder now decode bit-exactly. Sizes that are multiples of 16 are unchanged
+byte for byte.
+
+Remaining: dimensions that are not a multiple of 8 cannot be expressed with a
+16x16 CTU at all — 8 is the smallest legal MinCbSizeY. They now return an error
+naming the nearest usable size instead of panicking. Supporting them needs a
+conformance window (`conf_win_*_offset`), which also means teaching the decoder
+to crop on output; that is a separate piece of work and nothing needs it yet.
 
 ### 0.9 WPP / tiles streams fail to parse — blocks most real-world input (M) — **open bug**
 
