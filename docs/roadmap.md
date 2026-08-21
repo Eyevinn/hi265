@@ -1,8 +1,10 @@
 # hi265 roadmap — parity with hi264, then ahead
 
-Status at the time of writing: hi265 v0.1.0 vs hi264 v0.10.0 (+ unreleased
-pic_timing work). This document plans the work to reach parity and then move
-ahead using HEVC-specific capabilities that H.264 cannot express.
+Status: phases 0, 1, 2, 3 and 4.1/4.3 are complete; 4.2 and 5.x remain. Baseline
+was hi265 v0.1.0 against hi264 v0.10.0. This document plans the work to reach
+parity and then move ahead using HEVC-specific capabilities that H.264 cannot
+express. Items are marked **fixed**/**done** as they land, with what was actually
+measured, so the history of why each change exists stays with the plan.
 
 Phases are ordered by dependency. Sizes are rough: **S** ≈ half a day,
 **M** ≈ 1–2 days, **L** ≈ 3+ days.
@@ -263,13 +265,6 @@ while every neighbouring QP was exact. The table lived twice, once in
 lives in `internal/transform` with a test pinning the whole table and
 monotonicity.
 
----
-
-## Phase 5 — Ahead of hi264
-
-hi264 is permanently 8-bit 4:2:0; these are the items HEVC lets us take
-further.
-
 ### 0.12 Conformance window was ignored (S) — **fixed**
 
 Found while fixing 0.9. An encoder that pads the coded picture up to a whole
@@ -348,7 +343,7 @@ hi264dec); giving it both ways is an error rather than a silent preference.
 
 ---
 
-## Phase 1 — CRA insertion at a chosen POC (the GDR primitive)
+## Phase 1 — CRA insertion at a chosen POC (the GDR primitive) — **complete**
 
 This is the highest-value new capability and has no H.264 equivalent, so it is
 parity and "ahead" at once.
@@ -408,7 +403,7 @@ Treat it as a reference-frame reset for subsequent P-skip frames.
 
 ---
 
-## Phase 2 — Time Code SEI
+## Phase 2 — Time Code SEI — **complete**
 
 ### Can we reuse hi264's pic_timing? Partly — and the differences favour hi265.
 
@@ -418,7 +413,7 @@ Treat it as a reference-frame reset for subsequent P-skip frames.
 | payload construction | **Already done for us.** mp4ff (already a dependency) ships `sei.TimeCodeSEI` + `sei.ClockTS` with `Payload()` and `DecodeTimeCodeSEI` in `sei/sei136.go`. No bit-level code to write. |
 | API shape | **Yes, directly.** Mirror `PicTiming` / `GeneratePicTimingSEI` / `BuildPicTimingSEINALU` / `writeSEIValue` from `hi264/pkg/encode/sei.go` — the payloadType/payloadSize/`rbsp_trailing_bits` wrapper is identical. |
 | NALU framing | **Yes.** hi265's `WriteNALU` / `buildNALU` already do the 2-byte HEVC header + EBSP; use NAL type **39** (`PREFIX_SEI`). |
-| timecode arithmetic | **Yes**, but needs a dependency bump: `yuv.Timecode(frame, rate, dropFrame)` (24-hour wrap, drop-frame counting) lives in hi264's `pkg/yuv/format.go`, and the vendored **v0.10.0 has only `FormatText`**. Bump hi264, or copy the ~40 lines locally. |
+| timecode arithmetic | **Ported, not bumped.** `yuv.Timecode(frame, rate, dropFrame)` (24-hour wrap, drop-frame counting) lives in hi264's `pkg/yuv/format.go`, but the pinned v0.10.0 exports only `FormatText`. Rather than depend on an unreleased hi264, it lives in `pkg/timecode` here, together with a `FormatText` that takes a `dropFrame` argument so overlay and SEI can never disagree. |
 | SPS/VUI prerequisite | **Dropped — simpler than hi264.** AVC clock timestamps require `pic_struct_present_flag` in the VUI; SEI 136 has no such dependency, so hi265 needs no SPS change and no `PicStructPresent` config plumbing. |
 
 Verified end-to-end before planning: a hand-built SEI 136 prefix NALU injected
@@ -458,7 +453,7 @@ boundary.
 
 ---
 
-## Phase 3 — `hi265-mp4-extend`
+## Phase 3 — `hi265-mp4-extend` — **complete**
 
 hi264's flagship tool has no hi265 equivalent, though the API pieces
 (`EncodeIDRSliceFromSPSPPS`, `EncodePSkipSliceFromSPSPPS`,
@@ -573,6 +568,13 @@ output paths, or `-8x8` would mean different pixels for `.265` than for `.yuv`.
 The vendored hi264 does support the `@8x8` gridimg directive, so the helpers are
 there.
 
+---
+
+## Phase 5 — Ahead of hi264
+
+hi264 is permanently 8-bit 4:2:0; these are the items HEVC lets us take
+further.
+
 ### 5.1 High bit depth / non-4:2:0 decoding (L)
 
 `hi265gray` already generates 4:2:0/4:2:2/4:4:4 at 8/10/12-bit, but the decoder
@@ -599,11 +601,35 @@ add cases per feature (CRA, timecode, extend, bit depths) as those land.
 
 ---
 
+## What is left
+
+Everything through Phase 3 is done, plus 4.1 and 4.3. Remaining, smallest first:
+
+- **`hi265dec -no-deblock`** (S) — the only gap left in 4.1.
+- **4.2 `hi265gen`** (M) — PNG/JPEG image as background, and a committed PSNR
+  command (there is an untracked `psnr` binary in the repo root but no `cmd/`).
+- **8x8 *content*** (in 4.3) — `-8x8` changes the coding structure today, not the
+  pixels. Wiring 8x8 pixels through needs `PlaneGrid` threaded into
+  `GenerateIDR` and all four raw output paths, or `-8x8` would mean different
+  pixels for `.265` than for `.yuv`. The vendored hi264 does support the `@8x8`
+  gridimg directive, so the helpers exist.
+- **`hi265gen -cra-interval`** (in 1.3) — CRA keyframes instead of IDR, with POC
+  running continuously. The slice encoding it needs is already there.
+- **Tiles** (in 0.9) — entry point offsets parse, but tile scan order and
+  per-tile CABAC reset are not implemented.
+- **Encoder-side conformance window** (in 0.8) — the decoder applies one; the
+  generator still rejects dimensions finer than a multiple of 8.
+- **5.1 high bit depth decoding** (L) — the real differentiator, and the one item
+  that makes hi265 clearly ahead of hi264 rather than level with it. `hi265gray`
+  already generates 4:2:0/4:2:2/4:4:4 at 8/10/12-bit, but the decoder is 8-bit
+  4:2:0, so our own output cannot be verified without FFmpeg.
+- **5.2, 5.3, 5.4** — follow 5.1.
+
 ## Suggested order
 
 1. **0.1 + 0.2 + 0.3 + 0.4** — one PR. Ship a trustworthy generator first.
 2. **1.1 → 1.4** — CRA at a chosen POC. Answers the GDR need directly.
-3. **2.1 → 2.3** — Time Code SEI. Small and self-contained; needs the hi264 bump.
+3. **2.1 → 2.3** — Time Code SEI. Small and self-contained.
 4. **3.1 → 3.3** — `hi265-mp4-extend`, now able to append a gray CRA.
 5. **4.1 / 4.2** — CLI parity, mostly mechanical.
 6. **5.1** — high bit depth decoding, the real "ahead" item.
@@ -613,6 +639,8 @@ Phase 0 whenever finer patterns matter more than CRA/timecode — it needs only
 the scan derivation plus quadtree plumbing, and it doubles as the best
 regression test for 0.1.
 
-Dependencies worth noting up front: Phase 2 needs a hi264 bump past v0.10.0 for
-`yuv.Timecode`; Phase 3's CRA mode needs Phase 1; Phase 5.2 is much easier once
-5.1 gives a decoder that can verify the output.
+Dependencies worth noting up front: Phase 3's CRA mode needs Phase 1 (done);
+Phase 5.2 is much easier once 5.1 gives a decoder that can verify the output.
+Phase 2 needed `yuv.Timecode`, which the pinned hi264 v0.10.0 does not export —
+resolved by porting it into `pkg/timecode` rather than depending on an unreleased
+hi264.

@@ -1,6 +1,17 @@
 #!/bin/bash
 # Generate minimal HEVC test bitstreams and golden YUV references.
-# Requires: ffmpeg with libx265 support.
+#
+# Requires ffmpeg built with libx265. Note that many ffmpeg builds are not —
+# check with `ffmpeg -encoders | grep libx265`. Where it is missing, drive the
+# `x265` binary directly and convert with ffmpeg afterwards; the tests that
+# generate their own vectors (TestDecodeRealContent, TestDecodeWPPStreams,
+# TestDeblockExactness) do exactly that and are the better model for new cases.
+#
+# The committed vectors under testdata/ were made with the parameters below.
+# Feature flags are switched off here to isolate what each vector tests, not
+# because the decoder needs them off: wavefront parallel processing, SAO, sign
+# data hiding and deblocking are all supported and verified bit-exact against
+# FFmpeg. Leave a flag on when the vector is meant to cover it.
 set -euo pipefail
 
 TESTDATA="$(cd "$(dirname "$0")/../testdata" && pwd)"

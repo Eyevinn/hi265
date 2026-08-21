@@ -8,22 +8,147 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- CRA (Clean Random Access, `nal_unit_type` 21) slice generation at a caller-chosen
-  picture order count — the Gradual Decoder Refresh primitive, since a CRA does not
-  reset the POC the way an IDR does:
-  - `encode.EncodeCRASliceFromSPSPPS(sps, pps, grid, colors, poc)`
-  - `encode.EncodeGrayCRASliceFromSPSPPS(sps, pps, poc)` (any chroma format / bit depth)
-  - `hi265gray -cra -poc N`
-- CRA decoding in `pkg/decoder`: a CRA is decoded as an intra picture and becomes
-  the reference frame for the following P-skip pictures
+
+#### Decoding real encoder output
+- Wavefront parallel processing (`entropy_coding_sync_enabled_flag`), which x265
+  enables by default: `num_entry_point_offsets` and the substream offsets are
+  parsed, each CTU row is decoded from its own entry point, and the CABAC context
+  state is inherited from the snapshot taken after the second CTU of the row above
+  (spec 9.3.1). Entry point offsets count emulation prevention bytes, so they are
+  translated into the stripped slice data.
+- The SPS conformance window is applied to decoder output, while the full coded
+  picture is kept as the prediction reference. x265 codes a 360-line source as 368
+  lines and signals the padding.
+- Frame dimensions that are not a multiple of the 16x16 CTU, 1920x1080 and 640x360
+  among them: `split_cu_flag` is only coded when the CU lies inside the picture,
+  and the implicit split at the boundary is honoured on both sides. Generated
+  streams use an 8-sample minimum coding block for such sizes.
+- The QP prediction of spec 8.6.1, needed when the quantization group is smaller
+  than the CTB. x265 defaults to a 32x32 group with a 64x64 CTB.
+
+#### Time Code SEI
+- `encode.GenerateTimeCodeSEI` / `encode.BuildTimeCodeSEINALU`: HEVC carries the
+  SMPTE timecode in the Time Code SEI (payload type 136), not in pic_timing as
+  H.264 does, and needs no VUI change.
+- `pkg/timecode`: 24-hour-wrapping timecode arithmetic with NTSC drop-frame
+  counting, and text formatting that takes the drop-frame flag so a burned-in
+  overlay and the SEI cannot disagree.
+- `hi265gen -timecode`, `-start-frame N`, `-drop-frame`, and fractional `-fps`
+  (`25`, `30000/1001`, `29.97`). Applies to IDR, CRA and P-skip pictures alike, in
+  both Annex-B and MP4 output.
+
+#### CRA and Gradual Decoder Refresh
+- CRA (`nal_unit_type` 21) slice generation at a caller-chosen picture order
+  count — the GDR primitive, since a CRA does not reset the POC the way an IDR
+  does: `encode.EncodeCRASliceFromSPSPPS`,
+  `encode.EncodeGrayCRASliceFromSPSPPS` (any chroma format / bit depth),
+  `hi265gray -cra -poc N`.
+- CRA decoding: decoded as an intra picture, and becomes the reference frame for
+  the P-skip pictures that follow.
+
+#### hi265-mp4-extend (new command)
+- Extends a fragmented MP4 media segment with empty frames, reusing the source's
+  SPS and PPS verbatim so the output splices with no parameter-set change.
+- `-frames N` appends P-skip copies of the last reference picture (a freeze);
+  `-gray-cra` starts the span with a mid-gray CRA that continues the source POC;
+  `-gray-idr` uses an IDR instead (resetting POC); `-timecode` attaches a Time
+  Code SEI to each appended frame.
+- `encode.LastFrameState` and `encode.AppendEmptyFrames` expose the same at the
+  Annex-B level.
+
+#### hi265dec
+- MP4 input (`.mp4`, `.m4v`, `.m4s`), progressive and fragmented, with parameter
+  sets from the `hvcC` box. Samples decode in order rather than jumping between
+  sync samples, so P-skip frames resolve against their reference.
+- `.y4m` and `.jpg` output alongside `.yuv` and `.png`; `-n` frame limit, with one
+  numbered file per frame for image formats; `-q`, `-colorspace`, `-full-range`,
+  `-version`.
+
+#### hi265gen
+- `-8x8`: each 16x16 CTU is coded as four independent 8x8 CUs, each with its own
+  intra mode. Changes the coding structure, not yet the pixel granularity.
+
+#### Verification
+- `TestGeneratorConformance`: every generated stream is decoded by both FFmpeg and
+  `pkg/decoder` and asserted byte-identical, then both are checked against the
+  intended pattern. This is what nothing did before — the golden tests validated
+  the decoder only.
+- `TestDecodeRealContent`: 48 x265 configurations (3 content types x 4 rate
+  control modes x 4 CTU/CU/TU geometries) decoded bit-exactly against FFmpeg.
+- `TestDecodeWPPStreams`, `TestDeblockExactness`, and unit tests for the coding
+  layout, entry point translation and the chroma QP table.
+- Tests needing FFmpeg or x265 skip cleanly when those are absent; override the
+  binaries with `HI265_FFMPEG` and `HI265_X265`.
 
 ### Fixed
+
+Twelve conformance defects. Each was invisible to the existing tests for the same
+reason: the generator emits flat colours, three intra modes and one transform
+size, while a real encoder uses everything.
+
+- **Intra MPM candidate B** ignored the rule that intra mode prediction does not
+  cross a horizontal CTB boundary (spec 8.4.2). Encoder and decoder shared the
+  omission, so they agreed with each other and with nothing else: FFmpeg's decode
+  of a generated SMPTE frame differed by mean 18.5 / max 109.
+- **The intra boundary filter for modes 10 and 26** (spec 8.4.4.2.6, luma below
+  32x32) was missing. The term is exactly zero on column-uniform content for mode
+  26 and row-uniform content for mode 10, which is why colour bars and gradients
+  were unaffected.
+- **Chroma reference samples were filtered.** Spec 8.4.4.2.3 invokes the smoothing
+  filter for luma only (or 4:4:4 chroma, unsupported here).
+- **The chroma residual of a 4x4 luma group** was parsed at the first of the four
+  transform units; spec 7.3.8.10 codes it at `blkIdx == 3`, the last one.
+- **The 4x4 `sig_coeff_flag` context map was indexed by scan order.** Spec
+  9.3.4.2.5 has one position map with no scan dependence; the decoded bins often
+  still came out right and only the arithmetic decoder's state diverged.
+- **`IntraPredModeC`** was derived from the transform block's own PU rather than
+  `IntraPredModeY` at the CU's top-left (spec 8.4.3). With an NxN partition the
+  four luma PUs share one chroma block.
+- **Mode-dependent residual scan** covered only 4x4 luma; extended to 8x8 luma and
+  4x4 chroma, **the mapping was inverted** (modes 6-14 select vertical, 22-30
+  horizontal), and the vertical-scan `last_sig_coeff` x/y swap was missing.
+- **MPM `candModeList[1]`** computed `2+((candA-2+29)%32)` where spec 8.4.2 says
+  `2+((candA+29)%32)` — two steps off whenever both neighbours predict the same
+  angular mode. The encoder already had it right, so this was an
+  encoder/decoder mismatch.
+- **The deblocking normal filter** clipped delta before testing
+  `abs(delta) < 10*tC`, making the gate vacuous (spec 8.7.2.5.7), and the
+  strong/normal decision tested `(dp+dq)` against `beta >> 2` where spec
+  8.7.2.5.6 tests `2*(dp+dq)`.
+- **Chroma deblocking** filtered four samples per call while the caller stepped the
+  4x4 luma grid, two chroma samples apart, so every chroma line was filtered twice.
+- **The chroma QP table** mapped qPi 34 to 32 where spec Table 8-10 says 33. It
+  existed in three copies, all with the same error; it now lives once in
+  `internal/transform`.
+- **The generated PPS enabled deblocking by accident**: `deblocking_filter_control_present_flag = 0`
+  infers *disabled = 0*, the opposite of what the slice-header writers assume.
 - Slice headers now write the long-term reference picture set fields when the SPS
-  has `long_term_ref_pics_present_flag` set (previously omitted, making such
-  P-skip slices unparsable)
-- Slice header parsing of the long-term reference picture set: `num_long_term_sps`
-  is only present when `num_long_term_ref_pics_sps > 0`, and
-  `used_by_curr_pic_lt_flag` / `delta_poc_msb_cycle_lt` were not consumed
+  sets `long_term_ref_pics_present_flag`, and the parser consumes
+  `used_by_curr_pic_lt_flag` / `delta_poc_msb_cycle_lt`.
+- `hi265dec` accepted flags only before the input path, so
+  `hi265dec in.265 -o out.yuv` silently ignored `-o`.
+- A malformed stream could panic the decoder through out-of-range CU depth and
+  intra mode map writes.
+- Every `hi265gen` example in the README failed as written: the documented `-f`,
+  `-grid`, `-c` and `-digits` are `-gi`, `-gp`, `-gc` and `-text`.
+
+### Changed
+- Generated bitstreams differ from v0.1.0 for non-flat content, deliberately: the
+  intra boundary filter and the MPM CTB rule both change what a conforming decoder
+  reads. Flat-colour output at multiple-of-16 dimensions is unchanged byte for
+  byte.
+- `pkg/decoder` output is the conformance window rather than the coded picture.
+
+### Known limitations
+- Tiles are not supported: the entry point offsets parse, but tile scan order and
+  per-tile CABAC reset are not implemented.
+- P and B frames with real motion are out of scope; only zero-motion skip is
+  implemented, so inter pictures beyond a freeze are far off.
+- Generated frame dimensions must be a multiple of 8. Finer sizes need a
+  conformance window on the encoder side and are rejected with an error naming the
+  nearest usable size.
+- Decoding is 8-bit 4:2:0. `hi265gray` generates any chroma format and bit depth,
+  but its output can only be verified with an external decoder.
 
 ## [0.1.0] - 2026-05-12
 

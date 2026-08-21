@@ -32,6 +32,20 @@ go build ./...
 go test ./...
 ```
 
+Most tests are self-contained. Two groups compare against external tools and
+**skip cleanly when those are missing**, so a bare `go test ./...` always passes:
+
+| test | needs | what it proves |
+|---|---|---|
+| `TestGeneratorConformance` | ffmpeg | every generated stream decodes identically in FFmpeg and in `pkg/decoder`, and both match the intended pattern |
+| `TestDecodeRealContent` | ffmpeg + x265 | 48 x265 configurations decode bit-exactly |
+| `TestDecodeWPPStreams` | ffmpeg + x265 | wavefront parallel processing, including x265's own defaults |
+| `TestDeblockExactness` | ffmpeg + x265 | the loop filter is bit-exact, isolated on content that is exact without it |
+
+Point them at specific binaries with `HI265_FFMPEG` and `HI265_X265` if the ones
+on `PATH` are not the ones you want. The golden decoder tests in `pkg/decoder`
+need neither tool: their reference YUVs are committed under `testdata/golden/`.
+
 ## CLI Tools
 
 ### hi265dec — Decode HEVC to raw frames or images
