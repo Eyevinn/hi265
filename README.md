@@ -6,11 +6,12 @@
 [![license](https://img.shields.io/github/license/Eyevinn/hi265.svg)](https://github.com/Eyevinn/hi265/blob/main/LICENSE)
 [![Badge OSC](https://img.shields.io/badge/Evaluate-24243B?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTIiIGZpbGw9InVybCgjcGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyKSIvPgo8Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI3IiBzdHJva2U9ImJsYWNrIiBzdHJva2Utd2lkdGg9IjIiLz4KPGRlZnM+CjxsaW5lYXJHcmFkaWVudCBpZD0icGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyIiB4MT0iMTIiIHkxPSIwIiB4Mj0iMTIiIHkyPSIyNCIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPgo8c3RvcCBzdG9wLWNvbG9yPSIjQzE4M0ZGIi8+CjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzREQzlGRiIvPgo8L2xpbmVhckdyYWRpZW50Pgo8L2RlZnM+Cjwvc3ZnPgo=)](https://app.osaas.io/browse/eyevinn-mp4ff)
 
-## Pure Go HEVC/H.265 IDR Decoder & Bitstream Generator
+## Pure Go HEVC/H.265 Decoder & Bitstream Generator
 
-A pure Go HEVC/H.265 decoder for IDR and P-skip frames, plus a bitstream
-generator for producing valid HEVC test content from flat-color 16x16 CTU
-patterns. Sister project to [hi264](https://github.com/Eyevinn/hi264) (H.264/AVC).
+A pure Go HEVC/H.265 decoder for intra pictures (IDR and CRA) and P-skip
+frames, plus a bitstream generator for producing valid HEVC test content from
+flat-color 16x16 CTU patterns. Sister project to
+[hi264](https://github.com/Eyevinn/hi264) (H.264/AVC).
 
 This is **not** a general-purpose video encoder — it does not accept arbitrary
 pixel input or perform motion estimation. The encoder produces intra DC
@@ -21,9 +22,16 @@ counters, and reference content for decoder verification.
 Decoding is 8-bit 4:2:0 only. The gray IDR generator (`hi265gray`) supports
 any chroma format and bit depth (4:2:0, 4:2:2, 4:4:4; 8-bit, 10-bit, 12-bit).
 
-Pixel-perfect match with FFmpeg decoding across 16+ golden test cases covering
-SAO, sign hiding, transform skip, deblocking, P-frames, varied QP ranges, and
-complex content.
+Pixel-perfect against FFmpeg in both directions. Intra pictures from a real
+encoder decode bit-exactly — wavefront parallel processing (x265's default),
+SAO, deblocking, sign data hiding, every intra mode, NxN partitions, transform
+trees from 4x4 to 32x32, per-quantization-group QP and the conformance window —
+verified across 48 x265 configurations. Everything the generator produces
+decodes identically in FFmpeg and in this decoder, which is checked on every
+`go test` run. See [Build & Test](#build--test).
+
+Not supported: tiles, and P/B frames with real motion (only zero-motion skip,
+so inter pictures beyond a freeze are out of scope).
 
 ## Build & Test
 
@@ -32,13 +40,89 @@ go build ./...
 go test ./...
 ```
 
+Most tests are self-contained. Two groups compare against external tools and
+**skip cleanly when those are missing**, so a bare `go test ./...` always passes:
+
+| test | needs | what it proves |
+|---|---|---|
+| `TestGeneratorConformance` | ffmpeg | every generated stream decodes identically in FFmpeg and in `pkg/decoder`, and both match the intended pattern |
+| `TestDecodeRealContent` | ffmpeg + x265 | 48 x265 configurations decode bit-exactly |
+| `TestDecodeWPPStreams` | ffmpeg + x265 | wavefront parallel processing, including x265's own defaults |
+| `TestDeblockExactness` | ffmpeg + x265 | the loop filter is bit-exact, isolated on content that is exact without it |
+
+Point them at specific binaries with `HI265_FFMPEG` and `HI265_X265` if the ones
+on `PATH` are not the ones you want. The golden decoder tests in `pkg/decoder`
+need neither tool: their reference YUVs are committed under `testdata/golden/`.
+
 ## CLI Tools
 
-### hi265dec — Decode HEVC from raw .265
+### hi265dec — Decode HEVC to raw frames or images
+
+Input is Annex-B (`.265`, `.hevc`, `.h265`) or MP4 (`.mp4`, `.m4v`, `.m4s`),
+progressive or fragmented; MP4 parameter sets are read from the `hvcC` box.
+Output format follows the output extension: `.yuv`, `.y4m`, `.png`, `.jpg`.
+The output path may be given positionally or with `-o`, and flags may appear on
+either side of the input path.
 
 ```bash
-# Decode HEVC Annex-B to raw YUV
+# Raw YUV (all decoded frames, concatenated)
 go run ./cmd/hi265dec input.265 output.yuv
+go run ./cmd/hi265dec input.265 -o output.yuv
+
+# MP4 input; samples decode in order, so P-skip frames resolve correctly
+go run ./cmd/hi265dec input.mp4 -o frames.yuv
+
+# Thumbnail: first frame only
+go run ./cmd/hi265dec -n 1 input.mp4 thumb.png
+
+# N frames as numbered images (thumbs_0000.jpg, thumbs_0001.jpg, ...)
+go run ./cmd/hi265dec -n 5 -q 95 input.mp4 thumbs.jpg
+
+# Y4M, and a BT.709 RGB conversion for the image formats
+go run ./cmd/hi265dec input.265 out.y4m
+go run ./cmd/hi265dec -colorspace bt709 input.265 out.png
+```
+
+| Flag | Description | Default |
+|---|---|---|
+| `-o` | Output file (or give it as the second positional) | input name + `.yuv` |
+| `-n` | Number of frames to write (0 = all) | 0 |
+| `-q` | JPEG quality (1-100) | 85 |
+| `-colorspace` | Color space for RGB conversion (`bt601`/`bt709`/`bt2020`) | `bt601` |
+| `-full-range` | Treat input as full-range YCbCr | off |
+
+> Real encoder output decodes bit-exactly: wavefront parallel processing
+> (x265's default), SAO, deblocking, sign data hiding, every intra mode, NxN
+> partitions, transform trees down to 4x4, 32x32 transforms, per-quantization-
+> group QP, and the SPS conformance window. Verified against FFmpeg across 60
+> x265 configurations. Not supported: tiles, and P/B frames with real motion —
+> only zero-motion skip is implemented, so inter pictures beyond a freeze are out
+> of scope.
+
+### hi265-mp4-extend — Extend a CMAF segment with empty frames
+
+Appends N frames to a fragmented MP4 media segment, reusing the source's SPS
+and PPS verbatim so the output splices with no parameter-set change. Useful for
+padding a segment out to a target duration.
+
+```bash
+# Freeze: append 25 P-skip copies of the segment's last picture
+go run ./cmd/hi265-mp4-extend -frames 25 init.mp4 in.m4s out.m4s
+
+# Refresh with a mid-gray CRA, then P-skip copies of it. A CRA carries
+# slice_pic_order_cnt_lsb, so it continues the source POC instead of resetting
+# it — the right choice for splicing into a running stream, and something
+# H.264 cannot express.
+go run ./cmd/hi265-mp4-extend -frames 25 -gray-cra init.mp4 in.m4s out.m4s
+
+# Or a gray IDR (resets POC to 0 for everything after it)
+go run ./cmd/hi265-mp4-extend -frames 25 -gray-idr init.mp4 in.m4s out.m4s
+
+# Attach a Time Code SEI to each appended frame, continuing from the source
+go run ./cmd/hi265-mp4-extend -frames 25 -timecode init.mp4 in.m4s out.m4s
+
+# The result is a self-contained media segment, played next to the init segment
+cat init.mp4 out.m4s | ffplay -i -
 ```
 
 ### hi265gen — HEVC bitstream generator for test content
@@ -70,46 +154,72 @@ same `.gridimg` files and color specs work with both tools.
 
 ```bash
 # Grid-only: single IDR frame from grid pattern (frame size = grid size)
-go run ./cmd/hi265gen -f examples/logo.gridimg -o logo.265
-go run ./cmd/hi265gen -grid "xy,yx" -c x=235,128,128 -c y=16,128,128 -o checker.265
-go run ./cmd/hi265gen -grid "ab" -c a=255,0,0 -c b=0,0,255 -rgb -qp 20 -o test.265
+go run ./cmd/hi265gen -gi examples/logo.gridimg -o logo.265
+go run ./cmd/hi265gen -gp "xy,yx" -gc x=235,128,128 -gc y=16,128,128 -o checker.265
+go run ./cmd/hi265gen -gp "ab" -gc a=255,0,0 -gc b=0,0,255 -rgb -qp 20 -o test.265
 
 # Counter: frame counter digits on solid background
-go run ./cmd/hi265gen -w 192 -h 96 -n 10 -digits 3 -o counter.265
+go run ./cmd/hi265gen -w 192 -h 96 -n 10 -text "%03d" -o counter.265
 
 # With P-skip frames (IDR every 50 frames, P-skip copies between)
-go run ./cmd/hi265gen -w 192 -h 96 -n 100 -digits 3 -idr-interval 50 -o counter.265
+go run ./cmd/hi265gen -w 192 -h 96 -n 100 -text "%03d" -idr-interval 50 -o counter.265
 
 # Fragmented MP4 output (25 fps default, fragment every 25 frames)
-go run ./cmd/hi265gen -w 192 -h 96 -n 50 -digits 3 -o counter.mp4
+go run ./cmd/hi265gen -w 192 -h 96 -n 50 -text "%03d" -o counter.mp4
 
 # MP4 with custom framerate and fragment duration
-go run ./cmd/hi265gen -w 320 -h 240 -n 75 -digits 3 -fps 30 -frag-dur 30 -o counter.mp4
+go run ./cmd/hi265gen -w 320 -h 240 -n 75 -text "%03d" -fps 30 -frag-dur 30 -o counter.mp4
 
 # Tiled: grid pattern tiled to fill custom dimensions, with optional counter
-go run ./cmd/hi265gen -grid "xy,yx" -c x=235,128,128 -c y=16,128,128 -w 192 -h 96 -n 10 -digits 3 -o counter.265
+go run ./cmd/hi265gen -gp "xy,yx" -gc x=235,128,128 -gc y=16,128,128 -w 192 -h 96 -n 10 -text "%03d" -o counter.265
 
 # SMPTE color bars with counter overlay
-go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 10 -digits 3 -o smpte.265
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 10 -text "%03d" -o smpte.265
 
 # SMPTE bars with digit background box and explicit scale
-go run ./cmd/hi265gen -smpte -w 352 -h 288 -n 1 -digits 2 -digit-scale 3 -digit-bg 0,0,0 -o smpte_big.265
+go run ./cmd/hi265gen -smpte -w 352 -h 288 -n 1 -text "%02d" -text-scale 3 -text-bg 0,0,0 -o smpte_big.265
+
+# 8x8 coding granularity: minCb=8, so each 16x16 CTU is split into four
+# independent 8x8 CUs, each with its own intra mode. Finer coding structure for
+# the same pattern; the grid still maps one character per 16x16 block.
+go run ./cmd/hi265gen -gp "xy,yx" -gc x=235,128,128 -gc y=16,128,128 -w 64 -h 64 -8x8 -o fine.265
 
 # Fixed bytes per picture (pad with HEVC filler NALUs for CBR-like streams)
 go run ./cmd/hi265gen -smpte -w 192 -h 96 -bpp 5000 -o padded.265
-go run ./cmd/hi265gen -w 320 -h 240 -n 50 -digits 3 -bpp 8000 -o cbr_counter.mp4
+go run ./cmd/hi265gen -w 320 -h 240 -n 50 -text "%03d" -bpp 8000 -o cbr_counter.mp4
 
 # Raw image output (no HEVC encoding, useful as decoder reference)
-go run ./cmd/hi265gen -f examples/logo.gridimg -o logo.png
-go run ./cmd/hi265gen -f examples/logo.gridimg -o logo.yuv
-go run ./cmd/hi265gen -f examples/logo.gridimg -q 95 -o logo.jpg
-go run ./cmd/hi265gen -w 192 -h 96 -n 5 -digits 3 -o output.y4m
-go run ./cmd/hi265gen -w 192 -h 96 -n 5 -digits 3 -o frame_%03d.png
+go run ./cmd/hi265gen -gi examples/logo.gridimg -o logo.png
+go run ./cmd/hi265gen -gi examples/logo.gridimg -o logo.yuv
+go run ./cmd/hi265gen -gi examples/logo.gridimg -q 95 -o logo.jpg
+go run ./cmd/hi265gen -w 192 -h 96 -n 5 -text "%03d" -o output.y4m
+go run ./cmd/hi265gen -w 192 -h 96 -n 5 -text "%03d" -o frame_%03d.png
+```
+
+```bash
+# Time Code SEI: embed an HH:MM:SS:FF timecode per picture (IDR and P-skip alike).
+# HEVC carries the timecode in SEI 136, not in pic_timing as H.264 does, so no
+# SPS/VUI change is needed. Verify with `mp4ff-nallister -annexb -c hevc -sei 1`.
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 75 -fps 25 -timecode -o timecode.265
+
+# Read the timecode back with ffprobe (SMPTE 12M side data):
+#   ffprobe -loglevel error -select_streams v:0 \
+#     -show_entries frame_tags=timecode -of default=nw=1:nk=1 timecode.265
+
+# Start the counter/timecode at a given frame, so independently generated
+# segments (-start-frame 0, 48, 96, ...) concatenate into one continuous run.
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 48 -fps 25 -timecode -start-frame 76 -o seg.265
+
+# Fractional frame rate (29.97 = 30000/1001): MP4 timescale 30000, sample duration 1001.
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 60 -fps 30000/1001 -timecode -o ntsc.mp4
+
+# NTSC drop-frame counting (valid only for 29.97/59.94).
+go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 60 -fps 29.97 -drop-frame -timecode -o df.265
 ```
 
 ```bash
 # Color space: generate BT.709 stream (VUI signaled in SPS)
-go run ./cmd/hi265gen -f examples/logo.gridimg -colorspace bt709 -o logo_709.265
+go run ./cmd/hi265gen -gi examples/logo.gridimg -colorspace bt709 -o logo_709.265
 
 # Full-range BT.709
 go run ./cmd/hi265gen -smpte -w 320 -h 240 -colorspace bt709 -full-range -o smpte_709.265
@@ -119,28 +229,43 @@ Flags:
 
 | Flag | Description | Default |
 |---|---|---|
-| `-f` | Grid image file (`.gridimg`) | — |
-| `-grid` | Inline grid string (e.g. `"xy,yx"`) | — |
-| `-c` | Color mapping (repeatable, e.g. `x=235,128,128`) | — |
-| `-rgb` | Treat `-c` values as RGB instead of YCbCr | off |
+| `-gi` | Grid image file (`.gridimg`) | — |
+| `-gp` | Inline grid pattern, rows separated by commas (e.g. `"xy,yx"`) | — |
+| `-gc` | Color spec (repeatable, e.g. `x=235,128,128`) | — |
+| `-rgb` | Treat `-gc` values as RGB instead of YCbCr | off |
 | `-smpte` | Use built-in 75% SMPTE color bars pattern | off |
-| `-w` | Frame width in pixels | grid width |
-| `-h` | Frame height in pixels | grid height |
+| `-f` | Output format (`265`, `hevc`, `mp4`, `y4m`, `yuv`, `png`, `jpg`); required with `-o -` | from `-o` extension |
+| `-w` | Frame width in pixels (multiple of 8) | grid width |
+| `-h` | Frame height in pixels (multiple of 8) | grid height |
 | `-n` | Number of frames | 1 |
-| `-digits` | Counter digit count (0 = no counter) | 0 |
-| `-digit-scale` | Digit scale factor (0 = auto-fit) | 0 |
-| `-digit-bg` | Digit background box color (R,G,B) | none |
-| `-fg` | Foreground color (R,G,B) | — |
-| `-bg` | Background color (R,G,B) | — |
-| `-qp` | Quantization parameter | 26 |
-| `-q` | JPEG quality | 85 |
+| `-text` | Text overlay pattern (e.g. `"%03d"`, `"%mm:%ss.%ff"`) | — |
+| `-text-scale` | Text scale factor (0 = auto-fit) | 0 |
+| `-text-bg` | Text background box color (R,G,B) | none |
+| `-fg` | Foreground RGB color for text | `255,255,255` |
+| `-bg` | Background RGB color | `0,0,0` |
+| `-8x8` | Split each 16x16 CTU into four independent 8x8 CUs | off |
+| `-qp` | Quantization parameter (0-51) | 26 |
+| `-q` | JPEG quality (1-100) | 85 |
 | `-idr-interval` | Frames between IDR keyframes (0 = all-IDR) | 0 |
-| `-bpp` | Bytes per picture (filler NAL padding) | 0 (off) |
+| `-bpp` | Target bytes per picture (filler NAL padding) | 0 (off) |
+| `-kbps` | Target bitrate in kbit/s (converted to `-bpp` using `-fps`) | 0 (off) |
 | `-colorspace` | Color space (`bt601`/`bt709`/`bt2020`) | `bt601` |
 | `-full-range` | Full-range YCbCr (0-255) | off (limited) |
-| `-fps` | MP4 framerate | 25 |
+| `-timecode` | Emit a Time Code SEI (payload type 136) per picture (`265`/`mp4` only) | off |
+| `-start-frame` | Starting frame number; offsets counters, timecodes and the MP4 timeline | 0 |
+| `-drop-frame` | NTSC drop-frame timecode counting (only with `-fps 29.97`/`59.94`) | off |
+| `-fps` | Framerate: integer (`25`), rational (`30000/1001`) or NTSC decimal (`29.97`) | 25 |
 | `-frag-dur` | MP4 fragment duration in frames | 25 |
-| `-o` | Output file | — |
+| `-o` | Output file (`-` for stdout, requires `-f`) | — |
+| `-version` | Print version | — |
+
+> **Dimension constraint.** Frame width and height must be multiples of 8.
+> Sizes that are not a multiple of the 16x16 CTU — 1920x1080 and 640x360 among
+> them — are fully supported: the picture uses an 8-sample minimum coding block
+> and the partial bottom CTU row is split implicitly, as the spec requires.
+> Sizes that are not a multiple of 8 cannot be expressed with a 16x16 CTU
+> without a conformance window, and are rejected with an error naming the
+> nearest usable size.
 
 ### Constant bitrate testing with `-bpp`
 
@@ -158,13 +283,13 @@ playback:
 
 ```bash
 # 500 kbit/s tier — green background
-go run ./cmd/hi265gen -w 320 -h 240 -n 50 -digits 3 -bg 0,128,0 -bpp 2500 -o low.mp4
+go run ./cmd/hi265gen -w 320 -h 240 -n 50 -text "%03d" -bg 0,128,0 -bpp 2500 -o low.mp4
 
 # 1500 kbit/s tier — blue background
-go run ./cmd/hi265gen -w 640 -h 360 -n 50 -digits 3 -bg 0,0,200 -bpp 7500 -o mid.mp4
+go run ./cmd/hi265gen -w 640 -h 360 -n 50 -text "%03d" -bg 0,0,200 -bpp 7500 -o mid.mp4
 
 # 3000 kbit/s tier — red background
-go run ./cmd/hi265gen -w 1280 -h 720 -n 50 -digits 3 -bg 200,0,0 -bpp 15000 -o high.mp4
+go run ./cmd/hi265gen -w 1280 -h 720 -n 50 -text "%03d" -bg 200,0,0 -bpp 15000 -o high.mp4
 ```
 
 This makes it easy to verify that an ABR player switches between the correct
@@ -207,13 +332,13 @@ The `examples/` directory contains `.gridimg` files:
 
 ```bash
 # Encode to HEVC
-go run ./cmd/hi265gen -f examples/logo.gridimg -o logo.265
+go run ./cmd/hi265gen -gi examples/logo.gridimg -o logo.265
 
 # Decode to raw YUV
 go run ./cmd/hi265dec logo.265 logo.yuv
 
 # Generate reference PNG for comparison (raw output, no HEVC)
-go run ./cmd/hi265gen -f examples/logo.gridimg -o expected.png
+go run ./cmd/hi265gen -gi examples/logo.gridimg -o expected.png
 
 # Cross-verify with FFmpeg (raw YUV)
 go run ./cmd/hi265dec logo.265 logo.yuv
@@ -221,9 +346,9 @@ ffmpeg -i logo.265 -pix_fmt yuv420p -f rawvideo ff.yuv
 cmp logo.yuv ff.yuv  # should be identical
 ```
 
-### hi265gray — Gray IDR frame generator for GDR streams
+### hi265gray — Gray IDR/CRA frame generator for GDR streams
 
-Generates a uniform mid-gray IDR frame given external VPS, SPS, and PPS
+Generates a uniform mid-gray IDR or CRA frame given external VPS, SPS, and PPS
 parameter sets. Intended for bootstrapping decoders in Gradual Decode Refresh
 (GDR) streams that lack IDR frames.
 
@@ -239,7 +364,16 @@ go run ./cmd/hi265gray -f params.json -o gray.265
 
 # From hex strings
 go run ./cmd/hi265gray -vps 40010c... -sps 4201... -pps 4401... -o gray.265
+
+# A CRA refresh frame (nal_unit_type 21) at a chosen picture order count
+go run ./cmd/hi265gray -f params.json -cra -poc 42 -o gray_cra.265
 ```
+
+With `-cra` the slice is a CRA (Clean Random Access) picture at the POC given by
+`-poc` instead of an IDR. A CRA derives its POC MSBs from the preceding pictures
+rather than resetting the POC to 0, so it can be spliced into a running stream as
+a refresh point without breaking POC continuity of the pictures that follow —
+which an IDR cannot do.
 
 The input file (`-f`) is a JSON object with `vps`, `sps`, and `pps` hex strings:
 
@@ -264,6 +398,7 @@ details are in `internal/` and not accessible to external callers.
 import (
     "github.com/Eyevinn/hi265/pkg/decoder"
     "github.com/Eyevinn/hi265/pkg/encode"
+    "github.com/Eyevinn/hi265/pkg/timecode"
     "github.com/Eyevinn/hi264/pkg/yuv"
 )
 
@@ -293,6 +428,24 @@ pSkipSlice, err := encode.EncodePSkipSliceFromSPSPPS(sps, pps, poc)
 // Generate a gray IDR frame from external SPS/PPS (any chroma format / bit depth)
 // Useful for bootstrapping GDR streams that lack IDR frames.
 grayIDR, err := encode.EncodeGrayIDRSliceFromSPSPPS(sps, pps)
+
+// CRA (Clean Random Access) refresh point at a chosen POC. Unlike an IDR, a CRA
+// does not reset the POC, so it splices into a running stream without breaking
+// POC continuity of the pictures that follow.
+craSlice, err := encode.EncodeCRASliceFromSPSPPS(sps, pps, grid, colors, poc)
+grayCRA, err := encode.EncodeGrayCRASliceFromSPSPPS(sps, pps, poc)
+
+// Extend an existing stream: read the tail state, then append empty frames that
+// continue its POC. The source SPS/PPS are reused, so nothing is re-emitted.
+state, err := encode.LastFrameState(annexB)   // POC, NAL unit type, active SPS/PPS
+extended, err := encode.AppendEmptyFrames(annexB, 25)
+
+// Time Code SEI (payload type 136). HEVC carries the SMPTE timecode here rather
+// than in pic_timing, so no SPS/VUI change is needed to attach one.
+h, m, sec, fr, _ := timecode.Components(frameNum, 25, false)
+sei, err := encode.GenerateTimeCodeSEI(encode.TimeCode{
+    Hours: uint8(h), Minutes: uint8(m), Seconds: uint8(sec), Frames: uint16(fr),
+})
 ```
 
 ### Appending frames to an existing bitstream
@@ -350,22 +503,26 @@ stream = append(stream, pSkipSlice...)
 ## Architecture
 
 ```
-pkg/decoder/       — Public: top-level decoder API (DecodeAnnexB)
-pkg/encode/        — Public: bitstream generator API (GenerateIDR, GeneratePSkip, FrameEncoder)
-pkg/frame/         — Public: Frame type (decoded output)
-internal/cabac/    — Internal: CABAC arithmetic decoder and encoder engines
-internal/context/  — Internal: Context model initialization (170 contexts)
-internal/slice/    — Internal: Slice data parsing, CTU/CU/TU quadtree
-internal/transform/— Internal: Inverse quantization and transform (4x4, 8x8, 16x16)
-internal/pred/     — Internal: Intra prediction modes (planar, DC, angular)
-internal/deblock/  — Internal: Deblocking filter
-internal/sao/      — Internal: Sample Adaptive Offset
-cmd/hi265dec/      — CLI: decode HEVC from raw .265
-cmd/hi265gen/      — CLI: generate HEVC bitstreams or raw images from grid patterns
-cmd/hi265gray/     — CLI: generate gray IDR frames from external VPS/SPS/PPS
-examples/          — Example grid image files
-tools/             — Test generation scripts
-testdata/          — Golden HEVC bitstreams for regression testing
+pkg/decoder/          — Public: top-level decoder API (DecodeAnnexB, DecodeNALUs)
+pkg/encode/           — Public: bitstream generator API (GenerateIDR, GeneratePSkip,
+                        CRA and gray slices from external SPS/PPS, Time Code SEI,
+                        stream extension, FrameEncoder)
+pkg/frame/            — Public: Frame type (decoded output)
+pkg/timecode/         — Public: SMPTE timecode arithmetic and text formatting
+internal/cabac/       — Internal: CABAC arithmetic decoder and encoder engines
+internal/context/     — Internal: Context model initialization (170 contexts)
+internal/slice/       — Internal: Slice data parsing, CTU/CU/TU quadtree, WPP substreams
+internal/transform/   — Internal: Inverse quantization and transform (4x4 to 32x32, DST-VII)
+internal/pred/        — Internal: Intra prediction modes (planar, DC, angular)
+internal/deblock/     — Internal: Deblocking filter
+internal/sao/         — Internal: Sample Adaptive Offset
+cmd/hi265dec/         — CLI: decode HEVC from Annex-B or MP4 to YUV/Y4M/PNG/JPEG
+cmd/hi265gen/         — CLI: generate HEVC bitstreams or raw images from grid patterns
+cmd/hi265gray/        — CLI: generate gray IDR/CRA frames from external VPS/SPS/PPS
+cmd/hi265-mp4-extend/ — CLI: extend a CMAF media segment with empty frames
+examples/             — Example grid image files
+tools/                — Test generation scripts
+testdata/             — Golden HEVC bitstreams for regression testing
 ```
 
 ## Related Projects

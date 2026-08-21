@@ -1,4 +1,4 @@
-// Command hi265gray generates a gray IDR frame given external VPS, SPS, PPS.
+// Command hi265gray generates a gray IDR or CRA frame given external VPS, SPS, PPS.
 //
 // This is meant for bootstrapping a decoder for a Gradual Decode Refresh (GDR) stream
 // that lacks IDR frames. The generated frame is uniform mid-gray (Y=Cb=Cr=128 for 8-bit,
@@ -11,6 +11,10 @@
 //
 //	hi265gray -f testdata/vps_sps_pps_422_10bit.json -o gray.265
 //	hi265gray -vps <hex> -sps <hex> -pps <hex> -o gray.265
+//	hi265gray -f testdata/vps_sps_pps_420_8bit.json -cra -poc 42 -o gray_cra.265
+//
+// With -cra the frame is a CRA (nal_unit_type 21) at the POC given by -poc, which
+// can be spliced into a running stream without resetting the picture order count.
 package main
 
 import (
@@ -29,17 +33,23 @@ import (
 
 const appName = "hi265gray"
 
-var usg = `%s - generate a gray HEVC IDR frame from external VPS/SPS/PPS.
+var usg = `%s - generate a gray HEVC IDR or CRA frame from external VPS/SPS/PPS.
 
 Usage:
 
   %s -f testdata/vps_sps_pps_422_10bit.json -o gray.265
   %s -vps <hex> -sps <hex> -pps <hex> -o gray.265
+  %s -f testdata/vps_sps_pps_420_8bit.json -cra -poc 42 -o gray_cra.265
 
 The input file (-f) is a JSON object with vps/sps/pps hex strings:
   {"vps": "40010c...", "sps": "4201...", "pps": "4401..."}
 
-Output is an Annex-B bitstream: VPS + SPS + PPS + gray IDR slice.
+Output is an Annex-B bitstream: VPS + SPS + PPS + gray IDR or CRA slice.
+
+With -cra the slice is a CRA (nal_unit_type 21) at the POC given by -poc.
+A CRA does not reset the picture order count, so it can be spliced into a
+running stream as a refresh point without breaking POC continuity, which an
+IDR (always POC 0) cannot do.
 
 Options:
 `
@@ -51,6 +61,8 @@ type options struct {
 	spsHex  string
 	ppsHex  string
 	output  string
+	cra     bool
+	poc     int
 }
 
 func parseOptions(fs *flag.FlagSet, args []string) (*options, error) {
@@ -61,8 +73,10 @@ func parseOptions(fs *flag.FlagSet, args []string) (*options, error) {
 	fs.StringVar(&opts.spsHex, "sps", "", "SPS NALU as hex string (including 2-byte NAL header)")
 	fs.StringVar(&opts.ppsHex, "pps", "", "PPS NALU as hex string (including 2-byte NAL header)")
 	fs.StringVar(&opts.output, "o", "", "output Annex-B file (required)")
+	fs.BoolVar(&opts.cra, "cra", false, "generate a CRA frame (nal_unit_type 21) instead of an IDR")
+	fs.IntVar(&opts.poc, "poc", 0, "picture order count of the CRA frame (only used with -cra)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, usg, appName, appName, appName)
+		fmt.Fprintf(os.Stderr, usg, appName, appName, appName, appName)
 		fs.PrintDefaults()
 	}
 	err := fs.Parse(args[1:])
@@ -140,6 +154,13 @@ func run(args []string) error {
 		return fmt.Errorf("-o output file is required")
 	}
 
+	if opts.poc != 0 && !opts.cra {
+		return fmt.Errorf("-poc is only meaningful with -cra (an IDR always has POC 0)")
+	}
+	if opts.poc < 0 {
+		return fmt.Errorf("-poc must not be negative, got %d", opts.poc)
+	}
+
 	// Get VPS/SPS/PPS NALUs
 	var vpsNALU, spsNALU, ppsNALU []byte
 
@@ -196,13 +217,20 @@ func run(args []string) error {
 		sps.PicWidthInLumaSamples, sps.PicHeightInLumaSamples,
 		chromaFmt, bitDepth, 1<<ctuLog2, 1<<log2MinCb)
 
-	// Generate gray IDR slice
-	idrSlice, err := encode.EncodeGrayIDRSliceFromSPSPPS(sps, pps)
+	// Generate the gray slice: IDR by default, CRA at the requested POC with -cra
+	frameType := "IDR"
+	var graySlice []byte
+	if opts.cra {
+		frameType = fmt.Sprintf("CRA (POC %d)", opts.poc)
+		graySlice, err = encode.EncodeGrayCRASliceFromSPSPPS(sps, pps, opts.poc)
+	} else {
+		graySlice, err = encode.EncodeGrayIDRSliceFromSPSPPS(sps, pps)
+	}
 	if err != nil {
-		return fmt.Errorf("encoding gray IDR: %w", err)
+		return fmt.Errorf("encoding gray %s: %w", frameType, err)
 	}
 
-	// Write output: VPS + SPS + PPS + IDR in Annex-B format
+	// Write output: VPS + SPS + PPS + gray slice in Annex-B format
 	f, err := os.Create(opts.output)
 	if err != nil {
 		return err
@@ -218,13 +246,13 @@ func run(args []string) error {
 		return err
 	}
 
-	// Write IDR slice (already has start code from EncodeGrayIDRSliceFromSPSPPS)
-	if _, err := f.Write(idrSlice); err != nil {
+	// Write the gray slice (already Annex-B framed by the encoder)
+	if _, err := f.Write(graySlice); err != nil {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Wrote gray IDR %dx%d (%s, %d-bit) to %s\n",
-		sps.PicWidthInLumaSamples, sps.PicHeightInLumaSamples,
+	fmt.Fprintf(os.Stderr, "Wrote gray %s %dx%d (%s, %d-bit) to %s\n",
+		frameType, sps.PicWidthInLumaSamples, sps.PicHeightInLumaSamples,
 		chromaFmt, bitDepth, opts.output)
 	return nil
 }

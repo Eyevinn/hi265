@@ -69,11 +69,20 @@ func (d *Decoder) DecodeNALUs(nalus [][]byte) ([]*frame.Frame, error) {
 			d.ppsMap[pps.PicParameterSetID] = pps
 
 		case hevc.NALU_IDR_N_LP, hevc.NALU_IDR_W_RADL:
-			f, err := d.decodeIDR(nalu)
+			f, err := d.decodeIRAP(nalu, false)
 			if err != nil {
 				return nil, err
 			}
-			d.refFrame = f
+			frames = append(frames, f)
+
+		case hevc.NALU_CRA:
+			// A CRA is an intra picture like an IDR, but its header carries POC
+			// and reference picture set fields. It becomes the new reference
+			// frame for the P-skip pictures that follow.
+			f, err := d.decodeIRAP(nalu, true)
+			if err != nil {
+				return nil, err
+			}
 			frames = append(frames, f)
 
 		case hevc.NALU_TRAIL_R, hevc.NALU_TRAIL_N:
@@ -81,7 +90,6 @@ func (d *Decoder) DecodeNALUs(nalus [][]byte) ([]*frame.Frame, error) {
 			if err != nil {
 				return nil, err
 			}
-			d.refFrame = f
 			frames = append(frames, f)
 
 		case hevc.NALU_SEI_PREFIX, hevc.NALU_SEI_SUFFIX:
@@ -100,8 +108,133 @@ func (d *Decoder) DecodeNALUs(nalus [][]byte) ([]*frame.Frame, error) {
 	return frames, nil
 }
 
-// decodeIDR decodes an IDR slice NALU.
-func (d *Decoder) decodeIDR(nalu []byte) (*frame.Frame, error) {
+// parsePOCAndRefPicSets parses the slice header fields that every picture except
+// an IDR carries right after pic_output_flag (spec 7.3.6.1): pic_order_cnt_lsb,
+// the short-term and long-term reference picture sets, and
+// slice_temporal_mvp_enabled_flag. It returns the POC LSB and the slice-level
+// temporal MVP flag.
+func parsePOCAndRefPicSets(r *bits.EBSPReader, sps *hevc.SPS) (pocLsb int, temporalMvpEnabled bool, err error) {
+	pocLsbBits := int(sps.Log2MaxPicOrderCntLsbMinus4) + 4
+	pocLsb = int(r.Read(pocLsbBits))
+
+	// short_term_ref_pic_set
+	stRefPicSetSpsFlag := r.ReadFlag()
+	if stRefPicSetSpsFlag {
+		numSets := int(sps.NumShortTermRefPicSets)
+		if numSets > 1 {
+			nBits := ceilLog2(numSets)
+			r.Read(nBits)
+		}
+	} else {
+		// Inline short_term_ref_pic_set (st_rps_idx = num_short_term_ref_pic_sets)
+		stRpsIdx := int(sps.NumShortTermRefPicSets)
+		interRpsPredFlag := false
+		if stRpsIdx != 0 {
+			interRpsPredFlag = r.ReadFlag()
+		}
+		if interRpsPredFlag {
+			// Prediction mode: delta from a reference RPS
+			r.ReadExpGolomb() // delta_idx_minus1
+			r.ReadFlag()      // delta_rps_sign
+			r.ReadExpGolomb() // abs_delta_rps_minus1
+			// Need reference RPS to know num_delta_pocs - not supported yet
+			return 0, false, fmt.Errorf("inter_ref_pic_set_prediction_flag=1 not supported")
+		}
+		// Direct mode: list delta POCs
+		numNegPics := int(r.ReadExpGolomb())
+		numPosPics := int(r.ReadExpGolomb())
+		for range numNegPics {
+			r.ReadExpGolomb() // delta_poc_s0_minus1
+			r.ReadFlag()      // used_by_curr_pic_s0_flag
+		}
+		for range numPosPics {
+			r.ReadExpGolomb() // delta_poc_s1_minus1
+			r.ReadFlag()      // used_by_curr_pic_s1_flag
+		}
+	}
+
+	// long_term_ref_pics
+	if sps.LongTermRefPicsPresentFlag {
+		numLtSps := 0
+		if sps.NumLongTermRefPics > 0 {
+			numLtSps = int(r.ReadExpGolomb()) // num_long_term_sps
+		}
+		numLtPics := int(r.ReadExpGolomb()) // num_long_term_pics
+		for i := range numLtSps + numLtPics {
+			if i < numLtSps {
+				if sps.NumLongTermRefPics > 1 {
+					r.Read(ceilLog2(int(sps.NumLongTermRefPics))) // lt_idx_sps
+				}
+			} else {
+				r.Read(pocLsbBits) // poc_lsb_lt
+				r.ReadFlag()       // used_by_curr_pic_lt_flag
+			}
+			if r.ReadFlag() { // delta_poc_msb_present_flag
+				r.ReadExpGolomb() // delta_poc_msb_cycle_lt
+			}
+		}
+	}
+
+	// slice_temporal_mvp_enabled_flag
+	if sps.SpsTemporalMvpEnabledFlag {
+		temporalMvpEnabled = r.ReadFlag()
+	}
+
+	return pocLsb, temporalMvpEnabled, nil
+}
+
+// decodeIRAP decodes an intra random access point slice NALU: an IDR, or a CRA
+// when isCRA is set. Both are decoded as intra pictures; the CRA header
+// additionally carries slice_pic_order_cnt_lsb, the reference picture sets and
+// slice_temporal_mvp_enabled_flag (spec 7.3.6.1).
+// finishSliceHeader parses the tail of a slice segment header: the entry point
+// offsets, any slice segment header extension, and byte_alignment. It returns
+// the byte offsets, relative to the start of the slice data, at which each
+// substream after the first begins.
+//
+// num_entry_point_offsets is present whenever tiles or wavefront parallel
+// processing is enabled (spec 7.3.6.1). Skipping it left the reader a few bits
+// short of the alignment, which showed up as a failed stop-bit check — and since
+// x265 enables WPP by default, that was most real-world streams.
+func finishSliceHeader(r *bits.EBSPReader, sps *hevc.SPS, pps *hevc.PPS) ([]int, error) {
+	var entryPoints []int
+	if pps.TilesEnabledFlag || pps.EntropyCodingSyncEnabledFlag {
+		numEntryPointOffsets := int(r.ReadExpGolomb())
+		if numEntryPointOffsets > 0 {
+			offsetLen := int(r.ReadExpGolomb()) + 1
+			if offsetLen < 1 || offsetLen > 32 {
+				return nil, fmt.Errorf("slice header: offset_len_minus1+1 = %d out of range", offsetLen)
+			}
+			// The coded values are the sizes of consecutive substreams, so
+			// accumulate them into absolute positions within the slice data.
+			pos := 0
+			entryPoints = make([]int, 0, numEntryPointOffsets)
+			for range numEntryPointOffsets {
+				pos += int(r.Read(offsetLen)) + 1
+				entryPoints = append(entryPoints, pos)
+			}
+		}
+	}
+
+	if pps.SliceSegmentHeaderExtensionPresentFlag {
+		extLen := int(r.ReadExpGolomb())
+		for range extLen {
+			r.Read(8)
+		}
+	}
+
+	// byte_alignment
+	stopBit := r.Read(1)
+	if stopBit != 1 {
+		return nil, fmt.Errorf("slice header: expected stop bit 1, got %d", stopBit)
+	}
+	if bitsInByte := r.NrBitsRead() % 8; bitsInByte != 0 {
+		r.Read(8 - bitsInByte)
+	}
+	return entryPoints, nil
+}
+
+func (d *Decoder) decodeIRAP(nalu []byte, isCRA bool) (*frame.Frame, error) {
 	r := bits.NewEBSPReader(bytes.NewReader(nalu))
 
 	// Skip 2-byte NALU header
@@ -110,7 +243,7 @@ func (d *Decoder) decodeIDR(nalu []byte) (*frame.Frame, error) {
 	// first_slice_segment_in_pic_flag
 	r.ReadFlag()
 
-	// no_output_of_prior_pics_flag (present for IDR)
+	// no_output_of_prior_pics_flag (present for all IRAP pictures)
 	r.ReadFlag()
 
 	// slice_pic_parameter_set_id
@@ -132,7 +265,13 @@ func (d *Decoder) decodeIDR(nalu []byte) (*frame.Frame, error) {
 		r.ReadFlag()
 	}
 
-	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set
+	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set.
+	// CRA: POC lsb, reference picture sets and temporal MVP flag are present.
+	if isCRA {
+		if _, _, err := parsePOCAndRefPicSets(r, sps); err != nil {
+			return nil, err
+		}
+	}
 
 	// SAO flags if enabled
 	var sliceSaoLuma, sliceSaoChroma bool
@@ -176,14 +315,10 @@ func (d *Decoder) decodeIDR(nalu []byte) (*frame.Frame, error) {
 		r.ReadFlag()
 	}
 
-	// byte_alignment
-	stopBit := r.Read(1)
-	if stopBit != 1 {
-		return nil, fmt.Errorf("slice header: expected stop bit 1, got %d", stopBit)
-	}
-	bitsInByte := r.NrBitsRead() % 8
-	if bitsInByte != 0 {
-		r.Read(8 - bitsInByte)
+	// Entry point offsets, slice header extension and byte alignment.
+	entryPoints, epErr := finishSliceHeader(r, sps, pps)
+	if epErr != nil {
+		return nil, epErr
 	}
 
 	if err := r.AccError(); err != nil {
@@ -198,7 +333,8 @@ func (d *Decoder) decodeIDR(nalu []byte) (*frame.Frame, error) {
 	log2CtbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3 +
 		int(sps.Log2DiffMaxMinLumaCodingBlockSize)
 
-	cabacData := removeEmulationPreventionBytes(nalu[headerSize:])
+	cabacData, droppedEPBs := removeEmulationPreventionBytesWithMap(nalu[headerSize:])
+	entryPoints = rebaseEntryPoints(entryPoints, droppedEPBs)
 
 	log2MinTrSize := int(sps.Log2MinLumaTransformBlockSizeMinus2) + 2
 	log2MaxTrSize := log2MinTrSize + int(sps.Log2DiffMaxMinLumaTransformBlockSize)
@@ -220,6 +356,8 @@ func (d *Decoder) decodeIDR(nalu []byte) (*frame.Frame, error) {
 		SaoChroma:                       sliceSaoChroma,
 		CuQpDeltaEnabled:                pps.CuQpDeltaEnabledFlag,
 		Log2MinCuQpDeltaSize:            log2CtbSize - int(pps.DiffCuQpDeltaDepth),
+		EntropyCodingSyncEnabled:        pps.EntropyCodingSyncEnabledFlag,
+		EntryPoints:                     entryPoints,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("decode slice data: %w", err)
@@ -259,67 +397,10 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 		r.ReadFlag()
 	}
 
-	// pic_order_cnt_lsb
-	pocLsbBits := int(sps.Log2MaxPicOrderCntLsbMinus4) + 4
-	r.Read(pocLsbBits)
-
-	// short_term_ref_pic_set
-	stRefPicSetSpsFlag := r.ReadFlag()
-	if stRefPicSetSpsFlag {
-		numSets := int(sps.NumShortTermRefPicSets)
-		if numSets > 1 {
-			nBits := ceilLog2(numSets)
-			r.Read(nBits)
-		}
-	} else {
-		// Inline short_term_ref_pic_set (st_rps_idx = num_short_term_ref_pic_sets)
-		stRpsIdx := int(sps.NumShortTermRefPicSets)
-		interRpsPredFlag := false
-		if stRpsIdx != 0 {
-			interRpsPredFlag = r.ReadFlag()
-		}
-		if interRpsPredFlag {
-			// Prediction mode: delta from a reference RPS
-			r.ReadExpGolomb() // delta_idx_minus1
-			r.ReadFlag()      // delta_rps_sign
-			r.ReadExpGolomb() // abs_delta_rps_minus1
-			// Need reference RPS to know num_delta_pocs - not supported yet
-			return nil, fmt.Errorf("inter_ref_pic_set_prediction_flag=1 not supported")
-		} else {
-			// Direct mode: list delta POCs
-			numNegPics := int(r.ReadExpGolomb())
-			numPosPics := int(r.ReadExpGolomb())
-			for range numNegPics {
-				r.ReadExpGolomb() // delta_poc_s0_minus1
-				r.ReadFlag()      // used_by_curr_pic_s0_flag
-			}
-			for range numPosPics {
-				r.ReadExpGolomb() // delta_poc_s1_minus1
-				r.ReadFlag()      // used_by_curr_pic_s1_flag
-			}
-		}
-	}
-
-	// long_term_ref_pics
-	if sps.LongTermRefPicsPresentFlag {
-		numLtSps := r.ReadExpGolomb()
-		numLtPics := r.ReadExpGolomb()
-		numLt := int(numLtSps + numLtPics)
-		pocBits := int(sps.Log2MaxPicOrderCntLsbMinus4) + 4
-		for i := range numLt {
-			if i < int(numLtSps) && sps.NumLongTermRefPics > 1 {
-				r.Read(ceilLog2(int(sps.NumLongTermRefPics)))
-			} else if i >= int(numLtSps) {
-				r.Read(pocBits) // poc_lsb_lt
-			}
-			r.ReadFlag() // delta_poc_msb_present_flag
-		}
-	}
-
-	// slice_temporal_mvp_enabled_flag
-	var sliceTemporalMvpEnabled bool
-	if sps.SpsTemporalMvpEnabledFlag {
-		sliceTemporalMvpEnabled = r.ReadFlag()
+	// pic_order_cnt_lsb, reference picture sets, slice_temporal_mvp_enabled_flag
+	_, sliceTemporalMvpEnabled, err := parsePOCAndRefPicSets(r, sps)
+	if err != nil {
+		return nil, err
 	}
 
 	// SAO flags
@@ -405,14 +486,10 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 		r.ReadFlag()
 	}
 
-	// byte_alignment
-	stopBit := r.Read(1)
-	if stopBit != 1 {
-		return nil, fmt.Errorf("p-slice header: expected stop bit 1, got %d", stopBit)
-	}
-	bitsInByte := r.NrBitsRead() % 8
-	if bitsInByte != 0 {
-		r.Read(8 - bitsInByte)
+	// Entry point offsets, slice header extension and byte alignment.
+	entryPoints, epErr := finishSliceHeader(r, sps, pps)
+	if epErr != nil {
+		return nil, epErr
 	}
 
 	if err := r.AccError(); err != nil {
@@ -427,7 +504,8 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 	log2CtbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3 +
 		int(sps.Log2DiffMaxMinLumaCodingBlockSize)
 
-	cabacData := removeEmulationPreventionBytes(nalu[headerSize:])
+	cabacData, droppedEPBs := removeEmulationPreventionBytesWithMap(nalu[headerSize:])
+	entryPoints = rebaseEntryPoints(entryPoints, droppedEPBs)
 
 	log2MinTrSize := int(sps.Log2MinLumaTransformBlockSizeMinus2) + 2
 	log2MaxTrSize := log2MinTrSize + int(sps.Log2DiffMaxMinLumaTransformBlockSize)
@@ -450,6 +528,8 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 		SaoChroma:                       sliceSaoChroma,
 		CuQpDeltaEnabled:                pps.CuQpDeltaEnabledFlag,
 		Log2MinCuQpDeltaSize:            log2CtbSize - int(pps.DiffCuQpDeltaDepth),
+		EntropyCodingSyncEnabled:        pps.EntropyCodingSyncEnabledFlag,
+		EntryPoints:                     entryPoints,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("decode P-slice data: %w", err)
@@ -542,24 +622,35 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 			}
 			f.SetLumaBlock(tu.X0, tu.Y0, trSize, recon)
 
-			// Chroma reconstruction
-			if tu.Log2TrSize < 3 && (tu.X0%8 != 0 || tu.Y0%8 != 0) {
+			// Chroma reconstruction. With 4x4 luma TBs only one of the four
+			// TUs in a group carries the chroma block, and it covers the whole
+			// group, so it is reconstructed at ChromaX0/ChromaY0 rather than at
+			// the TU's own position.
+			if !tu.HasChroma {
 				continue
 			}
+			chromaX0, chromaY0 := tu.ChromaX0, tu.ChromaY0
 			chromaTrSize := trSize / 2
 			if chromaTrSize < 4 {
 				chromaTrSize = 4
 			}
 
+			// IntraPredModeC (spec 8.4.3) derives from IntraPredModeY at the
+			// CU's top-left luma location, not from this transform block's PU.
+			// With an NxN partition the four luma PUs share one chroma block, so
+			// using the TU's own mode picks the wrong one for every quadrant but
+			// the first — and produces modes the chroma syntax cannot even
+			// express, such as 23 from a table of {0, 26, 10, 1}.
+			cuLumaMode := cu.IntraLumaMode[0]
 			chromaMode := cu.IntraChromaMode
 			switch chromaMode {
 			case 4:
-				chromaMode = lumaMode
-			case lumaMode:
+				chromaMode = cuLumaMode
+			case cuLumaMode:
 				chromaMode = 34
 			}
 
-			chromaQP := chromaQPFromLumaQP(cu.QpY)
+			chromaQP := transform.ChromaQPFromLumaQP(cu.QpY)
 
 			for comp := range 2 {
 				var chromaCoeffs []int32
@@ -569,7 +660,7 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 					chromaCoeffs = tu.CrCoeffs
 				}
 
-				chromaNeighbors := getChromaNeighbors(f, comp, tu.X0/2, tu.Y0/2, chromaTrSize, ctbSize)
+				chromaNeighbors := getChromaNeighbors(f, comp, chromaX0/2, chromaY0/2, chromaTrSize, ctbSize)
 				pred.FilterRefSamples(chromaNeighbors, chromaMode, chromaTrSize, false, false)
 				chromaPred := predictIntra(chromaMode, chromaTrSize, chromaNeighbors, bitDepth, false)
 
@@ -595,7 +686,7 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 				for i := range chromaRecon {
 					chromaRecon[i] = chromaPred[i] + chromaResidual[i]
 				}
-				f.SetChromaBlock(comp, tu.X0/2, tu.Y0/2, chromaTrSize, chromaRecon)
+				f.SetChromaBlock(comp, chromaX0/2, chromaY0/2, chromaTrSize, chromaRecon)
 			}
 		}
 	}
@@ -610,7 +701,44 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 		sao.Apply(f, sd.SaoParams, log2CtbSize)
 	}
 
-	return f, nil
+	// Later pictures predict from the full coded picture, but what comes out of
+	// the decoder is the conformance window.
+	d.refFrame = f
+	return cropToConformanceWindow(f, sps), nil
+}
+
+// cropToConformanceWindow returns the visible part of a decoded picture. An
+// encoder that pads the coded size up to a whole number of CTUs — x265 codes a
+// 360-line source as 368 lines — signals the padding in the SPS conformance
+// window, and a decoder that ignores it hands back the wrong picture size.
+// Returns the input untouched when there is nothing to crop.
+func cropToConformanceWindow(f *frame.Frame, sps *hevc.SPS) *frame.Frame {
+	if !sps.ConformanceWindowFlag {
+		return f
+	}
+	outW, outH := sps.ImageSize()
+	width, height := int(outW), int(outH)
+	if width == f.Width && height == f.Height {
+		return f
+	}
+	if width <= 0 || height <= 0 || width > f.Width || height > f.Height {
+		return f // nonsensical window: better the whole picture than nothing
+	}
+
+	// 4:2:0 offsets are in chroma units, so both planes crop on even boundaries.
+	left := int(sps.ConformanceWindow.LeftOffset) * 2
+	top := int(sps.ConformanceWindow.TopOffset) * 2
+
+	out := frame.NewFrame(width, height)
+	for y := range height {
+		copy(out.Y[y*out.StrideY:y*out.StrideY+width], f.Y[(y+top)*f.StrideY+left:])
+	}
+	cw, ch := width/2, height/2
+	for y := range ch {
+		copy(out.Cb[y*out.StrideC:y*out.StrideC+cw], f.Cb[(y+top/2)*f.StrideC+left/2:])
+		copy(out.Cr[y*out.StrideC:y*out.StrideC+cw], f.Cr[(y+top/2)*f.StrideC+left/2:])
+	}
+	return out
 }
 
 // predictIntra performs intra prediction for a block.
@@ -621,7 +749,7 @@ func predictIntra(mode, size int, neighbors *pred.Neighbors, bitDepth int, isLum
 	case 1:
 		return pred.PredictDC(size, neighbors, bitDepth, isLuma)
 	default:
-		return pred.PredictAngular(mode, size, neighbors, bitDepth)
+		return pred.PredictAngular(mode, size, neighbors, bitDepth, isLuma)
 	}
 }
 
@@ -731,34 +859,45 @@ func getChromaNeighbors(f *frame.Frame, comp, x0, y0, size, ctbSize int) *pred.N
 	)
 }
 
-func removeEmulationPreventionBytes(data []byte) []byte {
-	out := make([]byte, 0, len(data))
+// removeEmulationPreventionBytesWithMap also reports the input positions of the
+// bytes it dropped, so offsets expressed in raw NAL bytes can be translated to
+// the cleaned buffer.
+func removeEmulationPreventionBytesWithMap(data []byte) (out []byte, dropped []int) {
+	out = make([]byte, 0, len(data))
 	i := 0
 	for i < len(data) {
 		if i+2 < len(data) && data[i] == 0 && data[i+1] == 0 && data[i+2] == 3 {
 			out = append(out, 0, 0)
+			dropped = append(dropped, i+2)
 			i += 3
 		} else {
 			out = append(out, data[i])
 			i++
 		}
 	}
-	return out
+	return out, dropped
 }
 
-func chromaQPFromLumaQP(qpY int) int {
-	if qpY < 30 {
-		return qpY
+// rebaseEntryPoints translates entry point offsets from raw NAL byte positions
+// into positions in the emulation-prevention-stripped slice data.
+//
+// Spec 7.4.7.1 counts emulation prevention bytes as part of the slice segment
+// data for the purposes of these offsets, so on content that escapes a lot —
+// flat colour, where long zero runs are common — the raw offsets run well past
+// the end of the stripped buffer.
+func rebaseEntryPoints(entryPoints, dropped []int) []int {
+	if len(entryPoints) == 0 || len(dropped) == 0 {
+		return entryPoints
 	}
-	table := []int{
-		29, 30, 31, 32, 32, 33, 34, 34, 35, 35,
-		36, 36, 37, 37, 38, 39, 40, 41, 42, 43,
-		44, 45, 46,
+	out := make([]int, len(entryPoints))
+	next := 0
+	for i, ep := range entryPoints {
+		for next < len(dropped) && dropped[next] < ep {
+			next++
+		}
+		out[i] = ep - next
 	}
-	if qpY-30 < len(table) {
-		return table[qpY-30]
-	}
-	return qpY - 6
+	return out
 }
 
 // ceilLog2 returns ceil(log2(n)), minimum 1.

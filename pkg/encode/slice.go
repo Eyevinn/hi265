@@ -1,20 +1,220 @@
 package encode
 
 import (
+	"fmt"
+
 	"github.com/Eyevinn/hi265/internal/cabac"
 	"github.com/Eyevinn/hi265/internal/context"
 	"github.com/Eyevinn/hi265/internal/pred"
+	"github.com/Eyevinn/hi265/internal/slice"
 	"github.com/Eyevinn/hi265/internal/transform"
 	"github.com/Eyevinn/hi265/pkg/frame"
 	"github.com/Eyevinn/mp4ff/hevc"
 )
 
-// idrSliceParams holds the parameters needed to write an IDR slice header
-// when using external SPS/PPS.
+// intraModes records the intra luma mode of coded blocks at 4x4 granularity,
+// mirroring the decoder's map. Keying by CU index instead would break as soon as
+// CUs of two sizes appear in one picture, which is exactly what a partial CTU
+// row at the bottom edge produces.
+type intraModes struct {
+	m map[[2]int]int
+}
+
+func newIntraModes() *intraModes {
+	return &intraModes{m: make(map[[2]int]int)}
+}
+
+func (t *intraModes) set(x0, y0, size, mode int) {
+	for y := y0; y < y0+size; y += 4 {
+		for x := x0; x < x0+size; x += 4 {
+			t.m[[2]int{x / 4, y / 4}] = mode
+		}
+	}
+}
+
+// get returns the mode covering pixel (x, y), or -1 when nothing was coded there.
+func (t *intraModes) get(x, y int) int {
+	if x < 0 || y < 0 {
+		return -1
+	}
+	if m, ok := t.m[[2]int{x / 4, y / 4}]; ok {
+		return m
+	}
+	return -1
+}
+
+// ctuSizeLuma is the coding tree block size the generator always uses.
+const ctuSizeLuma = 16
+
+// codingLayout is the coding block geometry chosen for a picture. It is derived
+// in exactly one place so the SPS and the slice data cannot disagree about it.
+type codingLayout struct {
+	ctuSize       int
+	minCbSize     int
+	log2CtuSize   int
+	log2MinCbSize int
+	// splitToMin means every CU that fits is split all the way to minCbSize,
+	// which is what 8x8 mode asks for. Boundary CUs split regardless.
+	splitToMin bool
+}
+
+// chooseCodingLayout picks the coding block sizes for a picture.
+//
+// pic_width_in_luma_samples and pic_height_in_luma_samples must each be an
+// integer multiple of MinCbSizeY, so a 16x16 minimum CB can only express
+// dimensions that are multiples of 16. Common heights are not — 360 and 1080
+// are both 8 mod 16 — so those pictures use a minimum CB of 8, which makes them
+// legal and costs one split_cu_flag per CTU. Dimensions that are multiples of 16
+// keep the 16x16 minimum, so their bitstreams are unchanged.
+func chooseCodingLayout(width, height int, use8x8CU bool) codingLayout {
+	minCb := 16
+	if use8x8CU || width%16 != 0 || height%16 != 0 {
+		minCb = 8
+	}
+	return codingLayout{
+		ctuSize:       ctuSizeLuma,
+		minCbSize:     minCb,
+		log2CtuSize:   ceilLog2(ctuSizeLuma),
+		log2MinCbSize: ceilLog2(minCb),
+		splitToMin:    use8x8CU,
+	}
+}
+
+// validateFrameDimensions reports whether a picture size can be coded at all.
+// The smallest legal MinCbSizeY is 8 and the picture dimensions must be a
+// multiple of it, so 8 is the granularity floor; 4:2:0 chroma needs even
+// dimensions anyway. Sizes that are neither would need a conformance window,
+// which the generator does not emit.
+func validateFrameDimensions(width, height int) error {
+	if width <= 0 || height <= 0 {
+		return fmt.Errorf("frame size %dx%d: width and height must be positive", width, height)
+	}
+	if width%8 != 0 || height%8 != 0 {
+		return fmt.Errorf("frame size %dx%d: width and height must be multiples of 8 "+
+			"(HEVC requires a multiple of the minimum coding block size, and 8 is the "+
+			"smallest one); nearest usable size is %dx%d",
+			width, height, roundUpTo8(width), roundUpTo8(height))
+	}
+	return nil
+}
+
+func roundUpTo8(v int) int {
+	if v <= 0 {
+		return 8
+	}
+	return (v + 7) / 8 * 8
+}
+
+// cuDepths records the quadtree depth of each coded CU at minCb granularity, so
+// split_cu_flag can be given the context the spec asks for.
+type cuDepths struct {
+	depths     []int
+	minCbSize  int
+	widthMinCb int
+}
+
+func newCuDepths(picW, picH, minCbSize int) *cuDepths {
+	w := (picW + minCbSize - 1) / minCbSize
+	h := (picH + minCbSize - 1) / minCbSize
+	d := make([]int, w*h)
+	for i := range d {
+		d[i] = -1
+	}
+	return &cuDepths{depths: d, minCbSize: minCbSize, widthMinCb: w}
+}
+
+func (m *cuDepths) set(x0, y0, cuSize, depth int) {
+	h := len(m.depths) / m.widthMinCb
+	for y := y0 / m.minCbSize; y < (y0+cuSize)/m.minCbSize; y++ {
+		if y < 0 || y >= h {
+			continue
+		}
+		for x := x0 / m.minCbSize; x < (x0+cuSize)/m.minCbSize; x++ {
+			if x < 0 || x >= m.widthMinCb {
+				continue
+			}
+			m.depths[y*m.widthMinCb+x] = depth
+		}
+	}
+}
+
+func (m *cuDepths) get(x, y int) int {
+	if x < 0 || y < 0 {
+		return -1
+	}
+	bx, by := x/m.minCbSize, y/m.minCbSize
+	if bx >= m.widthMinCb || by*m.widthMinCb+bx >= len(m.depths) {
+		return -1
+	}
+	return m.depths[by*m.widthMinCb+bx]
+}
+
+// splitCuCtxInc is ctxInc for split_cu_flag per spec 9.3.4.2.2: one for each of
+// the left and above neighbours that sits deeper in the quadtree than this CU.
+func splitCuCtxInc(depths *cuDepths, x0, y0, depth int) int {
+	ctxInc := 0
+	if d := depths.get(x0-1, y0); d >= 0 && d > depth {
+		ctxInc++
+	}
+	if d := depths.get(x0, y0-1); d >= 0 && d > depth {
+		ctxInc++
+	}
+	return ctxInc
+}
+
+// encodeCodingQuadtree walks one coding quadtree, writing split_cu_flag exactly
+// where spec 7.3.8.4 codes it and calling code for every CU a decoder will parse.
+//
+// The flag is only coded when the CU lies entirely inside the picture. A CU that
+// crosses the right or bottom edge is split with no flag at all, the split being
+// inferred as long as the size stays above MinCbSizeY, and the children that
+// fall wholly outside the picture are not coded either. That is what lets a
+// 16x16 CTU cover a height like 1080 or 360.
+func encodeCodingQuadtree(enc *cabac.Encoder, models []cabac.CtxState,
+	x0, y0, size, depth int, lay codingLayout, picW, picH int,
+	depths *cuDepths, code func(x0, y0, size int)) {
+
+	if x0 >= picW || y0 >= picH {
+		return // wholly outside the picture: nothing is coded
+	}
+
+	fits := x0+size <= picW && y0+size <= picH
+	canSplit := size > lay.minCbSize
+
+	if canSplit {
+		switch {
+		case !fits:
+			// Implicit split: no flag is coded.
+		case lay.splitToMin:
+			enc.EncodeDecision(1, &models[context.CtxSplitCuFlag+splitCuCtxInc(depths, x0, y0, depth)])
+		default:
+			enc.EncodeDecision(0, &models[context.CtxSplitCuFlag+splitCuCtxInc(depths, x0, y0, depth)])
+			depths.set(x0, y0, size, depth)
+			code(x0, y0, size)
+			return
+		}
+		half := size / 2
+		for _, off := range [4][2]int{{0, 0}, {half, 0}, {0, half}, {half, half}} {
+			encodeCodingQuadtree(enc, models, x0+off[0], y0+off[1], half, depth+1,
+				lay, picW, picH, depths, code)
+		}
+		return
+	}
+
+	// At minCbSize. validateFrameDimensions guarantees the picture is a multiple
+	// of minCbSize, so a CU this size always fits and every sample read below is
+	// inside the plane.
+	depths.set(x0, y0, size, depth)
+	code(x0, y0, size)
+}
+
+// idrSliceParams holds the parameters needed to write an IRAP (IDR or CRA)
+// slice header when using external SPS/PPS.
 type idrSliceParams struct {
 	width                           int
 	height                          int
 	qp                              int
+	use8x8CU                        bool
 	ppsID                           uint32
 	numExtraSliceHeaderBits         uint8
 	outputFlagPresent               bool
@@ -23,14 +223,111 @@ type idrSliceParams struct {
 	deblockingFilterOverrideEnabled bool
 	deblockingFilterDisabled        bool
 	loopFilterAcrossSlicesEnabled   bool
+
+	// refPicSet is nil for an IDR slice and non-nil for a CRA slice, which
+	// carries the POC and reference picture set fields an IDR header omits.
+	refPicSet *pocRefPicSetParams
+}
+
+// pocRefPicSetParams holds the slice header fields that every picture except an
+// IDR carries right after pic_output_flag (spec 7.3.6.1): the picture order
+// count LSB, the short-term and long-term reference picture sets, and the
+// slice-level temporal MVP flag.
+type pocRefPicSetParams struct {
+	poc                    int
+	log2MaxPicOrderCntLsb  int  // log2_max_pic_order_cnt_lsb_minus4 + 4
+	numShortTermRefPicSets int  // sps.NumShortTermRefPicSets
+	numLongTermRefPics     int  // sps.NumLongTermRefPics (num_long_term_ref_pics_sps)
+	longTermRefPicsPresent bool // sps.LongTermRefPicsPresentFlag
+	spsTemporalMvpEnabled  bool // sps.SpsTemporalMvpEnabledFlag
+
+	// intraRefresh marks a picture that references nothing (a CRA): an empty
+	// inline short-term RPS is written and temporal MVP is switched off.
+	intraRefresh bool
+}
+
+// craRefPicSetParams derives the CRA-specific slice header fields from the SPS.
+func craRefPicSetParams(sps *hevc.SPS, poc int) pocRefPicSetParams {
+	return pocRefPicSetParams{
+		poc:                    poc,
+		log2MaxPicOrderCntLsb:  int(sps.Log2MaxPicOrderCntLsbMinus4) + 4,
+		numShortTermRefPicSets: int(sps.NumShortTermRefPicSets),
+		numLongTermRefPics:     int(sps.NumLongTermRefPics),
+		longTermRefPicsPresent: sps.LongTermRefPicsPresentFlag,
+		spsTemporalMvpEnabled:  sps.SpsTemporalMvpEnabledFlag,
+		intraRefresh:           true,
+	}
+}
+
+// writePOCAndRefPicSets writes slice_pic_order_cnt_lsb, the short-term and
+// long-term reference picture sets and slice_temporal_mvp_enabled_flag
+// (spec 7.3.6.1). Only POC LSBs are coded, so the caller's POC is masked to
+// log2MaxPicOrderCntLsb bits; the decoder derives the MSBs from prevTid0Pic,
+// which is what lets a CRA splice into a running stream without resetting POC.
+func writePOCAndRefPicSets(w *BitWriter, p pocRefPicSetParams) {
+	pocBits := p.log2MaxPicOrderCntLsb
+	pocMask := (1 << pocBits) - 1
+	w.WriteBits(uint32(p.poc&pocMask), pocBits)
+
+	switch {
+	case p.intraRefresh:
+		// An intra refresh picture uses no reference pictures, so an empty RPS
+		// is written inline rather than pointing at one of the SPS sets.
+		w.WriteBit(0) // short_term_ref_pic_set_sps_flag = 0
+		if p.numShortTermRefPicSets > 0 {
+			// Inline RPS in a slice header has stRpsIdx = num_short_term_ref_pic_sets,
+			// and inter_ref_pic_set_prediction_flag is coded when stRpsIdx > 0.
+			w.WriteBit(0) // inter_ref_pic_set_prediction_flag = 0
+		}
+		w.WriteUE(0) // num_negative_pics = 0
+		w.WriteUE(0) // num_positive_pics = 0
+
+	case p.numShortTermRefPicSets > 0:
+		// short_term_ref_pic_set_sps_flag = 1, use SPS index 0
+		w.WriteBit(1)
+		if p.numShortTermRefPicSets > 1 {
+			// short_term_ref_pic_set_idx: u(ceil(log2(numShortTermRefPicSets)))
+			bits := ceilLog2(p.numShortTermRefPicSets)
+			w.WriteBits(0, bits) // index 0
+		}
+
+	default:
+		// short_term_ref_pic_set_sps_flag = 0 (inline)
+		// Inline STRPS: stRpsIdx=0, no inter_ref_pic_set_prediction_flag
+		w.WriteBit(0)
+		w.WriteUE(1)  // num_negative_pics = 1
+		w.WriteUE(0)  // num_positive_pics = 0
+		w.WriteUE(0)  // delta_poc_s0_minus1 = 0 (deltaPOC = -1)
+		w.WriteBit(1) // used_by_curr_pic_s0_flag = 1
+	}
+
+	// Long-term reference pictures are never used.
+	if p.longTermRefPicsPresent {
+		if p.numLongTermRefPics > 0 {
+			w.WriteUE(0) // num_long_term_sps = 0
+		}
+		w.WriteUE(0) // num_long_term_pics = 0
+	}
+
+	// slice_temporal_mvp_enabled_flag. Spec 7.4.7.1 requires it to be 0 when
+	// the current picture is a CRA or BLA picture.
+	if p.spsTemporalMvpEnabled {
+		if p.intraRefresh {
+			w.WriteBit(0)
+		} else {
+			w.WriteBit(1)
+		}
+	}
 }
 
 func idrSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) idrSliceParams {
 	qp := 26 + int(pps.InitQpMinus26) // slice_qp_delta = 0
+	minCbSize := 1 << (int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3)
 	return idrSliceParams{
 		width:                           int(sps.PicWidthInLumaSamples),
 		height:                          int(sps.PicHeightInLumaSamples),
 		qp:                              qp,
+		use8x8CU:                        minCbSize == 8,
 		ppsID:                           pps.PicParameterSetID,
 		numExtraSliceHeaderBits:         pps.NumExtraSliceHeaderBits,
 		outputFlagPresent:               pps.OutputFlagPresentFlag,
@@ -42,14 +339,15 @@ func idrSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) idrSliceParams {
 	}
 }
 
-// encodeIDRSliceWithParams generates an IDR slice RBSP respecting all header fields
-// from external SPS/PPS parameters.
+// encodeIDRSliceWithParams generates an IRAP slice RBSP respecting all header fields
+// from external SPS/PPS parameters. It writes an IDR header, or a CRA header when
+// p.refPicSet is set.
 func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 	w := NewBitWriter()
 
 	// === Slice header ===
 	w.WriteBit(1)      // first_slice_segment_in_pic_flag = 1
-	w.WriteBit(0)      // no_output_of_prior_pics_flag = 0 (IDR only)
+	w.WriteBit(0)      // no_output_of_prior_pics_flag = 0 (present for all IRAP)
 	w.WriteUE(p.ppsID) // slice_pic_parameter_set_id
 
 	// num_extra_slice_header_bits: skip N zero bits
@@ -64,7 +362,11 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 		w.WriteBit(1) // pic_output_flag = 1
 	}
 
-	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set
+	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set.
+	// CRA: POC lsb, reference picture sets and temporal MVP flag are present.
+	if p.refPicSet != nil {
+		writePOCAndRefPicSets(w, *p.refPicSet)
+	}
 
 	// SAO flags
 	if p.saoEnabled {
@@ -98,8 +400,7 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 	headerBytes := w.Bytes()
 
 	// === Slice data (CABAC) ===
-	// IDR encoding only supports 16x16 CUs (CTU = minCb = 16)
-	cabacBytes := encodeIDRSliceData(p.width, p.height, p.qp, y, cb, cr)
+	cabacBytes := encodeIDRSliceData(p.width, p.height, p.qp, p.use8x8CU, y, cb, cr)
 
 	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
 	result = append(result, headerBytes...)
@@ -108,7 +409,7 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 }
 
 // encodeIDRSlice generates the IDR slice RBSP (header + CABAC data).
-func encodeIDRSlice(width, height, qp int, y, cb, cr []uint8) []byte {
+func encodeIDRSlice(width, height, qp int, use8x8CU bool, y, cb, cr []uint8) []byte {
 	w := NewBitWriter()
 
 	// === Slice header ===
@@ -131,7 +432,7 @@ func encodeIDRSlice(width, height, qp int, y, cb, cr []uint8) []byte {
 	headerBytes := w.Bytes()
 
 	// === Slice data (CABAC) ===
-	cabacBytes := encodeIDRSliceData(width, height, qp, y, cb, cr)
+	cabacBytes := encodeIDRSliceData(width, height, qp, use8x8CU, y, cb, cr)
 
 	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
 	result = append(result, headerBytes...)
@@ -140,24 +441,32 @@ func encodeIDRSlice(width, height, qp int, y, cb, cr []uint8) []byte {
 }
 
 // encodeIDRSliceData encodes the CABAC slice data for an IDR I-slice.
-// ctuSize must be 16 (the only supported CU size for IDR encoding).
-func encodeIDRSliceData(width, height, qp int, y, cb, cr []uint8) []byte {
+// The CTU size is always 16. With use8x8CU each CTU is split by the coding
+// quadtree into four independently predicted 8x8 CUs (SPS minCbSize = 8),
+// otherwise the CTU is one 16x16 CU (SPS minCbSize = 16).
+func encodeIDRSliceData(width, height, qp int, use8x8CU bool, y, cb, cr []uint8) []byte {
 	enc := cabac.NewEncoder()
 	models := context.InitModels(context.SliceTypeI, qp)
 
-	ctuSize := 16
+	lay := chooseCodingLayout(width, height, use8x8CU)
+	ctuSize := lay.ctuSize
 	numCTUx := (width + ctuSize - 1) / ctuSize
 	numCTUy := (height + ctuSize - 1) / ctuSize
 	totalCTUs := numCTUx * numCTUy
 
 	reconFrame := frame.NewFrame(width, height)
-	lumaModesMap := make(map[[2]int]int)
+	modes := newIntraModes()
+	depths := newCuDepths(width, height, lay.minCbSize)
 
 	ctuIdx := 0
 	for ctuY := 0; ctuY < height; ctuY += ctuSize {
 		for ctuX := 0; ctuX < width; ctuX += ctuSize {
-			encodeIDRCU(enc, models, ctuX, ctuY, ctuSize, width, height, qp,
-				y, cb, cr, reconFrame, lumaModesMap)
+			encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
+				width, height, depths,
+				func(x0, y0, cuSize int) {
+					encodeIDRCU(enc, models, x0, y0, cuSize, ctuSize, lay.minCbSize,
+						width, height, qp, y, cb, cr, reconFrame, modes)
+				})
 
 			// end_of_slice_segment_flag
 			ctuIdx++
@@ -172,26 +481,32 @@ func encodeIDRSliceData(width, height, qp int, y, cb, cr []uint8) []byte {
 	return enc.Flush()
 }
 
-// encodeIDRCU encodes a single 16x16 intra CU.
+// encodeIDRCU encodes a single intra CU of size cuSize (8 or 16) at (cuX, cuY),
+// as one PART_2Nx2N partition with one luma and two chroma transform blocks.
+// ctuSize is the CTU size (16), used for reference sample availability and for
+// the CTB boundary rule in the MPM derivation.
 func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
-	ctuX, ctuY, ctuSize, width, height, qp int,
-	y, cb, cr []uint8, reconFrame *frame.Frame, lumaModesMap map[[2]int]int) {
+	cuX, cuY, cuSize, ctuSize, minCbSize, width, height, qp int,
+	y, cb, cr []uint8, reconFrame *frame.Frame, modes *intraModes) {
 
-	// No split_cu_flag (CTU = minCbSize = 16, implicitly no split)
+	// split_cu_flag is written by the caller.
 	// No pred_mode_flag (I-slice, implicitly intra)
 
-	// part_mode: decoded when log2CbSize == log2MinCbSize
-	// bin=1 → 2Nx2N, bin=0 → NxN
-	enc.EncodeDecision(1, &models[context.CtxPartMode])
+	// part_mode is only coded at the minimum CB size (spec 7.3.8.5); above it,
+	// PART_2Nx2N is inferred. Writing it unconditionally desynchronises CABAC
+	// for a 16x16 CU in a picture whose minimum CB is 8.
+	if cuSize == minCbSize {
+		enc.EncodeDecision(1, &models[context.CtxPartMode]) // part_mode = 2Nx2N
+	}
 
 	// Choose the best intra prediction mode for this flat-color block.
-	// For flat 16x16 blocks, vertical (26) or horizontal (10) can produce
-	// zero residual when the block color matches the top or left neighbor,
-	// while DC (1) averages both neighbors and also introduces AC energy
-	// through edge filtering at color boundaries.
-	lumaMode := chooseBestLumaMode(reconFrame, ctuX, ctuY, ctuSize, width, y)
+	// For a flat block, vertical (26) or horizontal (10) can produce zero
+	// residual when the block color matches the top or left neighbor, while
+	// DC (1) averages both neighbors and also introduces AC energy through
+	// edge filtering at color boundaries.
+	lumaMode := chooseBestLumaMode(reconFrame, cuX, cuY, cuSize, width, y)
 
-	mpm := deriveMPM(ctuX, ctuY, ctuSize, width, lumaModesMap)
+	mpm := deriveMPM(cuX, cuY, ceilLog2(ctuSize), modes)
 
 	// Encode intra luma mode
 	mpmIdx := -1
@@ -225,40 +540,46 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 			enc.EncodeBypass(uint8((rem >> k) & 1))
 		}
 	}
-	lumaModesMap[[2]int{ctuX / ctuSize, ctuY / ctuSize}] = lumaMode
+	modes.set(cuX, cuY, cuSize, lumaMode)
 
 	// intra_chroma_pred_mode = 4 (DM mode)
 	// First bin = 0 means "use DM mode"
 	enc.EncodeDecision(0, &models[context.CtxIntraChromaPredMode])
 
-	// Transform tree (no split, TU = CU = 16x16)
+	// Transform tree (no split, TU = CU: 16x16 luma with 8x8 chroma, or
+	// 8x8 luma with 4x4 chroma)
+	log2TrSize := ceilLog2(cuSize)
+	log2ChromaTrSize := log2TrSize - 1
+
 	// cbf_cb at depth 0
-	cbfCb := hasNonZeroChroma(ctuX, ctuY, ctuSize, width, cb, qp, lumaMode, reconFrame, 0)
+	cbfCb := hasNonZeroChroma(cuX, cuY, cuSize, width, cb, qp, lumaMode, reconFrame, 0)
 	encBool(enc, &models[context.CtxCbfCb], cbfCb)
 
 	// cbf_cr at depth 0
-	cbfCr := hasNonZeroChroma(ctuX, ctuY, ctuSize, width, cr, qp, lumaMode, reconFrame, 1)
+	cbfCr := hasNonZeroChroma(cuX, cuY, cuSize, width, cr, qp, lumaMode, reconFrame, 1)
 	encBool(enc, &models[context.CtxCbfCr], cbfCr)
 
 	// Compute luma residual
 	lumaResidual, lumaLevels, cbfLuma := computeLumaResidual(
-		ctuX, ctuY, ctuSize, width, y, qp, lumaMode, reconFrame)
+		cuX, cuY, cuSize, width, y, qp, lumaMode, reconFrame)
 
 	// cbf_luma at depth 0 (context = !trafoDepth = 1, so ctxIdx = CtxCbfLuma + 1)
 	encBool(enc, &models[context.CtxCbfLuma+1], cbfLuma)
 
 	// Encode residual if any cbf is set
 	if cbfLuma {
-		encodeResidualCoding(enc, models, lumaLevels, 4, true, 0)
+		scanIdx := slice.ScanIdxForIntraMode(lumaMode, log2TrSize, true)
+		encodeResidualCoding(enc, models, lumaLevels, log2TrSize, true, scanIdx)
 	}
 
 	// Reconstruct luma
-	reconstructLuma(reconFrame, ctuX, ctuY, ctuSize, width, height,
+	reconstructLuma(reconFrame, cuX, cuY, cuSize, width, height,
 		lumaMode, lumaResidual, cbfLuma, lumaLevels, qp)
 
 	// Encode and reconstruct chroma
-	chromaTrSize := ctuSize / 2
+	chromaTrSize := cuSize / 2
 	chromaMode := lumaMode // DM mode
+	chromaScanIdx := slice.ScanIdxForIntraMode(chromaMode, log2ChromaTrSize, false)
 
 	for comp := range 2 {
 		var chromaSrc []uint8
@@ -270,13 +591,14 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 		hasCbf := (comp == 0 && cbfCb) || (comp == 1 && cbfCr)
 
 		if hasCbf {
-			chromaLevels := computeChromaLevels(ctuX, ctuY, ctuSize, width,
+			chromaLevels := computeChromaLevels(cuX, cuY, cuSize, width,
 				chromaSrc, qp, chromaMode, reconFrame, comp)
-			encodeResidualCoding(enc, models, chromaLevels, 3, false, 0) // log2(8)=3
-			reconstructChroma(reconFrame, comp, ctuX/2, ctuY/2, chromaTrSize,
+			encodeResidualCoding(enc, models, chromaLevels, log2ChromaTrSize, false,
+				chromaScanIdx)
+			reconstructChroma(reconFrame, comp, cuX/2, cuY/2, chromaTrSize,
 				width/2, height/2, chromaMode, chromaLevels, qp)
 		} else {
-			reconstructChroma(reconFrame, comp, ctuX/2, ctuY/2, chromaTrSize,
+			reconstructChroma(reconFrame, comp, cuX/2, cuY/2, chromaTrSize,
 				width/2, height/2, chromaMode, nil, qp)
 		}
 	}
@@ -291,22 +613,18 @@ func encBool(enc *cabac.Encoder, ctx *cabac.CtxState, val bool) {
 }
 
 // deriveMPM computes the Most Probable Modes for the CU at (x0,y0).
-func deriveMPM(x0, y0, cuSize, picWidth int, modeMap map[[2]int]int) [3]int {
-	cuX := x0 / cuSize
-	cuY := y0 / cuSize
-
-	leftMode := -1
-	if x0 > 0 {
-		if m, ok := modeMap[[2]int{cuX - 1, cuY}]; ok {
-			leftMode = m
-		}
-	}
+//
+// log2CtbSize is the CTB size of the picture. Intra mode prediction does not
+// cross a horizontal CTB boundary: per spec 8.4.2 the above candidate is
+// INTRA_DC whenever y0-1 falls outside the current CTB. Omitting that rule
+// keeps encoder and decoder self-consistent but makes the bitstream decode
+// differently in every conforming decoder.
+func deriveMPM(x0, y0, log2CtbSize int, modes *intraModes) [3]int {
+	leftMode := modes.get(x0-1, y0)
 
 	aboveMode := -1
-	if y0 > 0 {
-		if m, ok := modeMap[[2]int{cuX, cuY - 1}]; ok {
-			aboveMode = m
-		}
+	if y0-1 >= (y0>>log2CtbSize)<<log2CtbSize {
+		aboveMode = modes.get(x0, y0-1)
 	}
 
 	// HEVC spec 8.4.2
@@ -373,7 +691,7 @@ func hasNonZeroChroma(ctuX, ctuY, ctuSize, picWidth int, chromaSrc []uint8,
 	qp, lumaMode int, recon *frame.Frame, comp int) bool {
 
 	chromaTrSize := ctuSize / 2
-	chromaQP := chromaQPFromLumaQP(qp)
+	chromaQP := transform.ChromaQPFromLumaQP(qp)
 	cx := ctuX / 2
 	cy := ctuY / 2
 
@@ -445,7 +763,7 @@ func computeChromaLevels(ctuX, ctuY, ctuSize, picWidth int, chromaSrc []uint8,
 	qp, chromaMode int, recon *frame.Frame, comp int) []int32 {
 
 	chromaTrSize := ctuSize / 2
-	chromaQP := chromaQPFromLumaQP(qp)
+	chromaQP := transform.ChromaQPFromLumaQP(qp)
 	cx := ctuX / 2
 	cy := ctuY / 2
 
@@ -497,7 +815,7 @@ func predictIntra(mode, size int, neighbors *pred.Neighbors, bitDepth int, isLum
 	case 1:
 		return pred.PredictDC(size, neighbors, bitDepth, isLuma)
 	default:
-		return pred.PredictAngular(mode, size, neighbors, bitDepth)
+		return pred.PredictAngular(mode, size, neighbors, bitDepth, isLuma)
 	}
 }
 
@@ -655,7 +973,7 @@ func reconstructLuma(f *frame.Frame, x0, y0, size, picW, picH, mode int,
 func reconstructChroma(f *frame.Frame, comp, cx, cy, chromaTrSize, chromaW, chromaH,
 	mode int, levels []int32, qp int) {
 
-	chromaQP := chromaQPFromLumaQP(qp)
+	chromaQP := transform.ChromaQPFromLumaQP(qp)
 	chromaPred := predictChromaBlock(f, comp, cx, cy, chromaTrSize, mode)
 
 	var residual []int32
@@ -684,6 +1002,8 @@ type pSkipSliceParams struct {
 	outputFlagPresent                 bool
 	log2MaxPicOrderCntLsb             int // log2_max_pic_order_cnt_lsb_minus4 + 4
 	numShortTermRefPicSets            int
+	numLongTermRefPics                int // num_long_term_ref_pics_sps
+	longTermRefPicsPresent            bool
 	spsTemporalMvpEnabled             bool
 	saoEnabled                        bool
 	cabacInitPresent                  bool
@@ -697,16 +1017,22 @@ type pSkipSliceParams struct {
 }
 
 // encodePSkipSlice generates a P-skip slice RBSP (header + CABAC data).
-// Uses the default encoder parameters: CTU=16, minCb=16.
-func encodePSkipSlice(width, height, qp, poc int) []byte {
+// Uses the default encoder parameters: CTU=16, minCb=16, or minCb=8 with
+// use8x8CU to match the SPS written for 8x8 coding granularity. The picture is
+// one 16x16 skip CU per CTU either way; with minCb=8 that needs an explicit
+// split_cu_flag = 0 at depth 0.
+func encodePSkipSlice(width, height, qp, poc int, use8x8CU bool) []byte {
+	lay := chooseCodingLayout(width, height, use8x8CU)
+	log2MinCbMinus3 := lay.log2MinCbSize - 3
+	log2Diff := lay.log2CtuSize - lay.log2MinCbSize
 	return encodePSkipSliceWithParams(pSkipSliceParams{
 		width:                             width,
 		height:                            height,
 		qp:                                qp,
 		poc:                               poc,
 		log2MaxPicOrderCntLsb:             4,
-		log2MinCodingBlockSizeMinus3:      1, // minCb=16
-		log2DiffMaxMinLumaCodingBlockSize: 0, // CTU=16
+		log2MinCodingBlockSizeMinus3:      log2MinCbMinus3,
+		log2DiffMaxMinLumaCodingBlockSize: log2Diff,
 	})
 }
 
@@ -728,33 +1054,15 @@ func encodePSkipSliceWithParams(p pSkipSliceParams) []byte {
 		w.WriteBit(1) // pic_output_flag = 1
 	}
 
-	// pic_order_cnt_lsb: u(log2MaxPicOrderCntLsb) bits
-	pocBits := p.log2MaxPicOrderCntLsb
-	pocMask := (1 << pocBits) - 1
-	w.WriteBits(uint32(p.poc&pocMask), pocBits)
-
-	if p.numShortTermRefPicSets > 0 {
-		// short_term_ref_pic_set_sps_flag = 1, use SPS index 0
-		w.WriteBit(1)
-		if p.numShortTermRefPicSets > 1 {
-			// short_term_ref_pic_set_idx: u(ceil(log2(numShortTermRefPicSets)))
-			bits := ceilLog2(p.numShortTermRefPicSets)
-			w.WriteBits(0, bits) // index 0
-		}
-	} else {
-		// short_term_ref_pic_set_sps_flag = 0 (inline)
-		w.WriteBit(0)
-		// Inline STRPS: stRpsIdx=0, no inter_ref_pic_set_prediction
-		w.WriteUE(1)  // num_negative_pics = 1
-		w.WriteUE(0)  // num_positive_pics = 0
-		w.WriteUE(0)  // delta_poc_s0_minus1 = 0 (deltaPOC = -1)
-		w.WriteBit(1) // used_by_curr_pic_s0_flag = 1
-	}
-
-	// slice_temporal_mvp_enabled_flag
-	if p.spsTemporalMvpEnabled {
-		w.WriteBit(1) // slice_temporal_mvp_enabled_flag = 1
-	}
+	// pic_order_cnt_lsb, reference picture sets, slice_temporal_mvp_enabled_flag
+	writePOCAndRefPicSets(w, pocRefPicSetParams{
+		poc:                    p.poc,
+		log2MaxPicOrderCntLsb:  p.log2MaxPicOrderCntLsb,
+		numShortTermRefPicSets: p.numShortTermRefPicSets,
+		numLongTermRefPics:     p.numLongTermRefPics,
+		longTermRefPicsPresent: p.longTermRefPicsPresent,
+		spsTemporalMvpEnabled:  p.spsTemporalMvpEnabled,
+	})
 
 	// SAO flags
 	if p.saoEnabled {
@@ -830,34 +1138,35 @@ func encodePSkipSliceData(width, height, qp, ctuSize, log2MinCbSize int) []byte 
 	numCTUy := (height + ctuSize - 1) / ctuSize
 	totalCTUs := numCTUx * numCTUy
 
-	log2CtuSize := 0
-	for s := ctuSize; s > 1; s >>= 1 {
-		log2CtuSize++
+	// The layout comes from the SPS the caller is matching, not from
+	// chooseCodingLayout: an external SPS may use any minimum CB size.
+	lay := codingLayout{
+		ctuSize:       ctuSize,
+		minCbSize:     1 << log2MinCbSize,
+		log2CtuSize:   ceilLog2(ctuSize),
+		log2MinCbSize: log2MinCbSize,
 	}
+	depths := newCuDepths(width, height, lay.minCbSize)
 
 	ctuIdx := 0
 	for ctuY := 0; ctuY < height; ctuY += ctuSize {
 		for ctuX := 0; ctuX < width; ctuX += ctuSize {
-			// Write split_cu_flag=0 when CTU > minCB to signal no quadtree split.
-			// Context for split_cu_flag: ctxInc = condL + condA.
-			// For all-skip with no splits, neighbor depths are always 0 (CTU level),
-			// same as current depth, so condL=condA=0, ctxInc=0.
-			if log2CtuSize > log2MinCbSize {
-				enc.EncodeDecision(0, &models[context.CtxSplitCuFlag]) // split_cu_flag = 0
-			}
-
-			// cu_skip_flag = 1
-			// Context: ctxInc from left + above skip CU availability
-			ctxInc := 0
-			if ctuX > 0 {
-				ctxInc++ // left available and is skip
-			}
-			if ctuY > 0 {
-				ctxInc++ // above available and is skip
-			}
-			enc.EncodeDecision(1, &models[context.CtxCuSkipFlag+ctxInc])
-
-			// merge_idx = 0: when maxMergeCand=1, no bins coded
+			encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
+				width, height, depths,
+				func(x0, y0, _ int) {
+					// cu_skip_flag = 1. ctxInc counts the left and above
+					// neighbours that are skipped; every coded CU here is, so
+					// availability alone decides it.
+					ctxInc := 0
+					if x0 > 0 {
+						ctxInc++
+					}
+					if y0 > 0 {
+						ctxInc++
+					}
+					enc.EncodeDecision(1, &models[context.CtxCuSkipFlag+ctxInc])
+					// merge_idx = 0: when maxMergeCand=1, no bins coded
+				})
 
 			// end_of_slice_segment_flag
 			ctuIdx++
@@ -881,19 +1190,4 @@ func ceilLog2(n int) int {
 		bits++
 	}
 	return bits
-}
-
-func chromaQPFromLumaQP(qpY int) int {
-	if qpY < 30 {
-		return qpY
-	}
-	table := []int{
-		29, 30, 31, 32, 32, 33, 34, 34, 35, 35,
-		36, 36, 37, 37, 38, 39, 40, 41, 42, 43,
-		44, 45, 46,
-	}
-	if qpY-30 < len(table) {
-		return table[qpY-30]
-	}
-	return qpY - 6
 }

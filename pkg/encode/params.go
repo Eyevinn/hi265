@@ -58,7 +58,9 @@ func generateVPS() []byte {
 
 // generateSPS returns the SPS RBSP bytes for the given dimensions.
 // cs and rng control VUI colour description parameters.
-func generateSPS(width, height int, cs yuv.ColorSpace, rng yuv.Range) []byte {
+// With use8x8CU the minimum coding block size is 8 instead of 16, so a 16x16
+// CTU can be split into four independently predicted 8x8 CUs.
+func generateSPS(width, height int, cs yuv.ColorSpace, rng yuv.Range, use8x8CU bool) []byte {
 	w := NewBitWriter()
 
 	w.WriteBits(0, 4) // sps_video_parameter_set_id = 0
@@ -83,10 +85,19 @@ func generateSPS(width, height int, cs yuv.ColorSpace, rng yuv.Range) []byte {
 	w.WriteUE(0) // sps_max_num_reorder_pics = 0
 	w.WriteUE(0) // sps_max_latency_increase_plus1 = 0
 
-	w.WriteUE(1) // log2_min_luma_coding_block_size_minus3 = 1 (minCbSize=16)
-	w.WriteUE(0) // log2_diff_max_min_luma_coding_block_size = 0 (CTU=16)
-	w.WriteUE(0) // log2_min_luma_transform_block_size_minus2 = 0 (minTbSize=4)
-	w.WriteUE(2) // log2_diff_max_min_luma_transform_block_size = 2 (maxTbSize=16)
+	// Coding and transform block sizes, from the one place that decides them.
+	// MinTbLog2SizeY must stay strictly below MinCbLog2SizeY, so the 4x4 minimum
+	// transform block works for both. The maximum transform block matches the
+	// largest CU the layout can produce.
+	lay := chooseCodingLayout(width, height, use8x8CU)
+	w.WriteUE(uint32(lay.log2MinCbSize - 3))               // log2_min_luma_coding_block_size_minus3
+	w.WriteUE(uint32(lay.log2CtuSize - lay.log2MinCbSize)) // log2_diff_max_min_luma_coding_block_size
+	w.WriteUE(0)                                           // log2_min_luma_transform_block_size_minus2 (minTbSize=4)
+	if use8x8CU {
+		w.WriteUE(1) // log2_diff_max_min_luma_transform_block_size = 1 (maxTbSize=8)
+	} else {
+		w.WriteUE(2) // log2_diff_max_min_luma_transform_block_size = 2 (maxTbSize=16)
+	}
 	w.WriteUE(0) // max_transform_hierarchy_depth_inter = 0
 	w.WriteUE(0) // max_transform_hierarchy_depth_intra = 0
 
@@ -164,8 +175,9 @@ func generatePPS(qp int) []byte {
 	w.WriteBit(0) // entropy_coding_sync_enabled_flag = 0
 	// no tile/WPP info
 	w.WriteBit(0) // loop_filter_across_slices_enabled_flag = 0
-	w.WriteBit(0) // deblocking_filter_control_present_flag = 0
-	// no deblocking syntax
+	w.WriteBit(1) // deblocking_filter_control_present_flag = 1
+	w.WriteBit(0) // deblocking_filter_override_enabled_flag = 0
+	w.WriteBit(1) // pps_deblocking_filter_disabled_flag = 1
 	w.WriteBit(0) // pps_scaling_list_data_present_flag = 0
 	w.WriteBit(0) // lists_modification_present_flag = 0
 	w.WriteUE(0)  // log2_parallel_merge_level_minus2 = 0
