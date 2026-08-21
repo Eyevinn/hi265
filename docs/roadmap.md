@@ -393,7 +393,7 @@ Real-world MP4 input is blocked by 0.9 (WPP), not by the MP4 plumbing.
 - `cmd/hi265psnr` (or reuse hi264's `rawpsnr`) — there is an untracked `psnr`
   binary in the repo root but no committed command
 
-### 4.3 8x8 coding granularity (M) — encoder feature, not a CLI flag
+### 4.3 8x8 coding granularity (M) — **done**
 
 Parity with hi264's `-8x8` / `@8x8`: four characters per 16x16 block instead of
 one, so grid patterns and digits get real spatial detail. Today
@@ -430,6 +430,41 @@ Useful synergy with 0.1: with four 8x8 CUs inside a 16x16 CTB, the top two CUs
 must force `candB = INTRA_DC` while the bottom two legitimately use the above
 CU's mode. That makes an 8x8 pattern the sharpest golden test for the MPM fix —
 it exercises both sides of the branch in one frame, which no current test does.
+
+**Landed** as Route A behind `-8x8` / `Use8x8CU`, with the 16x16 default path
+byte-identical (pinned by a digest test). FFmpeg agrees bit-exactly at QP
+20/26/30/34/40, with P-skip frames, and through external SPS/PPS.
+
+Doing it surfaced four more conformance bugs, all now fixed:
+
+- mode-dependent `scanIdx` derivation covered only 4x4 luma. Extended to 8x8
+  luma and 4x4 chroma (the latter from `IntraPredModeC`), **and the mapping was
+  inverted** — modes 6–14 select vertical, 22–30 horizontal.
+- the vertical-scan `last_sig_coeff` x/y swap was missing on both sides.
+- the TB's luma mode indexed the per-PU array unconditionally, reading mode 0
+  from unset entries of a 2Nx2N CU.
+- decoder MPM `candModeList[1]` computed `2+((candA-2+29)%32)`; spec 8.4.2 says
+  `2+((candA+29)%32)`. Two steps off whenever both neighbours predict the same
+  angular mode, which four 8x8 CUs per CTB makes common. The encoder already had
+  it right, so this was a straight encoder/decoder mismatch.
+
+Instrumenting all 18 golden streams found exactly **one** 4x4 block that takes a
+mode-dependent scan, which is why none of this was constrained before.
+
+Still to do: `-8x8` changes the coding structure, not the content. Wiring 8x8
+*pixels* through needs `PlaneGrid` threaded into `GenerateIDR` and all four raw
+output paths, or `-8x8` would mean different pixels for `.265` than for `.yuv`.
+The vendored hi264 does support the `@8x8` gridimg directive, so the helpers are
+there.
+
+### 0.11 Chroma QP table was off by one at qPi 34 (S) — **fixed**
+
+Spec Table 8-10 maps qPi 34 to chroma QP 33; both copies of the mapping said 32,
+giving a chroma-only mismatch against FFmpeg at exactly QP 34 (mean 1.6, max 14)
+while every neighbouring QP was exact. The table lived twice, once in
+`pkg/encode` and once in `pkg/decoder`, which is what allowed the drift; it now
+lives in `internal/transform` with a test pinning the whole table and
+monotonicity.
 
 ---
 
