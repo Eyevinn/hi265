@@ -199,7 +199,41 @@ func PredictAngular(mode, size int, neighbors *Neighbors, bitDepth int) []int32 
 		}
 	}
 
+	applyBoundaryFilter(p, mode, size, neighbors, bitDepth)
 	return p
+}
+
+// applyBoundaryFilter applies the intra boundary filter of spec 8.4.4.2.6: for
+// exactly vertical (mode 26) or exactly horizontal (mode 10) prediction of a
+// luma block smaller than 32x32, the first column resp. the first row is
+// blended with the perpendicular reference samples. Reference smoothing never
+// applies to these two modes, so the unfiltered neighbours are the right input.
+//
+// Leaving this out keeps a matched encoder and decoder self-consistent, but any
+// conforming decoder then reads a different picture out of the same bitstream.
+func applyBoundaryFilter(p []int32, mode, size int, n *Neighbors, bitDepth int) {
+	if n == nil || !n.Luma || size >= 32 {
+		return
+	}
+	if len(n.Top) < size || len(n.Left) < size {
+		return
+	}
+	maxVal := (1 << bitDepth) - 1
+	topLeft := int32(n.TopLeft)
+	switch mode {
+	case 26: // vertical: filter the first column
+		top0 := int32(n.Top[0])
+		for y := range size {
+			v := top0 + ((int32(n.Left[y]) - topLeft) >> 1)
+			p[y*size] = int32(clip3(0, maxVal, int(v)))
+		}
+	case 10: // horizontal: filter the first row
+		left0 := int32(n.Left[0])
+		for x := range size {
+			v := left0 + ((int32(n.Top[x]) - topLeft) >> 1)
+			p[x] = int32(clip3(0, maxVal, int(v)))
+		}
+	}
 }
 
 // Neighbors holds the reference samples for intra prediction.
@@ -209,13 +243,24 @@ type Neighbors struct {
 	Top       []uint8 // top neighbor samples [0..2*size-1]
 	Left      []uint8 // left neighbor samples [0..2*size-1]
 	TopLeft   uint8   // top-left corner sample
+
+	// Luma records which component these samples belong to. It is set by
+	// FilterRefSamples, which every prediction path calls first, and is read by
+	// PredictAngular for the luma-only intra boundary filter (spec 8.4.4.2.6).
+	// It defaults to false, so a caller that predicts luma without calling
+	// FilterRefSamples would lose that filter.
+	Luma bool
 }
 
 // FilterRefSamples applies the HEVC spec 8.4.4.2.3 reference sample filtering
 // in-place. filterFlag depends on mode, block size, and component type.
 // strongSmooth enables strong intra smoothing for 32x32 luma (SPS flag).
 func FilterRefSamples(n *Neighbors, mode, size int, isLuma bool, strongSmooth bool) {
-	if n == nil || size <= 4 {
+	if n == nil {
+		return
+	}
+	n.Luma = isLuma
+	if size <= 4 {
 		return
 	}
 
