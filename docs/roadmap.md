@@ -44,7 +44,7 @@ also why the goldens never caught it.
 
 Fix both sites, then add a golden test that actually exercises it (see 0.2).
 
-### 0.2 Generator conformance harness (M) — **structural**
+### 0.2 Generator conformance harness (M) — **done**
 
 The golden tests validate the *decoder* against FFmpeg on x265-produced
 streams. Nothing validates the *encoder* against FFmpeg. 0.1 is exactly the
@@ -62,8 +62,17 @@ sequences):
    of the intended pattern from `hi265gen`'s own `.yuv` output.
 
 Step 4's first assertion is the one that matters — it is what 0.1 violated.
-`tools/gen_test_bitstream.sh` is the natural place for the fixture generation
-if it should stay out of `go test`.
+
+Landed as `pkg/encode/conformance_test.go`: 11 cases (flat, tiled, SMPTE, QP
+20/26/40, one and multiple CTU rows, P-skip structures, a digit overlay and a
+diagonal), each decoded by FFmpeg and by `pkg/decoder` and asserted
+byte-identical, then both checked against the intended pattern. Failures name
+the plane, sample count, max delta and the CTU of the worst sample. Skips
+cleanly when `ffmpeg`/`x265` are absent.
+
+The harness was validated by reverse-applying 0.1, which makes the SMPTE cases
+fail at max delta 107 and mean 18.41 — reproducing the original bug. It then
+immediately earned its keep by localising 0.6 and 0.7.
 
 ### 0.3 README flag drift (S)
 
@@ -86,25 +95,54 @@ streams:
 | SMPTE + `%03d` overlay | luma 5163 / max 75, chroma 824 / max 4 | luma 2112 / max 76, chroma exact |
 | 3-frame P-skip sequence | chroma drift growing 4 → 12 → 20 per frame | no drift |
 
-### 0.6 Non-flat CTU luma coding mismatch (M) — **open bug**
+### 0.6 Missing intra boundary filter for modes 10 and 26 (M) — **fixed**
 
-Once 0.1 and 0.5 are in, flat content is bit-exact against FFmpeg but CTUs
-carrying real AC residual are not. On a 192x96 SMPTE frame with a `%03d`
-overlay: **2112 luma samples differ, max delta 76**, chroma exact, unchanged by
-deblocking, and identical on every frame of a P-skip sequence (so it is coded
-in, not accumulated). Luma TBs are 16x16 here, so mode-dependent scan should
-not be involved. The encoder's own reconstruction is what later CTUs predict
-from, so an error there propagates spatially.
+Not residual coding at all, as first suspected: the final step of spec
+8.4.4.2.6 was missing from `internal/pred.PredictAngular`. For luma blocks
+below 32x32 it nudges the first column (mode 26, vertical) or first row
+(mode 10, horizontal) by half the gradient of the perpendicular neighbours:
 
-### 0.7 Deblocking filter exactness at moderate QP (M) — **open, decoder side**
+    mode 26:  pred[0][y] = Clip1Y(p[0][-1]  + ((p[-1][y] - p[-1][-1]) >> 1))
+    mode 10:  pred[x][0] = Clip1Y(p[-1][0]  + ((p[x][-1] - p[-1][-1]) >> 1))
 
-With deblocking enabled (before 0.5), `hi265dec` differed from FFmpeg by up to 4
-on flat content at QP 26, accumulating across P-skip frames. The three golden
-deblock streams pass, but they were deliberately generated at `--qp 40` "for a
-clean test (minimal ±1 rounding)" — which implies the filter is not bit-exact at
-moderate QP. 0.5 hides this for *generated* content but it still affects the
-decoder's main job: decoding real-world streams. Needs its own x265/FFmpeg
-vectors at QP 22–30 with deblocking on.
+Both the encoder and the decoder call that one function, so they agreed with
+each other and with nothing else. The term is exactly zero on column-uniform
+content for mode 26 and on row-uniform content for mode 10 — which is why flat
+colours, colour bars and smooth gradients were unaffected, and why 16 goldens
+plus 9 of 11 conformance cases missed it. The measured deltas matched the
+missing term exactly, three CTUs for three.
+
+Fixed; both reproduction cases (digit overlay, diagonal) are now bit-exact
+against FFmpeg. It also improved decoding of real x265 content, where the same
+signature appeared on the first row/column of transform blocks.
+
+### 0.7 Deblocking normal filter gated on the clipped delta (M) — **fixed**
+
+`internal/deblock/deblock.go` clipped delta to `[-tC, tC]` and only then tested
+`abs(delta) < 10*tC`. Clipping first makes the gate vacuous — the clipped value
+is at most tC, always below 10*tC — so every edge passing the `d < beta`
+decision got filtered, including the hard edges spec 8.7.2.5.7 deliberately
+leaves alone. The chroma path has no such gate and was already correct, which
+matches chroma always having been exact.
+
+Isolated on a white/black split frame, where deblocking-disabled decodes
+bit-exactly at every QP:
+
+| QP | deblocking off | deblocking on (before fix) |
+|---|---|---|
+| 22 / 26 | exact | 128 samples, max 1 |
+| 30 / 34 | exact | 256 samples, max 2–3 |
+| 40 | exact | 256 samples, max 5 |
+
+On a static P-frame run the error compounded — each frame re-filtering an
+already-over-smoothed edge — giving worst luma deltas of 1, 3, 5, 7 across four
+frames at QP 26 and 3, 7, 11, 15 at QP 34, unbounded on a long static run.
+
+Fixed by gating on the raw delta and clipping inside the branch. All six
+conformance cases are now bit-exact. The golden deblock streams stayed green
+throughout because they are flat or smooth-gradient content, where the raw delta
+never approaches 10*tC; the `--qp 40` choice in the project notes turns out to
+be unrelated — on this content the error grew with QP.
 
 ### 0.8 Non-multiple-of-16 frame heights panic the grid encoder (M) — **open bug**
 
@@ -162,6 +200,29 @@ Two levels of fix:
 
 Do (1) with a clear "WPP with multiple CTU rows not supported" error for the
 multi-row case, then (2) as a separate piece of work.
+
+The slice header parser also skips `num_extra_slice_header_bits`
+(`slice_reserved_flag[i]`) — harmless today because every encoder we see writes
+0, but the same class of gap and worth fixing alongside. `tools/gen_test_bitstream.sh`
+should record `--no-wpp`, which is what the vectors were actually made with.
+
+### 0.10 Real-world content decoding is not yet bit-exact (L) — **open**
+
+With 0.6 and 0.7 fixed, x265-coded natural content is much closer but still not
+exact. Measured on 128x64 single-frame x265 output (`--no-wpp --no-sao
+--no-deblock --no-signhide --ctu 16`), FFmpeg vs `hi265dec`:
+
+| content | QP | samples differing | max delta | before 0.6/0.7 |
+|---|---|---|---|---|
+| `gradients` | 26 | 29 / 12288 | 1 | max 3–4 |
+| `gradients` | 34 | 841 / 12288 | 3 | max 3–4 |
+| `testsrc2` | 26 | 1624 / 12288 | 18 | max 39–55 |
+| `testsrc2` | 34 | 1011 / 12288 | 17 | max 39–55 |
+
+So a residual or prediction path still diverges on busy content. This is the
+decoder's core job, so it deserves its own phase; the conformance harness plus
+x265 is the tool for bisecting it. P frames with real motion are far off
+(max > 200), as expected — only zero-motion skip is implemented.
 
 ### 0.4 `hi265dec` argument handling (S)
 
