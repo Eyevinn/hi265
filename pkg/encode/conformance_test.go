@@ -602,7 +602,7 @@ func TestDeblockExactnessKnownDefect(t *testing.T) {
 	x265 := x265Bin(t)
 
 	const w, h = 128, 64
-	src := twoHalvesYUV(w, h)
+	src := twoHalvesYUV(w, h, 1)
 
 	cases := []deblockCase{
 		{qp: 22, maxSamples: 128, maxDelta: 1},
@@ -614,8 +614,8 @@ func TestDeblockExactnessKnownDefect(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("qp%d", c.qp), func(t *testing.T) {
-			noDeblock := encodeWithX265(t, x265, src, w, h, c.qp, false)
-			deblock := encodeWithX265(t, x265, src, w, h, c.qp, true)
+			noDeblock := encodeWithX265(t, x265, src, w, h, c.qp, 1, 1, false)
+			deblock := encodeWithX265(t, x265, src, w, h, c.qp, 1, 1, true)
 
 			// Control: without the loop filter the two decoders must agree.
 			ffNo := decodeWithFFmpeg(t, ffmpeg, noDeblock)
@@ -644,33 +644,75 @@ func TestDeblockExactnessKnownDefect(t *testing.T) {
 			}
 		})
 	}
+
+	// The same defect on a static P-frame run. Each frame re-filters an edge
+	// that is already over-smoothed in the reference picture, so the error
+	// grows linearly with the distance from the IDR: at QP 26 the worst luma
+	// delta is 1, 3, 5, 7 over four frames.
+	t.Run("accumulation_over_p_frames", func(t *testing.T) {
+		const qp, frames = 26, 4
+		staticSrc := twoHalvesYUV(w, h, frames)
+		noDeblock := encodeWithX265(t, x265, staticSrc, w, h, qp, frames, 25, false)
+		deblock := encodeWithX265(t, x265, staticSrc, w, h, qp, frames, 25, true)
+
+		ffNo := decodeWithFFmpeg(t, ffmpeg, noDeblock)
+		hiNo := decodeWithHi265(t, noDeblock, w, h, frames)
+		if rep := compareYUV(t, hiNo, ffNo, w, h, frames); !rep.exact() {
+			t.Fatalf("control case (deblocking disabled) already differs, "+
+				"so this run cannot isolate the loop filter: %s", rep)
+		}
+
+		ffDb := decodeWithFFmpeg(t, ffmpeg, deblock)
+		hiDb := decodeWithHi265(t, deblock, w, h, frames)
+		rep := compareYUV(t, hiDb, ffDb, w, h, frames)
+		if rep.exact() {
+			t.Log("KNOWN DEFECT now passes exactly — tighten the recorded budget")
+			return
+		}
+		t.Logf("KNOWN DEFECT: the deblocking error accumulates across P frames "+
+			"on static content: %s", rep)
+		const maxSamples, maxDelta = 896, 7
+		if rep.total > maxSamples || rep.maxDelta > maxDelta {
+			t.Errorf("accumulated deblocking mismatch got worse: %d samples / "+
+				"max delta %d, recorded budget %d samples / max delta %d",
+				rep.total, rep.maxDelta, maxSamples, maxDelta)
+		}
+	})
 }
 
-// twoHalvesYUV builds a yuv420p picture with a white left half and a black
-// right half: flat everywhere except one vertical luma edge in the middle.
-func twoHalvesYUV(w, h int) []byte {
+// twoHalvesYUV builds frames of a yuv420p picture with a white left half and a
+// black right half: flat everywhere except one vertical luma edge in the
+// middle. All frames are identical, so a P frame over this source codes as
+// zero-motion skip.
+func twoHalvesYUV(w, h, frames int) []byte {
 	lumaSize := w * h
 	chromaSize := (w / 2) * (h / 2)
-	buf := make([]byte, lumaSize+2*chromaSize)
+	one := make([]byte, lumaSize+2*chromaSize)
 	for y := range h {
 		for x := range w {
 			v := byte(235)
 			if x >= w/2 {
 				v = 16
 			}
-			buf[y*w+x] = v
+			one[y*w+x] = v
 		}
 	}
-	for i := lumaSize; i < len(buf); i++ {
-		buf[i] = 128
+	for i := lumaSize; i < len(one); i++ {
+		one[i] = 128
 	}
-	return buf
+	out := make([]byte, 0, frames*len(one))
+	for range frames {
+		out = append(out, one...)
+	}
+	return out
 }
 
-// encodeWithX265 encodes one intra frame of raw yuv420p with x265, using the
-// same coding-tool subset as the checked-in test vectors (CTU 16, no SAO, no
-// sign hiding, no WPP), with the loop filter switched on or off.
-func encodeWithX265(t *testing.T, x265 string, src []byte, w, h, qp int, deblock bool) []byte {
+// encodeWithX265 encodes raw yuv420p with x265, using the same coding-tool
+// subset as the checked-in test vectors (CTU 16, no SAO, no sign hiding, no
+// WPP), with the loop filter switched on or off. keyint 1 gives an all-intra
+// stream; a larger keyint makes every frame after the first a P frame.
+func encodeWithX265(t *testing.T, x265 string, src []byte,
+	w, h, qp, frames, keyint int, deblock bool) []byte {
 	t.Helper()
 	dir := t.TempDir()
 	in := filepath.Join(dir, "src.yuv")
@@ -682,8 +724,10 @@ func encodeWithX265(t *testing.T, x265 string, src []byte, w, h, qp int, deblock
 		"--input", in,
 		"--input-res", fmt.Sprintf("%dx%d", w, h),
 		"--fps", "25",
-		"--frames", "1",
-		"--keyint", "1", "--min-keyint", "1", "--no-open-gop",
+		"--frames", fmt.Sprintf("%d", frames),
+		"--keyint", fmt.Sprintf("%d", keyint),
+		"--min-keyint", fmt.Sprintf("%d", keyint),
+		"--no-open-gop",
 		"--ctu", "16", "--min-cu-size", "16",
 		"--qp", fmt.Sprintf("%d", qp),
 		"--no-sao", "--no-signhide", "--no-strong-intra-smoothing",
