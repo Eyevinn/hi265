@@ -172,3 +172,46 @@ func TestDecodeGray2Frames128x64(t *testing.T) {
 	testGoldenFrames(t, "../../testdata/gray_2frames_128x64.265",
 		"../../testdata/golden/gray_2frames_128x64.yuv", 128, 64, 2)
 }
+
+// Tiled pictures, one slice segment per tile — the shape kvazaar's
+// "--tiles WxH --slices tiles" produces and the one `hevc-retiler` stitches.
+// Both loop filters are off in these vectors so that tile geometry, tile scan
+// order and neighbour availability are the only things under test; filtering
+// across a tile boundary is a separate matter (docs/tiles-decoding.md, T5).
+
+// Two tile columns over two frames, which also covers closing one picture when
+// the next picture's first slice segment arrives.
+func TestDecodeTiles2x1TwoFrames128x64(t *testing.T) {
+	testGoldenFrames(t, "../../testdata/tiles_2x1_2frames_128x64.265",
+		"../../testdata/golden/tiles_2x1_2frames_128x64.yuv", 128, 64, 2)
+}
+
+// A 2x2 grid, so the picture has both a vertical and a horizontal tile
+// boundary and tile scan differs from raster scan in both directions.
+func TestDecodeTiles2x2_128x128(t *testing.T) {
+	testGolden(t, "../../testdata/tiles_2x2_128x128.265",
+		"../../testdata/golden/tiles_2x2_128x128.yuv", 128, 128)
+}
+
+// Uniform spacing that is not an equal division: 3 CTBs in 2 tile columns is
+// one CTB then two, per the spec 6.5.1 formula. A decoder that divided equally
+// would put the tile boundary in the wrong place.
+func TestDecodeTilesNonEqual192x64(t *testing.T) {
+	testGolden(t, "../../testdata/tiles_nonequal_192x64.265",
+		"../../testdata/golden/tiles_nonequal_192x64.yuv", 192, 64)
+}
+
+// The same 2x2 grid with one loop filter on at a time. These are the vectors
+// that pin the boundary rules of spec 8.7.2 and 8.7.3.2: with
+// loop_filter_across_tiles_enabled_flag equal to 0, neither filter may reach
+// across a tile edge, so a decoder that filtered through it would differ from
+// FFmpeg along the seams and nowhere else.
+func TestDecodeTilesDeblock2x2_128x128(t *testing.T) {
+	testGolden(t, "../../testdata/tiles_2x2_deblock_128x128.265",
+		"../../testdata/golden/tiles_2x2_deblock_128x128.yuv", 128, 128)
+}
+
+func TestDecodeTilesSao2x2_128x128(t *testing.T) {
+	testGolden(t, "../../testdata/tiles_2x2_sao_128x128.265",
+		"../../testdata/golden/tiles_2x2_sao_128x128.yuv", 128, 128)
+}

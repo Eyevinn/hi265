@@ -10,9 +10,8 @@ import (
 	"github.com/Eyevinn/mp4ff/hevc"
 
 	"github.com/Eyevinn/hi265/internal/context"
-	"github.com/Eyevinn/hi265/internal/deblock"
+	"github.com/Eyevinn/hi265/internal/loopfilter"
 	"github.com/Eyevinn/hi265/internal/pred"
-	"github.com/Eyevinn/hi265/internal/sao"
 	"github.com/Eyevinn/hi265/internal/slice"
 	"github.com/Eyevinn/hi265/internal/transform"
 	"github.com/Eyevinn/hi265/pkg/frame"
@@ -24,6 +23,7 @@ type Decoder struct {
 	spsMap   map[uint32]*hevc.SPS
 	ppsMap   map[uint32]*hevc.PPS
 	refFrame *frame.Frame // reference frame for inter prediction
+	pic      *picture     // picture being assembled from slice segments
 }
 
 // New creates a new HEVC decoder.
@@ -33,6 +33,25 @@ func New() *Decoder {
 		spsMap: make(map[uint32]*hevc.SPS),
 		ppsMap: make(map[uint32]*hevc.PPS),
 	}
+}
+
+// sliceSegment is one parsed slice segment header plus the CABAC payload that
+// follows it. Picture assembly happens a segment at a time, so parsing a header
+// and decoding what it describes are separate steps.
+type sliceSegment struct {
+	sps    *hevc.SPS
+	pps    *hevc.PPS
+	first  bool // first_slice_segment_in_pic_flag
+	addrRS int  // slice_segment_address, in raster scan
+	params slice.Params
+	cabac  []byte
+	intra  bool // an IRAP segment, which needs no reference frame
+
+	// Loop filter parameters, which the spec allows to vary per slice.
+	deblockingDisabled   bool
+	betaOffset, tcOffset int
+	saoEnabled           bool
+	acrossSlices         bool // slice_loop_filter_across_slices_enabled_flag
 }
 
 // DecodeAnnexB decodes all frames from an Annex-B byte stream.
@@ -69,28 +88,34 @@ func (d *Decoder) DecodeNALUs(nalus [][]byte) ([]*frame.Frame, error) {
 			d.ppsMap[pps.PicParameterSetID] = pps
 
 		case hevc.NALU_IDR_N_LP, hevc.NALU_IDR_W_RADL:
-			f, err := d.decodeIRAP(nalu, false)
+			seg, err := d.parseIRAPSegment(nalu, false)
 			if err != nil {
 				return nil, err
 			}
-			frames = append(frames, f)
+			if err := d.decodeSegment(seg, &frames); err != nil {
+				return nil, err
+			}
 
 		case hevc.NALU_CRA:
 			// A CRA is an intra picture like an IDR, but its header carries POC
 			// and reference picture set fields. It becomes the new reference
 			// frame for the P-skip pictures that follow.
-			f, err := d.decodeIRAP(nalu, true)
+			seg, err := d.parseIRAPSegment(nalu, true)
 			if err != nil {
 				return nil, err
 			}
-			frames = append(frames, f)
+			if err := d.decodeSegment(seg, &frames); err != nil {
+				return nil, err
+			}
 
 		case hevc.NALU_TRAIL_R, hevc.NALU_TRAIL_N:
-			f, err := d.decodeTrailSlice(nalu)
+			seg, err := d.parseTrailSegment(nalu)
 			if err != nil {
 				return nil, err
 			}
-			frames = append(frames, f)
+			if err := d.decodeSegment(seg, &frames); err != nil {
+				return nil, err
+			}
 
 		case hevc.NALU_SEI_PREFIX, hevc.NALU_SEI_SUFFIX:
 			// Skip SEI
@@ -102,10 +127,91 @@ func (d *Decoder) DecodeNALUs(nalus [][]byte) ([]*frame.Frame, error) {
 			// Skip unknown NALU types
 		}
 	}
+	// The last picture of the stream has no following first-slice flag to close
+	// it, so the end of the NAL list does.
+	if err := d.finishPicture(&frames); err != nil {
+		return nil, err
+	}
 	if len(frames) == 0 {
 		return nil, fmt.Errorf("no frames decoded")
 	}
 	return frames, nil
+}
+
+// decodeSegment decodes one slice segment into the picture it belongs to,
+// starting a new picture when the segment says it is the first of one and
+// publishing the previous picture at that point.
+func (d *Decoder) decodeSegment(seg *sliceSegment, frames *[]*frame.Frame) error {
+	if seg.first {
+		if err := d.finishPicture(frames); err != nil {
+			return err
+		}
+		if err := d.startPicture(seg); err != nil {
+			return err
+		}
+	}
+	pic := d.pic
+	if pic == nil {
+		return fmt.Errorf("slice segment at CTB %d arrived before the first segment of a picture", seg.addrRS)
+	}
+	pic.startSegment()
+
+	seg.params.Grid = pic.grid
+	seg.params.SegmentAddressRS = seg.addrRS
+	seg.params.SaoParams = pic.saoParams
+
+	sd, err := slice.DecodeSliceData(seg.cabac, seg.params)
+	if err != nil {
+		return fmt.Errorf("decode slice data: %w", err)
+	}
+
+	// Every independent slice segment is a slice of its own — dependent
+	// segments, which would share their slice's parameters, are refused when the
+	// header is parsed. Slices are added in decoding order, which is what lets
+	// the loop filters tell which side of a slice boundary came later.
+	sliceIdx := pic.bounds.AddSlice(loopfilter.Slice{
+		DeblockingDisabled: seg.deblockingDisabled,
+		BetaOffset:         seg.betaOffset,
+		TcOffset:           seg.tcOffset,
+		AcrossSlices:       seg.acrossSlices,
+	})
+	pic.bounds.ClaimSegment(seg.addrRS, sd.CtbsDecoded, sliceIdx)
+	if seg.saoEnabled {
+		pic.saoEnabled = true
+	}
+
+	var refFrame *frame.Frame
+	if !seg.intra {
+		refFrame = d.refFrame
+	}
+	if err := reconstructSegment(pic.f, sd, seg.sps, refFrame); err != nil {
+		return err
+	}
+
+	pic.cus = append(pic.cus, sd.CUs...)
+	pic.ctbsDecoded += sd.CtbsDecoded
+	return nil
+}
+
+// parseSegmentAddress reads the fields that only a slice segment other than the
+// first of a picture carries (spec 7.3.6.1), returning the segment's raster CTB
+// address.
+func parseSegmentAddress(r *bits.EBSPReader, sps *hevc.SPS, pps *hevc.PPS, first bool) (int, error) {
+	if first {
+		return 0, nil
+	}
+	if pps.DependentSliceSegmentsEnabledFlag && r.ReadFlag() {
+		// A dependent segment continues the previous segment's header and CABAC
+		// contexts instead of carrying its own.
+		return 0, fmt.Errorf("dependent slice segments are not supported")
+	}
+	ctbsX, ctbsY := picSizeInCtbs(sps)
+	numCtbs := ctbsX * ctbsY
+	addr := int(r.Read(ceilLog2(numCtbs)))
+	if addr <= 0 || addr >= numCtbs {
+		return 0, fmt.Errorf("slice_segment_address %d in a picture of %d CTBs", addr, numCtbs)
+	}
+	return addr, nil
 }
 
 // parsePOCAndRefPicSets parses the slice header fields that every picture except
@@ -234,14 +340,14 @@ func finishSliceHeader(r *bits.EBSPReader, sps *hevc.SPS, pps *hevc.PPS) ([]int,
 	return entryPoints, nil
 }
 
-func (d *Decoder) decodeIRAP(nalu []byte, isCRA bool) (*frame.Frame, error) {
+func (d *Decoder) parseIRAPSegment(nalu []byte, isCRA bool) (*sliceSegment, error) {
 	r := bits.NewEBSPReader(bytes.NewReader(nalu))
 
 	// Skip 2-byte NALU header
 	r.Read(16)
 
 	// first_slice_segment_in_pic_flag
-	r.ReadFlag()
+	firstSlice := r.ReadFlag()
 
 	// no_output_of_prior_pics_flag (present for all IRAP pictures)
 	r.ReadFlag()
@@ -255,6 +361,17 @@ func (d *Decoder) decodeIRAP(nalu []byte, isCRA bool) (*frame.Frame, error) {
 	sps := d.spsMap[pps.SeqParameterSetID]
 	if sps == nil {
 		return nil, fmt.Errorf("SPS %d not found", pps.SeqParameterSetID)
+	}
+
+	// dependent_slice_segment_flag and slice_segment_address
+	segAddrRS, err := parseSegmentAddress(r, sps, pps, firstSlice)
+	if err != nil {
+		return nil, err
+	}
+
+	// slice_reserved_flag[i]
+	for range int(pps.NumExtraSliceHeaderBits) {
+		r.ReadFlag()
 	}
 
 	// slice_type
@@ -309,10 +426,14 @@ func (d *Decoder) decodeIRAP(nalu []byte, isCRA bool) (*frame.Frame, error) {
 		}
 	}
 
-	// loop_filter_across_slices_enabled_flag
+	// slice_loop_filter_across_slices_enabled_flag, which is inferred from the
+	// PPS when absent (spec 7.4.7.1). Its presence turns on the *slice* SAO
+	// flags, not the SPS one: a slice with SAO off and deblocking disabled does
+	// not carry the bit even when the SPS enables SAO.
+	sliceAcrossSlices := pps.LoopFilterAcrossSlicesEnabledFlag
 	if pps.LoopFilterAcrossSlicesEnabledFlag &&
-		(!sliceDeblockingDisabled || sps.SampleAdaptiveOffsetEnabledFlag) {
-		r.ReadFlag()
+		(sliceSaoLuma || sliceSaoChroma || !sliceDeblockingDisabled) {
+		sliceAcrossSlices = r.ReadFlag()
 	}
 
 	// Entry point offsets, slice header extension and byte alignment.
@@ -327,56 +448,57 @@ func (d *Decoder) decodeIRAP(nalu []byte, isCRA bool) (*frame.Frame, error) {
 
 	headerSize := r.NrBytesRead()
 
-	sliceQPY := 26 + int(pps.InitQpMinus26) + qpDelta
-	picWidth := int(sps.PicWidthInLumaSamples)
-	picHeight := int(sps.PicHeightInLumaSamples)
-	log2CtbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3 +
-		int(sps.Log2DiffMaxMinLumaCodingBlockSize)
-
+	log2Ctb := log2CtbSize(sps)
 	cabacData, droppedEPBs := removeEmulationPreventionBytesWithMap(nalu[headerSize:])
 	entryPoints = rebaseEntryPoints(entryPoints, droppedEPBs)
 
 	log2MinTrSize := int(sps.Log2MinLumaTransformBlockSizeMinus2) + 2
 	log2MaxTrSize := log2MinTrSize + int(sps.Log2DiffMaxMinLumaTransformBlockSize)
-	log2MinCbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3
 
-	sd, err := slice.DecodeSliceData(cabacData, slice.Params{
-		SliceType:                       context.SliceTypeI,
-		SliceQPY:                        sliceQPY,
-		PicWidth:                        picWidth,
-		PicHeight:                       picHeight,
-		Log2CtbSize:                     log2CtbSize,
-		Log2MinCbSize:                   log2MinCbSize,
-		Log2MinTrafoSize:                log2MinTrSize,
-		Log2MaxTrafoSize:                log2MaxTrSize,
-		MaxTransformHierarchyDepthIntra: int(sps.MaxTransformHierarchyDepthIntra),
-		SignDataHidingEnabled:           pps.SignDataHidingEnabledFlag,
-		TransformSkipEnabled:            pps.TransformSkipEnabledFlag,
-		SaoLuma:                         sliceSaoLuma,
-		SaoChroma:                       sliceSaoChroma,
-		CuQpDeltaEnabled:                pps.CuQpDeltaEnabledFlag,
-		Log2MinCuQpDeltaSize:            log2CtbSize - int(pps.DiffCuQpDeltaDepth),
-		EntropyCodingSyncEnabled:        pps.EntropyCodingSyncEnabledFlag,
-		EntryPoints:                     entryPoints,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("decode slice data: %w", err)
-	}
-
-	return d.reconstructFrame(sd, sps, nil, sliceQPY, picWidth, picHeight,
-		sliceDeblockingDisabled, betaOffsetDiv2*2, tcOffsetDiv2*2,
-		sliceSaoLuma || sliceSaoChroma)
+	return &sliceSegment{
+		sps:                sps,
+		pps:                pps,
+		first:              firstSlice,
+		addrRS:             segAddrRS,
+		cabac:              cabacData,
+		intra:              true,
+		deblockingDisabled: sliceDeblockingDisabled,
+		betaOffset:         betaOffsetDiv2 * 2,
+		tcOffset:           tcOffsetDiv2 * 2,
+		saoEnabled:         sliceSaoLuma || sliceSaoChroma,
+		acrossSlices:       sliceAcrossSlices,
+		params: slice.Params{
+			SliceType:                       context.SliceTypeI,
+			SliceQPY:                        26 + int(pps.InitQpMinus26) + qpDelta,
+			PicWidth:                        int(sps.PicWidthInLumaSamples),
+			PicHeight:                       int(sps.PicHeightInLumaSamples),
+			Log2CtbSize:                     log2Ctb,
+			Log2MinCbSize:                   int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3,
+			Log2MinTrafoSize:                log2MinTrSize,
+			Log2MaxTrafoSize:                log2MaxTrSize,
+			MaxTransformHierarchyDepthIntra: int(sps.MaxTransformHierarchyDepthIntra),
+			SignDataHidingEnabled:           pps.SignDataHidingEnabledFlag,
+			TransformSkipEnabled:            pps.TransformSkipEnabledFlag,
+			SaoLuma:                         sliceSaoLuma,
+			SaoChroma:                       sliceSaoChroma,
+			CuQpDeltaEnabled:                pps.CuQpDeltaEnabledFlag,
+			Log2MinCuQpDeltaSize:            log2Ctb - int(pps.DiffCuQpDeltaDepth),
+			EntropyCodingSyncEnabled:        pps.EntropyCodingSyncEnabledFlag,
+			EntryPoints:                     entryPoints,
+		},
+	}, nil
 }
 
-// decodeTrailSlice decodes a trailing (non-IDR) slice NALU (P or B slice).
-func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
+// parseTrailSegment parses the header of a trailing (non-IRAP) slice segment,
+// which carries a P or B slice.
+func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
 	r := bits.NewEBSPReader(bytes.NewReader(nalu))
 
 	// Skip 2-byte NALU header
 	r.Read(16)
 
 	// first_slice_segment_in_pic_flag
-	r.ReadFlag()
+	firstSlice := r.ReadFlag()
 
 	// slice_pic_parameter_set_id
 	ppsID := r.ReadExpGolomb()
@@ -387,6 +509,17 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 	sps := d.spsMap[pps.SeqParameterSetID]
 	if sps == nil {
 		return nil, fmt.Errorf("SPS %d not found", pps.SeqParameterSetID)
+	}
+
+	// dependent_slice_segment_flag and slice_segment_address
+	segAddrRS, err := parseSegmentAddress(r, sps, pps, firstSlice)
+	if err != nil {
+		return nil, err
+	}
+
+	// slice_reserved_flag[i]
+	for range int(pps.NumExtraSliceHeaderBits) {
+		r.ReadFlag()
 	}
 
 	// slice_type
@@ -480,10 +613,12 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 		}
 	}
 
-	// loop_filter_across_slices_enabled_flag
+	// slice_loop_filter_across_slices_enabled_flag, inferred from the PPS when
+	// absent (spec 7.4.7.1).
+	sliceAcrossSlices := pps.LoopFilterAcrossSlicesEnabledFlag
 	if pps.LoopFilterAcrossSlicesEnabledFlag &&
-		(!sliceDeblockingDisabled || sps.SampleAdaptiveOffsetEnabledFlag) {
-		r.ReadFlag()
+		(sliceSaoLuma || sliceSaoChroma || !sliceDeblockingDisabled) {
+		sliceAcrossSlices = r.ReadFlag()
 	}
 
 	// Entry point offsets, slice header extension and byte alignment.
@@ -498,65 +633,61 @@ func (d *Decoder) decodeTrailSlice(nalu []byte) (*frame.Frame, error) {
 
 	headerSize := r.NrBytesRead()
 
-	sliceQPY := 26 + int(pps.InitQpMinus26) + qpDelta
-	picWidth := int(sps.PicWidthInLumaSamples)
-	picHeight := int(sps.PicHeightInLumaSamples)
-	log2CtbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3 +
-		int(sps.Log2DiffMaxMinLumaCodingBlockSize)
-
+	log2Ctb := log2CtbSize(sps)
 	cabacData, droppedEPBs := removeEmulationPreventionBytesWithMap(nalu[headerSize:])
 	entryPoints = rebaseEntryPoints(entryPoints, droppedEPBs)
 
 	log2MinTrSize := int(sps.Log2MinLumaTransformBlockSizeMinus2) + 2
 	log2MaxTrSize := log2MinTrSize + int(sps.Log2DiffMaxMinLumaTransformBlockSize)
-	log2MinCbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3
 
-	sd, err := slice.DecodeSliceData(cabacData, slice.Params{
-		SliceType:                       sliceType,
-		SliceQPY:                        sliceQPY,
-		PicWidth:                        picWidth,
-		PicHeight:                       picHeight,
-		Log2CtbSize:                     log2CtbSize,
-		Log2MinCbSize:                   log2MinCbSize,
-		Log2MinTrafoSize:                log2MinTrSize,
-		Log2MaxTrafoSize:                log2MaxTrSize,
-		MaxTransformHierarchyDepthIntra: int(sps.MaxTransformHierarchyDepthIntra),
-		MaxNumMergeCand:                 maxNumMergeCand,
-		SignDataHidingEnabled:           pps.SignDataHidingEnabledFlag,
-		TransformSkipEnabled:            pps.TransformSkipEnabledFlag,
-		SaoLuma:                         sliceSaoLuma,
-		SaoChroma:                       sliceSaoChroma,
-		CuQpDeltaEnabled:                pps.CuQpDeltaEnabledFlag,
-		Log2MinCuQpDeltaSize:            log2CtbSize - int(pps.DiffCuQpDeltaDepth),
-		EntropyCodingSyncEnabled:        pps.EntropyCodingSyncEnabledFlag,
-		EntryPoints:                     entryPoints,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("decode P-slice data: %w", err)
-	}
-
-	return d.reconstructFrame(sd, sps, d.refFrame, sliceQPY, picWidth, picHeight,
-		sliceDeblockingDisabled, betaOffsetDiv2*2, tcOffsetDiv2*2,
-		sliceSaoLuma || sliceSaoChroma)
+	return &sliceSegment{
+		sps:                sps,
+		pps:                pps,
+		first:              firstSlice,
+		addrRS:             segAddrRS,
+		cabac:              cabacData,
+		deblockingDisabled: sliceDeblockingDisabled,
+		betaOffset:         betaOffsetDiv2 * 2,
+		tcOffset:           tcOffsetDiv2 * 2,
+		saoEnabled:         sliceSaoLuma || sliceSaoChroma,
+		acrossSlices:       sliceAcrossSlices,
+		params: slice.Params{
+			SliceType:                       sliceType,
+			SliceQPY:                        26 + int(pps.InitQpMinus26) + qpDelta,
+			PicWidth:                        int(sps.PicWidthInLumaSamples),
+			PicHeight:                       int(sps.PicHeightInLumaSamples),
+			Log2CtbSize:                     log2Ctb,
+			Log2MinCbSize:                   int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3,
+			Log2MinTrafoSize:                log2MinTrSize,
+			Log2MaxTrafoSize:                log2MaxTrSize,
+			MaxTransformHierarchyDepthIntra: int(sps.MaxTransformHierarchyDepthIntra),
+			MaxNumMergeCand:                 maxNumMergeCand,
+			SignDataHidingEnabled:           pps.SignDataHidingEnabledFlag,
+			TransformSkipEnabled:            pps.TransformSkipEnabledFlag,
+			SaoLuma:                         sliceSaoLuma,
+			SaoChroma:                       sliceSaoChroma,
+			CuQpDeltaEnabled:                pps.CuQpDeltaEnabledFlag,
+			Log2MinCuQpDeltaSize:            log2Ctb - int(pps.DiffCuQpDeltaDepth),
+			EntropyCodingSyncEnabled:        pps.EntropyCodingSyncEnabledFlag,
+			EntryPoints:                     entryPoints,
+		},
+	}, nil
 }
 
-// reconstructFrame builds the output frame from decoded CU data.
-func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
-	refFrame *frame.Frame, sliceQPY int, picWidth, picHeight int,
-	deblockingDisabled bool, betaOffset, tcOffset int,
-	saoEnabled bool) (*frame.Frame, error) {
+// reconstructSegment reconstructs one slice segment's CUs into the picture
+// buffer. The loop filters are not applied here: they belong to the finished
+// picture, which may be made of several segments.
+func reconstructSegment(f *frame.Frame, sd *slice.SliceData, sps *hevc.SPS,
+	refFrame *frame.Frame) error {
 
-	f := frame.NewFrame(picWidth, picHeight)
 	bitDepth := 8
-	log2CtbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3 +
-		int(sps.Log2DiffMaxMinLumaCodingBlockSize)
-	ctbSize := 1 << log2CtbSize
+	picWidth, picHeight := f.Width, f.Height
 
 	for _, cu := range sd.CUs {
 		if cu.SkipFlag {
 			// Skip CU: copy from reference frame (zero motion)
 			if refFrame == nil {
-				return nil, fmt.Errorf("skip CU at (%d,%d) but no reference frame", cu.X0, cu.Y0)
+				return fmt.Errorf("skip CU at (%d,%d) but no reference frame", cu.X0, cu.Y0)
 			}
 			cuSize := 1 << cu.Log2CbSize
 			// Copy luma
@@ -598,7 +729,7 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 			}
 
 			// Luma reconstruction
-			lumaNeighbors := getLumaNeighbors(f, tu.X0, tu.Y0, trSize, ctbSize)
+			lumaNeighbors := getLumaNeighbors(f, tu.X0, tu.Y0, trSize)
 			pred.FilterRefSamples(lumaNeighbors, lumaMode, trSize, true, sps.StrongIntraSmoothingEnabledFlag)
 			predSamples := predictIntra(lumaMode, trSize, lumaNeighbors, bitDepth, true)
 
@@ -660,7 +791,7 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 					chromaCoeffs = tu.CrCoeffs
 				}
 
-				chromaNeighbors := getChromaNeighbors(f, comp, chromaX0/2, chromaY0/2, chromaTrSize, ctbSize)
+				chromaNeighbors := getChromaNeighbors(f, comp, chromaX0/2, chromaY0/2, chromaTrSize)
 				pred.FilterRefSamples(chromaNeighbors, chromaMode, chromaTrSize, false, false)
 				chromaPred := predictIntra(chromaMode, chromaTrSize, chromaNeighbors, bitDepth, false)
 
@@ -691,20 +822,7 @@ func (d *Decoder) reconstructFrame(sd *slice.SliceData, sps *hevc.SPS,
 		}
 	}
 
-	// Apply deblocking filter if enabled
-	if !deblockingDisabled {
-		deblock.Apply(f, sd.CUs, sliceQPY, betaOffset, tcOffset)
-	}
-
-	// Apply SAO filter if enabled
-	if saoEnabled {
-		sao.Apply(f, sd.SaoParams, log2CtbSize)
-	}
-
-	// Later pictures predict from the full coded picture, but what comes out of
-	// the decoder is the conformance window.
-	d.refFrame = f
-	return cropToConformanceWindow(f, sps), nil
+	return nil
 }
 
 // cropToConformanceWindow returns the visible part of a decoded picture. An
@@ -755,27 +873,20 @@ func predictIntra(mode, size int, neighbors *pred.Neighbors, bitDepth int, isLum
 
 // buildRefSamples extracts and substitutes reference samples for intra prediction
 // per HEVC spec section 8.4.4.2.2.
-func buildRefSamples(x0, y0, size, picW, picH, ctbSize int,
+func buildRefSamples(x0, y0, size, picW, picH int,
 	getPixel func(x, y int) uint8, isDecoded func(x, y int) bool) *pred.Neighbors {
-	numCtbX := (picW + ctbSize - 1) / ctbSize
-	curCtbX := x0 / ctbSize
-	curCtbY := y0 / ctbSize
-	curAddr := curCtbY*numCtbX + curCtbX
 
+	// A neighbouring sample is available when it is inside the picture and has
+	// already been reconstructed *by this slice segment* (spec 6.4.1: a
+	// neighbour in another slice or another tile is unavailable, whatever its
+	// address). The reconstruction map is cleared at the start of every segment,
+	// so asking it is the whole test — an earlier segment's samples sit in the
+	// same buffer but read as undecoded, which is exactly what tiles need.
 	isAvailable := func(px, py int) bool {
 		if px < 0 || py < 0 || px >= picW || py >= picH {
 			return false
 		}
-		nCtbX := px / ctbSize
-		nCtbY := py / ctbSize
-		nAddr := nCtbY*numCtbX + nCtbX
-		if nAddr < curAddr {
-			return true
-		}
-		if nAddr == curAddr {
-			return isDecoded(px, py)
-		}
-		return false
+		return isDecoded(px, py)
 	}
 
 	hasAny := isAvailable(x0-1, y0) || isAvailable(x0, y0-1)
@@ -845,15 +956,15 @@ func buildRefSamples(x0, y0, size, picW, picH, ctbSize int,
 	return n
 }
 
-func getLumaNeighbors(f *frame.Frame, x0, y0, size, ctbSize int) *pred.Neighbors {
-	return buildRefSamples(x0, y0, size, f.Width, f.Height, ctbSize,
+func getLumaNeighbors(f *frame.Frame, x0, y0, size int) *pred.Neighbors {
+	return buildRefSamples(x0, y0, size, f.Width, f.Height,
 		func(x, y int) uint8 { return f.GetLumaPixel(x, y) },
 		func(x, y int) bool { return f.IsLumaDecoded(x, y) },
 	)
 }
 
-func getChromaNeighbors(f *frame.Frame, comp, x0, y0, size, ctbSize int) *pred.Neighbors {
-	return buildRefSamples(x0, y0, size, f.Width/2, f.Height/2, ctbSize/2,
+func getChromaNeighbors(f *frame.Frame, comp, x0, y0, size int) *pred.Neighbors {
+	return buildRefSamples(x0, y0, size, f.Width/2, f.Height/2,
 		func(x, y int) uint8 { return f.GetChromaPixel(comp, x, y) },
 		func(x, y int) bool { return f.IsLumaDecoded(x*2, y*2) },
 	)

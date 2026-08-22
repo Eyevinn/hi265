@@ -2,13 +2,20 @@
 package sao
 
 import (
+	"github.com/Eyevinn/hi265/internal/loopfilter"
 	"github.com/Eyevinn/hi265/internal/slice"
 	"github.com/Eyevinn/hi265/pkg/frame"
 )
 
 // Apply applies SAO filtering to the reconstructed frame after deblocking.
 // SAO reads from the pre-SAO reconstructed picture, so we make copies of each plane.
-func Apply(f *frame.Frame, saoParams []slice.SaoParams, log2CtbSize int) {
+//
+// bounds says which neighbouring samples the edge offset mode may look at: one
+// in another tile, or in another slice that disallows filtering across its
+// boundary, is unavailable and leaves the sample unfiltered (spec 8.7.3.2). It
+// must not be nil.
+func Apply(f *frame.Frame, saoParams []slice.SaoParams, log2CtbSize int,
+	bounds *loopfilter.Boundaries) {
 	ctbSize := 1 << log2CtbSize
 	ctbsX := (f.Width + ctbSize - 1) / ctbSize
 	ctbsY := (f.Height + ctbSize - 1) / ctbSize
@@ -31,7 +38,8 @@ func Apply(f *frame.Frame, saoParams []slice.SaoParams, log2CtbSize int) {
 			w := min(ctbSize, f.Width-cx)
 			h := min(ctbSize, f.Height-cy)
 			applyCTU(origY, f.Y, f.StrideY, f.Width, f.Height, cx, cy, w, h,
-				sao.TypeIdx[0], sao.Offsets[0], sao.BandPos[0], sao.EoClass[0])
+				sao.TypeIdx[0], sao.Offsets[0], sao.BandPos[0], sao.EoClass[0],
+				bounds.CanFilterLuma)
 		}
 
 		// Chroma
@@ -57,20 +65,25 @@ func Apply(f *frame.Frame, saoParams []slice.SaoParams, log2CtbSize int) {
 			w := min(chromaCtbSize, chromaW-chromaCX)
 			h := min(chromaCtbSize, chromaH-chromaCY)
 			applyCTU(origPlane, dstPlane, f.StrideC, chromaW, chromaH, chromaCX, chromaCY, w, h,
-				sao.TypeIdx[cIdx], sao.Offsets[cIdx], sao.BandPos[cIdx], sao.EoClass[cIdx])
+				sao.TypeIdx[cIdx], sao.Offsets[cIdx], sao.BandPos[cIdx], sao.EoClass[cIdx],
+				bounds.CanFilterChroma)
 		}
 	}
 }
 
 // applyCTU applies SAO to a single CTU region on a single plane.
 // orig is the pre-SAO plane (read), dst is the output plane (write).
+// canFilter reports whether a neighbouring sample may be read, in this plane's
+// own coordinates.
 func applyCTU(orig, dst []uint8, stride, picW, picH, x0, y0, w, h int,
-	typeIdx int, offsets [4]int, bandPos, eoClass int) {
+	typeIdx int, offsets [4]int, bandPos, eoClass int,
+	canFilter func(xA, yA, xB, yB int) bool) {
 
 	if typeIdx == 1 {
+		// Band offset reads no neighbours, so no boundary can restrict it.
 		applyBandOffset(orig, dst, stride, x0, y0, w, h, offsets, bandPos)
 	} else {
-		applyEdgeOffset(orig, dst, stride, picW, picH, x0, y0, w, h, offsets, eoClass)
+		applyEdgeOffset(orig, dst, stride, picW, picH, x0, y0, w, h, offsets, eoClass, canFilter)
 	}
 }
 
@@ -95,7 +108,7 @@ var eoDY = [4]int{0, 1, 1, 1}
 
 // applyEdgeOffset applies SAO Edge Offset to a CTU region.
 func applyEdgeOffset(orig, dst []uint8, stride, picW, picH, x0, y0, w, h int,
-	offsets [4]int, eoClass int) {
+	offsets [4]int, eoClass int, canFilter func(xA, yA, xB, yB int) bool) {
 
 	dx := eoDX[eoClass]
 	dy := eoDY[eoClass]
@@ -109,6 +122,13 @@ func applyEdgeOffset(orig, dst []uint8, stride, picW, picH, x0, y0, w, h int,
 
 			if nx1 < 0 || nx1 >= picW || ny1 < 0 || ny1 >= picH ||
 				nx2 < 0 || nx2 >= picW || ny2 < 0 || ny2 >= picH {
+				continue
+			}
+			// Either neighbour being across a boundary the filter may not reach
+			// across leaves this sample alone (spec 8.7.3.2). Both directions
+			// matter: the class is a line through the sample, so one end can sit
+			// in the tile to the left and the other in the tile to the right.
+			if !canFilter(x, y, nx1, ny1) || !canFilter(x, y, nx2, ny2) {
 				continue
 			}
 

@@ -16,23 +16,20 @@ Phases are ordered by dependency. Sizes are rough: **S** ≈ half a day,
 Nothing else was worth building until generated bitstreams decoded identically in
 a conforming decoder, and until real streams decoded at all.
 
-All twelve items are closed. The phase started with two known defects and grew to
-twelve: each fix made the next one visible, and the conformance harness (0.2) is
+All thirteen items are closed. The phase started with two known defects and
+grew: each fix made the next one visible, and the conformance harness (0.2) is
 what turned "FFmpeg disagrees" into a specific spec clause every time. Generated
-content and real x265 output are both bit-exact against FFmpeg now.
+content, real x265 output and tiled streams are all bit-exact against FFmpeg now.
 
-Two things were deliberately left out of scope rather than half-built, and are
-recorded where they belong:
+One thing remains, narrowed to something specific rather than left vague:
 
-- **Tiles** (see 0.9): the entry point offsets parse, but tile scan order and
-  per-tile CABAC reset are not implemented.
 - **A conformance window on the encoder side** (see 0.8): the decoder applies
   one, but the generator cannot emit dimensions finer than a multiple of 8, so
   those are rejected with a clear error instead.
 
 Ordered by dependency, the fixes were: 0.1 → 0.5 → 0.2 (the harness) → 0.6, 0.7
-(which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11. The three small
-items 0.3, 0.4 and 0.11 were housekeeping alongside.
+(which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11 → 0.13. The three
+small items 0.3, 0.4 and 0.11 were housekeeping alongside.
 
 ### 0.1 MPM candidate-B CTB boundary rule (S) — **fixed**
 
@@ -253,8 +250,9 @@ Verified bit-exact against FFmpeg on flat content, all with WPP on:
 | x265 defaults (WPP + SAO + sign hiding + 32x32 TBs), 256x192 | exact |
 | x265 defaults, 1280x720 | exact |
 
-**Tiles** are still unsupported: the entry point offsets now parse, but tile
-scan order and per-tile CABAC reset are not implemented.
+**Tiles** were left for later here, and are done as of 0.13. The per-tile CABAC
+reset, needed only when one slice segment spans several tiles, is still missing
+and refused with a clear error.
 
 ### 0.11 Chroma QP table was off by one at qPi 34 (S) — **fixed**
 
@@ -275,6 +273,87 @@ padding was meaningless. The output is now cropped while the full coded picture
 stays as the prediction reference. On x265 colour bars this took 640x360 from
 30723 differing samples (max 196) to 1112 (max 3), and 1920x1080 from 99760
 (max 197) to 3336 (max 12) — the remainder being 0.10.
+
+### 0.13 Tiles decoding (L) — **fixed**
+
+The tiles half of 0.9, planned in `docs/tiles-decoding.md` and taken as far as
+its items T1–T4b. Before this, every tiled stream failed on its *second* slice
+segment with `slice header: expected stop bit 1, got 0`, because
+`slice_segment_address` was never read.
+
+Six things landed, the first five in that order out of necessity rather than
+taste:
+
+1. **A picture from several slice segments.** `first_slice_segment_in_pic_flag`
+   opens a picture, the next first-flag or the end of the NAL stream closes it,
+   and only then do the loop filters, the reference update and the conformance
+   window crop run (`pkg/decoder/picture.go`). Multi-slice pictures used to come
+   out as one bogus frame per slice.
+2. **Spec 6.5.1 scan tables** in `internal/tiles`: `colBd`/`rowBd`,
+   `CtbAddrRsToTs`, `CtbAddrTsToRs`, `TileId`, with uniform spacing as the
+   `(i+1)*n/N - i*n/N` formula rather than an equal division — 5 CTBs in two
+   columns is 2 then 3.
+3. **Slice segment header**: `dependent_slice_segment_flag`,
+   `slice_segment_address` and the `num_extra_slice_header_bits` reserved flags,
+   none of which were read.
+4. **Tile scan iteration** bounded by the segment, replacing a raster walk of
+   the whole picture.
+5. **Neighbour availability** (spec 6.4.1). The raster CTB address comparison in
+   `buildRefSamples` is gone: availability is now "inside the picture and
+   already reconstructed", with the reconstruction map cleared at each segment
+   start. Without this the work above was invisible — a 2x2 picture decoded tile
+   0 perfectly and the other three as garbage, since every CTB of tile 1 has a
+   lower-addressed CTB in tile 0 to mispredict from. The SAO merge flags were
+   gated the same way, which matters more: they are *parsed* conditionally, so a
+   bin read across a tile or slice boundary desyncs CABAC.
+
+6. **Loop filters that stop at boundaries.** With
+   `loop_filter_across_tiles_enabled_flag` equal to 0, neither deblocking nor
+   SAO may reach across a tile edge, and the same holds at a slice edge whose
+   `slice_loop_filter_across_slices_enabled_flag` is 0. `internal/loopfilter`
+   holds the answer for both filters — tiles and slices are whole CTBs, so "may
+   these two samples be filtered together?" is a question about their two CTBs.
+   Deblocking clears the affected edge flags before filtering (the spec 8.7.2
+   `filterEdgeFlag` derivation); SAO leaves a sample alone when either end of
+   its edge offset class is unavailable (8.7.3.2). The per-slice deblocking
+   parameters became real lookups at the same time: beta and tC offsets from the
+   slice holding the q side of the edge, and a slice with deblocking disabled
+   contributes no edges while still contributing its QPs to a neighbour's.
+
+   `slice_loop_filter_across_slices_enabled_flag` was read and discarded, and
+   keyed on the SPS SAO flag rather than the two slice SAO flags; it is now used,
+   and inferred from the PPS when absent (spec 7.4.7.1). It is not decoration:
+   x265 varies it per frame, so in `grid.265` it is 1 in three pictures and 0 in
+   two, verbatim through the stitch.
+
+Measured with kvazaar (`--tiles WxH --slices tiles`, the one shape x265 cannot
+produce) and with `hevc-retiler` output:
+
+| stream | before | after T1–T4 | after T5 |
+|---|---|---|---|
+| tiled, both loop filters off, 2x2 and non-equal 2x1 | header error | exact | exact |
+| tiled with SAO on, 256x256 | header error | 169 samples differ | **exact** |
+| tiled with deblocking on, 256x256 | header error | 1 972 differ | **exact** |
+| retiler `merged`, `grid`, `h`, `nu` (5 frames each) | header error | 2 871–14 651 differ | **exact** |
+| the same streams' standalone inputs | exact | exact | exact |
+
+The middle column's differences all sat within the loop filter's reach of a tile
+seam and nowhere else, which is what identified the remaining work as exactly
+the boundary rules. Removing those rules again reproduces those counts to the
+sample, so nothing else about the filters changed.
+
+The check the caller cares about now runs without ffmpeg: each tile's
+sub-rectangle of a merged picture equals that input's standalone decode under
+hi265 alone, every frame. That is `retile -verify`'s whole test.
+
+Still outstanding, all three refused with a clear error rather than
+mis-decoded: several tiles in one slice segment (needs the per-tile CABAC reset
+and per-tile `qPY_PREV` reset), dependent slice segments, and WPP combined with
+several segments.
+
+Five golden vectors — three unfiltered, one per loop filter — plus unit tests
+for the scan tables and the boundary rules came with it;
+`tools/gen_tiles_bitstreams.sh` regenerates the vectors.
 
 ### 0.10 Real-world content decoding (L) — **fixed**
 
@@ -332,7 +411,8 @@ Verified against FFmpeg:
 
 What is still out of scope: **P and B frames with real motion** — only
 zero-motion skip is implemented, so inter pictures beyond a freeze are far off,
-as designed. Tiles are also still unsupported (see 0.9).
+as designed. Worse, such a picture decodes without any error at all; see the
+tiles document's T8. Tiles have since landed as far as 0.13.
 
 ### 0.4 `hi265dec` argument handling (S) — **fixed**
 
@@ -465,7 +545,12 @@ Port from `hi264/pkg/encode/extend.go`, with HEVC differences:
 
 - `LastFrameState(annexB) (poc int, nalType hevc.NaluType, err error)` — use
   mp4ff's `hevc.ParseSliceHeader`, which exposes `PicOrderCntLsb` and
-  `SliceType`
+  `SliceType`. That parser is the one dependency this tool has on mp4ff beyond
+  parameter sets, and it needs **v0.56.0 or newer**: earlier releases miss the
+  spec 7.4.7.1 inference for `slice_deblocking_filter_disabled_flag`, so every
+  x265 `--no-deblock` stream — `testdata/sincos_128x64.265` included — was
+  refused with "alignment bit is not equal to one"
+  (`TestAppendEmptyFramesOnRealNoDeblockStream` pins it)
 - POC stride is **1** per appended picture (HEVC counts pictures), not AVC's 2
 - `AppendEmptyFrames(annexB, count)` — P-skip freeze continuing the source POC
 - `AppendRefreshFrames(annexB, count, mode)` with `mode ∈ {PSkip, GrayCRA,
@@ -615,8 +700,14 @@ Everything through Phase 3 is done, plus 4.1 and 4.3. Remaining, smallest first:
   gridimg directive, so the helpers exist.
 - **`hi265gen -cra-interval`** (in 1.3) — CRA keyframes instead of IDR, with POC
   running continuously. The slice encoding it needs is already there.
-- **Tiles** (in 0.9) — entry point offsets parse, but tile scan order and
-  per-tile CABAC reset are not implemented.
+- **Tiles: several tiles in one slice segment** (in 0.13, T6) — needs the
+  per-tile CABAC context reset and the per-tile `qPY_PREV` reset; dependent slice
+  segments are the other refused shape. Everything else about tiles is bit-exact,
+  loop filters included.
+- **Refusing inter CUs the decoder cannot reconstruct** (tiles document, T8) — a
+  P slice that is not all zero-motion skip decodes to garbage with no error,
+  which makes any differential check built on hi265 untrustworthy for inter
+  streams.
 - **Encoder-side conformance window** (in 0.8) — the decoder applies one; the
   generator still rejects dimensions finer than a multiple of 8.
 - **5.1 high bit depth decoding** (L) — the real differentiator, and the one item

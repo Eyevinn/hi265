@@ -2,5 +2,7 @@ github.com/Eyevinn/hi264 v0.10.0 h1:4CgeRcBT8Y03BuHHr9u7ErMN5Iiw1mGbvKNU9s4QFPg=
 github.com/Eyevinn/hi264 v0.10.0/go.mod h1:ag1j/wxUs7EvZu6qEZBRyLJ0bJW4OUjO8ip8c2TfLTQ=
 github.com/Eyevinn/mp4ff v0.52.0 h1:QJUi2PtROeZGkcumbX7f4/91Jz6dlhjeKzpwSdCoYG8=
 github.com/Eyevinn/mp4ff v0.52.0/go.mod h1:LKZAf3K+OtWYdzlvte8uafD/e3g2aK2WcsgVohvjccU=
+github.com/Eyevinn/mp4ff v0.56.0 h1:K81hqadHOLqQP+Rr610dwy7Cn3tLLEejCljzIfcNo+k=
+github.com/Eyevinn/mp4ff v0.56.0/go.mod h1:AhC+bOI7GSZmzuN4zFY9U76qMedbHI+8BdQXWrC9+8U=
 github.com/go-test/deep v1.1.0 h1:WOcxcdHcvdgThNXjw0t76K42FXTU7HpNQWHpA2HHNlg=
 github.com/go-test/deep v1.1.0/go.mod h1:5C2ZWiW0ErCdrYzpqxLbTX7MG14M9iiw8DgHncVwcsE=

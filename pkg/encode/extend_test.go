@@ -2,6 +2,7 @@ package encode
 
 import (
 	"bytes"
+	"os"
 	"testing"
 
 	"github.com/Eyevinn/hi264/pkg/yuv"
@@ -99,6 +100,48 @@ func TestAppendEmptyFramesFreezes(t *testing.T) {
 	for i := 1; i < len(frames); i++ {
 		if !bytes.Equal(frames[i].YUV420Bytes(), want) {
 			t.Errorf("appended frame %d differs from the source's last picture", i)
+		}
+	}
+}
+
+// Extending a real encoder's stream, rather than one of ours. x265 --no-deblock
+// leaves slice_deblocking_filter_disabled_flag out of the slice header, where it
+// has to be inferred from the PPS (spec 7.4.7.1). A parser that misses that
+// inference goes on to read a slice_loop_filter_across_slices_enabled_flag bit
+// that was never coded and fails byte_alignment() — which is what mp4ff's
+// ParseSliceHeader did before v0.56.0, making this whole path refuse every
+// --no-deblock stream with "alignment bit is not equal to one". Our own
+// generated streams do not have that shape, so nothing caught it.
+func TestAppendEmptyFramesOnRealNoDeblockStream(t *testing.T) {
+	stream, err := os.ReadFile("../../testdata/sincos_128x64.265")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := LastFrameState(stream)
+	if err != nil {
+		t.Fatalf("LastFrameState: %v", err)
+	}
+	if state.POC != 0 {
+		t.Errorf("POC = %d, want 0 for the IDR this vector holds", state.POC)
+	}
+
+	const appended = 2
+	extended, err := AppendEmptyFrames(stream, appended)
+	if err != nil {
+		t.Fatalf("AppendEmptyFrames: %v", err)
+	}
+	frames, err := decoder.New().DecodeAnnexB(extended)
+	if err != nil {
+		t.Fatalf("decode extended stream: %v", err)
+	}
+	if len(frames) != 1+appended {
+		t.Fatalf("decoded %d frames, want %d", len(frames), 1+appended)
+	}
+	want := frames[0].YUV420Bytes()
+	for i := 1; i < len(frames); i++ {
+		if !bytes.Equal(frames[i].YUV420Bytes(), want) {
+			t.Errorf("appended frame %d differs from the source picture", i)
 		}
 	}
 }
