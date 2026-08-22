@@ -35,9 +35,11 @@ segment per tile, which is what a tile-stitching tool produces, and every tile i
 a single segment reached through entry point offsets, which is what
 `kvazaar --tiles` does by default. Loop filters are included — neither
 deblocking nor SAO reaches across a tile boundary when the PPS forbids it, and
-the per-slice deblocking parameters are honoured. Dependent slice segments, and
-tiles combined with wavefront parallel processing, are refused with a clear
-error rather than mis-decoded.
+the per-slice deblocking parameters are honoured. Multi-slice pictures decode in
+both segment shapes as well: independent slices, each with their own wavefront
+substreams, and dependent segments that continue the slice before them. Tiles
+combined with wavefront parallel processing is refused with a clear error rather
+than mis-decoded — no HEVC profile permits it.
 
 Not supported: P/B frames with real motion (only zero-motion skip, so inter
 pictures beyond a freeze are out of scope).

@@ -88,10 +88,13 @@ What remains outside the supported set is refused rather than mis-decoded:
 
 ```
 picture covered by 16 CTBs, expected 64: slice segments do not tile the picture
-dependent slice segments are not supported
 tiles combined with wavefront parallel processing is not supported
-wavefront parallel processing in a picture of several slice segments is not supported
+slice segment at CTB 2 carries no data
 ```
+
+The last of those is x265's own degenerate output when `--slices 2` is asked of a
+picture too small to split — ffmpeg rejects that stream too ("Overread slice
+header by 5 bits").
 
 ## The narrow target
 
@@ -482,11 +485,11 @@ resets are unobservable one at a time, so they had to land together.
 
 What is left, in the order that makes each step verifiable:
 
-1. **Dependent slice segments.** The same segment bookkeeping, and it turns
-   "clear availability per segment" into "per slice", since a dependent segment
-   belongs to its predecessor's slice. It also unlocks the streams x265
-   `--slices N` and kvazaar `--slices wpp` produce, both of which pair dependent
-   segments with WPP.
+1. ~~**Dependent slice segments.**~~ **Done** — see roadmap 0.14. Availability,
+   QP prediction, the CABAC contexts and the wavefront snapshot are now per
+   *slice* rather than per segment, and the loop filters see a dependent boundary
+   as interior. Both `kvazaar --slices wpp` and `x265 --wpp --slices N` decode
+   bit-exactly.
 2. **T8.** Half a day, independent of everything else, and it is where
    `cu_skip_flag`'s context finally derives its increments from real availability
    and the neighbours' skip flags rather than from `x0 > 0` / `y0 > 0` — which is

@@ -16,7 +16,7 @@ Phases are ordered by dependency. Sizes are rough: **S** ≈ half a day,
 Nothing else was worth building until generated bitstreams decoded identically in
 a conforming decoder, and until real streams decoded at all.
 
-All thirteen items are closed. The phase started with two known defects and
+All fourteen items are closed. The phase started with two known defects and
 grew: each fix made the next one visible, and the conformance harness (0.2) is
 what turned "FFmpeg disagrees" into a specific spec clause every time. Generated
 content, real x265 output and tiled streams are all bit-exact against FFmpeg now.
@@ -28,7 +28,7 @@ One thing remains, narrowed to something specific rather than left vague:
   those are rejected with a clear error instead.
 
 Ordered by dependency, the fixes were: 0.1 → 0.5 → 0.2 (the harness) → 0.6, 0.7
-(which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11 → 0.13. The three
+(which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11 → 0.13 → 0.14. The three
 small items 0.3, 0.4 and 0.11 were housekeeping alongside.
 
 ### 0.1 MPM candidate-B CTB boundary rule (S) — **fixed**
@@ -356,14 +356,72 @@ The check the caller cares about now runs without ffmpeg: each tile's
 sub-rectangle of a merged picture equals that input's standalone decode under
 hi265 alone, every frame. That is `retile -verify`'s whole test.
 
-Still outstanding, all refused with a clear error rather than mis-decoded:
-dependent slice segments, WPP combined with several slice segments, and tiles
-combined with WPP — the last of which no HEVC profile permits, so it is
-deliberate rather than pending.
+Dependent slice segments and WPP across several slice segments followed in 0.14.
+What stays refused is tiles combined with WPP, which no HEVC profile permits, so
+it is deliberate rather than pending.
 
 Eight golden vectors — five with one slice segment per tile, three with every
 tile in one segment — plus unit tests for the scan tables and the boundary
 rules; `tools/gen_tiles_bitstreams.sh` regenerates them all.
+
+### 0.14 Slice segment structure (M) — **fixed**
+
+A slice is one independent slice segment plus any number of dependent ones
+(spec 7.4.7.1), and 0.13 handled only the independent kind. Two real shapes were
+refused: `kvazaar --slices wpp`, which puts every CTB row in a dependent segment,
+and `x265 --wpp --slices N`, which cuts a picture into N independent slices that
+each carry their own wavefront substreams.
+
+**Dependent segments.** Their header holds nothing but the address, so the slice
+type, QP, SAO flags and loop filter parameters all come from the independent
+segment that opened the slice. What used to be per-segment is now per-slice: the
+CABAC contexts are stored when a segment ends and resumed when the next one
+begins (spec 9.3.2.4), and QP prediction, the intra mode and CU depth maps and
+the sample availability map all carry over, because spec 6.4.1 makes a neighbour
+available when it is in the same *slice* — a boundary inside a slice is not a
+prediction boundary. The SAO merge flags are gated on `SliceAddrRs`, the slice's
+first CTB rather than the segment's, which is what spec 7.3.8.3 actually says.
+And the loop filters see a dependent boundary as interior, since the segment
+shares its slice's entry in the boundary map.
+
+**Wavefront processing across segments.** Entry point offsets are relative to
+the segment, so a slice beginning part-way down the picture indexes them from its
+own first row. The snapshot taken after the second CTB of a row lives in the
+slice state, so it survives a dependent segment boundary — and the row-start sync
+is gated on availability, so the first row of an *independent* slice starts from
+initial contexts instead of inheriting the previous slice's snapshot.
+
+One bug worth recording, because it is the kind that hides: the code had a single
+`wpp` flag meaning both "wavefront rules apply" and "this segment has
+substreams". Those differ. A dependent segment holding one row needs the context
+rules — snapshot, and sync at the row start — but carries no entry point offsets,
+so with the flags conflated it took no snapshot at all, and the next segment
+synced from a two-rows-stale one. It decoded 20 CTBs into a 16-CTB picture.
+
+Two pieces of encoder reality had to be accommodated:
+
+- kvazaar writes an entry point offset for every CTB row of the **picture** into
+  the first slice segment, even when the following rows live in their own
+  dependent segments. Offsets describing data the segment does not contain are
+  now ignored rather than rejected; a segment that really runs out of substreams
+  still says so.
+- x265 `--slices 2` on a picture too small to split emits a second slice NAL with
+  a header and no payload. That is refused with "slice segment at CTB n carries
+  no data"; ffmpeg rejects the same stream with "Overread slice header by 5 bits".
+
+Measured, all against FFmpeg: `kvazaar --slices wpp` at 128x128 and 256x256, the
+same with deblocking on, and `x265 --wpp --slices 2` — every one bit-exact, with
+no regression across the 22 tiled and non-tiled streams from 0.13. Three
+mutations confirm the rules are load-bearing: sharing slice state across a slice
+boundary breaks the x265 vector (24 548 samples), clearing availability at a
+dependent boundary breaks the kvazaar ones (12 286–73 920), and treating a
+dependent boundary as a slice boundary for the loop filters breaks the deblocked
+vector (104). Three golden vectors came with it, regenerated by
+`tools/gen_slice_bitstreams.sh`.
+
+Still missing: a dependent segment that begins **mid-row**, which is the one path
+the resume-from-stored-contexts branch exists for and which neither encoder here
+emits. And tiles combined with WPP, which no profile permits.
 
 ### 0.10 Real-world content decoding (L) — **fixed**
 
@@ -710,10 +768,10 @@ Everything through Phase 3 is done, plus 4.1 and 4.3. Remaining, smallest first:
   gridimg directive, so the helpers exist.
 - **`hi265gen -cra-interval`** (in 1.3) — CRA keyframes instead of IDR, with POC
   running continuously. The slice encoding it needs is already there.
-- **Dependent slice segments** (in 0.13) — the last refused slice shape that a
-  real encoder emits: x265 `--slices N` and kvazaar `--slices wpp` both pair them
-  with WPP. Everything else about tiles is bit-exact, both tiling shapes and both
-  loop filters included.
+- **A dependent slice segment beginning mid-row** (in 0.14) — the resume-from-
+  stored-contexts path exists and is spec-shaped, but no encoder to hand emits
+  such a stream, so it is untested by any fixture. Everything else about slices
+  and tiles is bit-exact.
 - **Refusing inter CUs the decoder cannot reconstruct** (tiles document, T8) — a
   P slice that is not all zero-motion skip decodes to garbage with no error,
   which makes any differential check built on hi265 untrustworthy for inter
