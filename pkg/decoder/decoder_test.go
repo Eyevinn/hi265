@@ -240,3 +240,30 @@ func TestDecodeTilesMultiPerSegmentQP2x2_128x128(t *testing.T) {
 	testGolden(t, "../../testdata/tiles_multi_qp_2x2_128x128.265",
 		"../../testdata/golden/tiles_multi_qp_2x2_128x128.yuv", 128, 128)
 }
+
+// A slice is one independent slice segment plus any number of dependent ones
+// (spec 7.4.7.1). A dependent segment carries almost no header: it continues its
+// predecessor's CABAC contexts, QP prediction and neighbour maps, and a boundary
+// between two segments of one slice is not a prediction or filtering boundary at
+// all. "kvazaar --slices wpp" puts each CTB row in a dependent segment.
+func TestDecodeDependentSegmentsWpp128x128(t *testing.T) {
+	testGolden(t, "../../testdata/slices_dep_wpp_128x128.265",
+		"../../testdata/golden/slices_dep_wpp_128x128.yuv", 128, 128)
+}
+
+// The same stream with deblocking on, which pins the filtering half: treating a
+// dependent segment boundary as a slice boundary leaves the row seam unfiltered.
+func TestDecodeDependentSegmentsDeblock128x128(t *testing.T) {
+	testGolden(t, "../../testdata/slices_dep_wpp_deblock_128x128.265",
+		"../../testdata/golden/slices_dep_wpp_deblock_128x128.yuv", 128, 128)
+}
+
+// Two *independent* slices with wavefront parallel processing, from x265
+// --wpp --slices 2. Each slice indexes its entry point offsets from its own
+// first CTB row, and the second slice must not inherit the first's wavefront
+// snapshot: the row above it belongs to another slice, so spec 6.4.1 makes it
+// unavailable and the contexts start from their initial values.
+func TestDecodeTwoSlicesWpp256x128(t *testing.T) {
+	testGolden(t, "../../testdata/slices_wpp_2slices_256x128.265",
+		"../../testdata/golden/slices_wpp_2slices_256x128.yuv", 256, 128)
+}

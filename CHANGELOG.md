@@ -38,6 +38,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or another tile is unavailable, replacing a comparison of raster CTB addresses
   that granted availability across both.
 
+#### Slice segments
+- Dependent slice segments: a slice is one independent segment plus any number of
+  dependent ones, and the dependent kind carries only its address. The CABAC
+  contexts are stored at the end of a segment and resumed by the next
+  (spec 9.3.2.4), and QP prediction, the neighbour maps and sample availability
+  are now per *slice* rather than per segment — spec 6.4.1 makes a neighbour
+  available when it is in the same slice, so a boundary inside one is neither a
+  prediction nor a filtering boundary. The SAO merge flags follow suit, gated on
+  `SliceAddrRs` rather than the segment's own address.
+- Wavefront parallel processing across several slice segments: entry point
+  offsets are indexed from the segment's own first CTB row, the row snapshot
+  survives a dependent segment boundary, and the first row of an independent
+  slice starts from initial contexts rather than inheriting the previous slice's
+  snapshot. This is what `x265 --wpp --slices N` produces.
+- Entry point offsets describing data outside the segment that carries them are
+  ignored rather than rejected: kvazaar writes one per CTB row of the whole
+  picture into the first segment even when later rows live in their own dependent
+  segments.
+
 #### Decoding real encoder output
 - Wavefront parallel processing (`entropy_coding_sync_enabled_flag`), which x265
   enables by default: `num_entry_point_offsets` and the substream offsets are

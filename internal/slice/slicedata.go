@@ -61,6 +61,45 @@ type SliceData struct {
 	// CtbsDecoded counts the CTBs this segment covered, so a caller assembling
 	// a picture from several segments can tell whether they add up to one.
 	CtbsDecoded int
+	// State is what this slice carries to its next segment. A caller decoding a
+	// dependent slice segment passes it back in through Params.
+	State *State
+}
+
+// State is what a slice keeps across its segments.
+//
+// A slice is one independent slice segment followed by zero or more dependent
+// ones (spec 7.4.7.1). A dependent segment carries almost no header of its own:
+// it continues its predecessor's CABAC contexts (spec 9.3.1), its QP prediction
+// (8.6.1), and its neighbour maps, since spec 6.4.1 makes a neighbour available
+// when it is in the same *slice* — segment boundaries inside a slice are not
+// prediction boundaries at all.
+type State struct {
+	// sliceAddrRS is SliceAddrRs: the raster address of the first CTB of the
+	// slice, which is the segment address of its independent segment. Several
+	// syntax elements are conditioned on it rather than on the segment's own
+	// address, the SAO merge flags among them (spec 7.3.8.3).
+	sliceAddrRS int
+	modeMap     *intraModeMap
+	depthMap    *cuDepthMap
+	qps         *qpState
+	// ctx is the context state stored when the previous segment of this slice
+	// ended (spec 9.3.2.4), which a dependent segment resumes from.
+	ctx []cabac.CtxState
+	// sync is the wavefront snapshot taken after the second CTB of a row
+	// (spec 9.3.2.3). It outlives a segment boundary because the row above may
+	// have been decoded by an earlier segment of the same slice.
+	sync []cabac.CtxState
+}
+
+// newState prepares the state of a slice beginning at raster address addrRS.
+func newState(p *Params, addrRS int) *State {
+	return &State{
+		sliceAddrRS: addrRS,
+		modeMap:     newIntraModeMap(p.PicWidth, p.PicHeight),
+		depthMap:    newCuDepthMap(p.PicWidth, p.PicHeight, 1<<p.Log2MinCbSize),
+		qps:         newQpState(p.SliceQPY, p.PicWidth, p.PicHeight, 1<<p.Log2MinCbSize),
+	}
 }
 
 // Params holds SPS/PPS-derived parameters needed for slice data decoding.
@@ -98,6 +137,14 @@ type Params struct {
 	// every slice segment so that a merge can reference a CTB decoded by an
 	// earlier one. A nil value allocates a fresh picture-sized array.
 	SaoParams []SaoParams
+
+	// Dependent mirrors dependent_slice_segment_flag: this segment continues the
+	// slice that the previous segment belonged to, and carries no header of its
+	// own beyond its address. State must then hold that slice's state.
+	Dependent bool
+	// State is the slice state returned by the previous segment of the same
+	// slice. Nil starts a new slice.
+	State *State
 }
 
 // qpState tracks the QP prediction state of spec 8.6.1.
@@ -246,13 +293,22 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 			len(sd.SaoParams), numCTUs)
 	}
 
-	// Spec 6.4.1 makes a neighbour that lies in another slice or another tile
-	// unavailable, so these three start empty for every slice segment rather
-	// than carrying over from the segment before: an undecoded neighbour and one
-	// belonging to a different segment then look alike, which is exactly right.
-	modeMap := newIntraModeMap(p.PicWidth, p.PicHeight)
-	depthMap := newCuDepthMap(p.PicWidth, p.PicHeight, 1<<p.Log2MinCbSize)
-	qps := newQpState(p.SliceQPY, p.PicWidth, p.PicHeight, 1<<p.Log2MinCbSize)
+	// The neighbour maps and the QP prediction belong to the slice, not to the
+	// segment: spec 6.4.1 makes a neighbour unavailable when it is in another
+	// *slice*, so a dependent segment inherits them and an independent one starts
+	// clean. An undecoded neighbour and one in another slice then look alike,
+	// which is exactly right.
+	st := p.State
+	if st == nil {
+		if p.Dependent {
+			return nil, fmt.Errorf("dependent slice segment at CTB %d without the state of the slice it continues",
+				p.SegmentAddressRS)
+		}
+		st = newState(&p, p.SegmentAddressRS)
+	}
+	sd.State = st
+	modeMap, depthMap, qps := st.modeMap, st.depthMap, st.qps
+	sliceFirstTs := grid.RsToTs(st.sliceAddrRS)
 
 	// Wavefront parallel processing splits the slice data into one substream per
 	// CTU row. Each substream restarts the arithmetic decoding engine at its
@@ -260,31 +316,38 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 	// after the second CTU of the row above rather than continuing the row
 	// before it (spec 9.3.1). Without WPP there is a single substream and the
 	// state simply carries on across rows.
-	wpp := p.EntropyCodingSyncEnabled && len(p.EntryPoints) > 0
-	if wpp && p.SegmentAddressRS != 0 {
-		return nil, fmt.Errorf("wavefront parallel processing in a picture of several slice segments is not supported")
-	}
-	if wpp && len(p.EntryPoints)+1 != ctbsY {
-		return nil, fmt.Errorf("WPP: %d entry point offsets for %d CTU rows",
-			len(p.EntryPoints), ctbsY)
-	}
-	substreams, err := splitSubstreams(cabacData, p.EntryPoints)
-	if err != nil {
-		return nil, err
+	// Wavefront parallel processing has two halves that must not be conflated.
+	// The *context* rules — a snapshot after the second CTB of every row, and a
+	// row starting from the row above's snapshot — follow from
+	// entropy_coding_sync_enabled_flag alone. The *substream* switch at a row
+	// boundary needs an entry point offset, and a segment holding a single row
+	// carries none. A dependent segment per row, which is what
+	// "kvazaar --slices wpp" emits, has the first without the second.
+	sync := p.EntropyCodingSyncEnabled
+	firstRow := p.SegmentAddressRS / ctbsX
+	substreams := splitSubstreams(cabacData, p.EntryPoints)
+	if len(cabacData) == 0 {
+		return nil, fmt.Errorf("slice segment at CTB %d carries no data", p.SegmentAddressRS)
 	}
 
 	dec, err := cabac.NewDecoder(substreams[0])
 	if err != nil {
 		return nil, fmt.Errorf("init CABAC: %w", err)
 	}
-	ctxModels := context.InitModels(p.SliceType, p.SliceQPY)
-	var syncModels []cabac.CtxState // state saved after the second CTU of a row
+	// Spec 9.3.1 decides what the contexts start from, and the same three-way
+	// choice applies at every substream boundary further down.
+	ctxModels, resetQP := initialContexts(grid, &p, st, ctbsX, sliceFirstTs)
+	if resetQP {
+		qps.resetToSliceQP(p.SliceQPY)
+	}
 
 	// The segment covers a run of consecutive tile scan addresses starting at
 	// its own, and ends when end_of_slice_segment_flag says so.
 	firstTs := grid.RsToTs(p.SegmentAddressRS)
-	// substream indexes into substreams; tile tracks which tile the previous CTB
-	// belonged to, so the first CTB of the next one can be recognised.
+	// substream indexes into substreams for the tile case, where each tile of the
+	// segment is one; the wavefront case indexes them by row instead. tile tracks
+	// which tile the previous CTB belonged to, so the first CTB of the next one
+	// can be recognised.
 	substream := 0
 	tile := grid.TileIDOfRs(p.SegmentAddressRS)
 
@@ -318,20 +381,25 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 			depthMap.reset()
 		}
 
-		if wpp && ctbAddrRS%ctbsX == 0 && row > 0 {
-			// Start of a CTU row: open its substream and take the context state
-			// from the row above, or start fresh when there was no second CTU
-			// there to snapshot (a picture one CTU wide).
-			if row >= len(substreams) {
-				return nil, fmt.Errorf("WPP: no substream for CTU row %d of %d", row, ctbsY)
+		if sync && ctbAddrRS%ctbsX == 0 && ts > firstTs {
+			// Start of a CTU row inside this segment. Its data is a substream of
+			// its own, indexed from the segment's first row; a segment that
+			// reaches a new row without an entry point for it is malformed.
+			idx := row - firstRow
+			if idx >= len(substreams) {
+				return nil, fmt.Errorf("WPP: no substream for CTU row %d; the segment carries %d entry point offsets",
+					row, len(p.EntryPoints))
 			}
-			dec, err = cabac.NewDecoder(substreams[row])
+			dec, err = cabac.NewDecoder(substreams[idx])
 			if err != nil {
 				return nil, fmt.Errorf("WPP: init CABAC for CTU row %d: %w", row, err)
 			}
-			substream = row
-			if syncModels != nil {
-				ctxModels = append(ctxModels[:0], syncModels...)
+			// The contexts come from the row above, whose snapshot is only usable
+			// when the CTB it was taken from is available — same slice, same tile
+			// (spec 9.3.1 via 6.4.1). A row that opens a new slice starts fresh.
+			aboveRight := ctbAddrRS - ctbsX + 1
+			if st.sync != nil && ctbsX > 1 && available(grid, sliceFirstTs, aboveRight, ctbAddrRS) {
+				ctxModels = append(ctxModels[:0], st.sync...)
 			} else {
 				ctxModels = context.InitModels(p.SliceType, p.SliceQPY)
 			}
@@ -343,11 +411,8 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 		// and this tile (spec 7.3.8.3) — a bin read for a neighbour across
 		// either boundary was never coded, and desyncs CABAC from there on.
 		if p.SaoLuma || p.SaoChroma {
-			inSegment := func(nRS int) bool {
-				return grid.RsToTs(nRS) >= firstTs && grid.SameTileRs(nRS, ctbAddrRS)
-			}
-			mergeLeftAvail := ctbX > 0 && inSegment(ctbAddrRS-1)
-			mergeUpAvail := ctbY > 0 && inSegment(ctbAddrRS-ctbsX)
+			mergeLeftAvail := ctbX > 0 && available(grid, sliceFirstTs, ctbAddrRS-1, ctbAddrRS)
+			mergeUpAvail := ctbY > 0 && available(grid, sliceFirstTs, ctbAddrRS-ctbsX, ctbAddrRS)
 			sd.SaoParams[ctbAddrRS] = decodeSaoParams(
 				dec, ctxModels, ctbsX, ctbAddrRS, sd.SaoParams,
 				mergeLeftAvail, mergeUpAvail, p.SaoLuma, p.SaoChroma,
@@ -361,9 +426,10 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 		sd.CUs = append(sd.CUs, cus...)
 
 		// Snapshot the context state after the second CTU of a row, which is
-		// what the first CTU of the next row starts from.
-		if wpp && ctbAddrRS%ctbsX == 1 {
-			syncModels = append(syncModels[:0], ctxModels...)
+		// what the first CTU of the next row starts from. It lives in the slice
+		// state because that next row can be in a later segment.
+		if sync && ctbAddrRS%ctbsX == 1 {
+			st.sync = append(st.sync[:0], ctxModels...)
 		}
 
 		sd.CtbsDecoded++
@@ -379,14 +445,57 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 		// behind with the one that ended.
 	}
 
-	// Every substream the header announced belongs to this segment, so any left
-	// over means the segment ended earlier than its entry points describe.
-	if substream != len(substreams)-1 {
-		return nil, fmt.Errorf("slice segment used %d of its %d substreams",
-			substream+1, len(substreams))
-	}
+	// Store the context state for a dependent segment continuing this slice
+	// (spec 9.3.2.4). Substreams the header announced but the segment never
+	// reached are left alone: kvazaar writes one entry point offset per CTB row
+	// of the *picture* into the first segment even when the following rows live
+	// in their own dependent segments, and such a stream is otherwise perfectly
+	// decodable.
+	st.ctx = append(st.ctx[:0], ctxModels...)
 
 	return sd, nil
+}
+
+// available implements the part of spec 6.4.1 that this decoder needs: a
+// neighbouring CTB is available when it belongs to the same slice and the same
+// tile as the current one, and comes earlier in tile scan. sliceFirstTs is the
+// tile scan address of the slice's first CTB — the slice's, not the segment's,
+// since segment boundaries inside a slice do not break availability.
+func available(grid *tiles.Grid, sliceFirstTs, neighbourRS, curRS int) bool {
+	nTs := grid.RsToTs(neighbourRS)
+	return nTs >= sliceFirstTs && nTs < grid.RsToTs(curRS) && grid.SameTileRs(neighbourRS, curRS)
+}
+
+// initialContexts applies spec 9.3.1 at the first CTB of a slice segment, and
+// reports whether QP prediction restarts there too (spec 8.6.1). The order of
+// the tests is the spec's: beginning a tile beats beginning a wavefront row,
+// which beats continuing a dependent segment.
+func initialContexts(grid *tiles.Grid, p *Params, st *State, ctbsX, sliceFirstTs int) (
+	ctx []cabac.CtxState, resetQP bool) {
+
+	rs := p.SegmentAddressRS
+	ts := grid.RsToTs(rs)
+	fresh := func() []cabac.CtxState { return context.InitModels(p.SliceType, p.SliceQPY) }
+
+	// The first CTB of a tile always starts from initial values.
+	if ts == 0 || grid.TileIDOfRs(grid.TsToRs(ts-1)) != grid.TileIDOfRs(rs) {
+		return fresh(), true
+	}
+	// The first CTB of a wavefront row takes the snapshot from the row above
+	// when that CTB is available — same slice, same tile — and starts fresh
+	// otherwise, which is what happens when a slice begins mid-picture.
+	if p.EntropyCodingSyncEnabled && rs%ctbsX == 0 {
+		if st.sync != nil && ctbsX > 1 && available(grid, sliceFirstTs, rs-ctbsX+1, rs) {
+			return append([]cabac.CtxState(nil), st.sync...), true
+		}
+		return fresh(), true
+	}
+	// A dependent segment picks up where the previous segment of its slice left
+	// off, mid-row and mid-tile, so nothing restarts.
+	if p.Dependent && st.ctx != nil {
+		return append([]cabac.CtxState(nil), st.ctx...), false
+	}
+	return fresh(), true
 }
 
 // splitSubstreams divides the slice data at the entry point offsets. A segment
@@ -394,21 +503,26 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 // for tiles as for wavefront parallel processing — where the next substream
 // begins — only what happens at that point differs: a tile re-initialises the
 // CABAC contexts, a WPP row inherits them from the row above.
-func splitSubstreams(cabacData []byte, entryPoints []int) ([][]byte, error) {
-	if len(entryPoints) == 0 {
-		return [][]byte{cabacData}, nil
-	}
+//
+// Offsets that fall outside the segment's own data are ignored rather than
+// rejected, and so are ones the segment never reaches. kvazaar writes an entry
+// point offset for every CTB row of the *picture* into the first slice segment,
+// even when the following rows live in their own dependent segments, which makes
+// the tail of that list describe data this segment does not contain. Such a
+// stream decodes perfectly well as long as nothing insists on the offsets being
+// meaningful, and a segment that really does run out of substreams says so where
+// it needs one.
+func splitSubstreams(cabacData []byte, entryPoints []int) [][]byte {
 	subs := make([][]byte, 0, len(entryPoints)+1)
 	start := 0
 	for _, ep := range entryPoints {
 		if ep <= start || ep > len(cabacData) {
-			return nil, fmt.Errorf("entry point %d outside slice data of %d bytes",
-				ep, len(cabacData))
+			break
 		}
 		subs = append(subs, cabacData[start:ep])
 		start = ep
 	}
-	return append(subs, cabacData[start:]), nil
+	return append(subs, cabacData[start:])
 }
 
 // decodeSaoParams decodes SAO parameters for one CTU per HEVC spec 7.3.8.3.

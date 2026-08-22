@@ -40,13 +40,14 @@ func New() *Decoder {
 // follows it. Picture assembly happens a segment at a time, so parsing a header
 // and decoding what it describes are separate steps.
 type sliceSegment struct {
-	sps    *hevc.SPS
-	pps    *hevc.PPS
-	first  bool // first_slice_segment_in_pic_flag
-	addrRS int  // slice_segment_address, in raster scan
-	params slice.Params
-	cabac  []byte
-	intra  bool // an IRAP segment, which needs no reference frame
+	sps       *hevc.SPS
+	pps       *hevc.PPS
+	first     bool // first_slice_segment_in_pic_flag
+	dependent bool // dependent_slice_segment_flag
+	addrRS    int  // slice_segment_address, in raster scan
+	params    slice.Params
+	cabac     []byte
+	intra     bool // an IRAP segment, which needs no reference frame
 
 	// Loop filter parameters, which the spec allows to vary per slice.
 	deblockingDisabled   bool
@@ -155,28 +156,51 @@ func (d *Decoder) decodeSegment(seg *sliceSegment, frames *[]*frame.Frame) error
 	if pic == nil {
 		return fmt.Errorf("slice segment at CTB %d arrived before the first segment of a picture", seg.addrRS)
 	}
-	pic.startSegment()
+
+	if seg.dependent {
+		// A dependent segment's header holds nothing but its address: the slice
+		// type, QP, SAO flags and loop filter parameters are the independent
+		// segment's, and so is the slice's place in bounds (spec 7.4.7.1). Its
+		// neighbours in the earlier segments of this slice stay available, so the
+		// availability map is deliberately not cleared here.
+		if pic.slice == nil {
+			return fmt.Errorf("dependent slice segment at CTB %d before any independent segment", seg.addrRS)
+		}
+		inherited := *pic.slice
+		inherited.first = false
+		inherited.dependent = true
+		inherited.addrRS = seg.addrRS
+		inherited.cabac = seg.cabac
+		inherited.params.EntryPoints = seg.params.EntryPoints
+		seg = &inherited
+	} else {
+		// A new slice: nothing decoded before it is available, and it takes its
+		// own place in bounds. Slices are added in decoding order, which is what
+		// lets the loop filters tell which side of a boundary came later.
+		pic.startSegment()
+		pic.slice = seg
+		pic.sliceState = nil
+		pic.sliceIdx = pic.bounds.AddSlice(loopfilter.Slice{
+			DeblockingDisabled: seg.deblockingDisabled,
+			BetaOffset:         seg.betaOffset,
+			TcOffset:           seg.tcOffset,
+			AcrossSlices:       seg.acrossSlices,
+		})
+	}
 
 	seg.params.Grid = pic.grid
 	seg.params.SegmentAddressRS = seg.addrRS
 	seg.params.SaoParams = pic.saoParams
+	seg.params.Dependent = seg.dependent
+	seg.params.State = pic.sliceState
 
 	sd, err := slice.DecodeSliceData(seg.cabac, seg.params)
 	if err != nil {
 		return fmt.Errorf("decode slice data: %w", err)
 	}
+	pic.sliceState = sd.State
 
-	// Every independent slice segment is a slice of its own — dependent
-	// segments, which would share their slice's parameters, are refused when the
-	// header is parsed. Slices are added in decoding order, which is what lets
-	// the loop filters tell which side of a slice boundary came later.
-	sliceIdx := pic.bounds.AddSlice(loopfilter.Slice{
-		DeblockingDisabled: seg.deblockingDisabled,
-		BetaOffset:         seg.betaOffset,
-		TcOffset:           seg.tcOffset,
-		AcrossSlices:       seg.acrossSlices,
-	})
-	pic.bounds.ClaimSegment(seg.addrRS, sd.CtbsDecoded, sliceIdx)
+	pic.bounds.ClaimSegment(seg.addrRS, sd.CtbsDecoded, pic.sliceIdx)
 	if seg.saoEnabled {
 		pic.saoEnabled = true
 	}
@@ -195,24 +219,49 @@ func (d *Decoder) decodeSegment(seg *sliceSegment, frames *[]*frame.Frame) error
 }
 
 // parseSegmentAddress reads the fields that only a slice segment other than the
-// first of a picture carries (spec 7.3.6.1), returning the segment's raster CTB
-// address.
-func parseSegmentAddress(r *bits.EBSPReader, sps *hevc.SPS, pps *hevc.PPS, first bool) (int, error) {
+// first of a picture carries (spec 7.3.6.1): the dependent flag and the segment
+// address. A dependent segment's header stops there — everything else about the
+// slice comes from the independent segment that started it.
+func parseSegmentAddress(r *bits.EBSPReader, sps *hevc.SPS, pps *hevc.PPS, first bool) (
+	addr int, dependent bool, err error) {
+
 	if first {
-		return 0, nil
+		return 0, false, nil
 	}
-	if pps.DependentSliceSegmentsEnabledFlag && r.ReadFlag() {
-		// A dependent segment continues the previous segment's header and CABAC
-		// contexts instead of carrying its own.
-		return 0, fmt.Errorf("dependent slice segments are not supported")
+	if pps.DependentSliceSegmentsEnabledFlag {
+		dependent = r.ReadFlag()
 	}
 	ctbsX, ctbsY := picSizeInCtbs(sps)
 	numCtbs := ctbsX * ctbsY
-	addr := int(r.Read(ceilLog2(numCtbs)))
+	addr = int(r.Read(ceilLog2(numCtbs)))
 	if addr <= 0 || addr >= numCtbs {
-		return 0, fmt.Errorf("slice_segment_address %d in a picture of %d CTBs", addr, numCtbs)
+		return 0, false, fmt.Errorf("slice_segment_address %d in a picture of %d CTBs", addr, numCtbs)
 	}
-	return addr, nil
+	return addr, dependent, nil
+}
+
+// parseDependentSegment finishes the header of a dependent slice segment, whose
+// only remaining fields are the entry point offsets, any header extension and
+// the byte alignment. The slice-level fields are the containing slice's.
+func parseDependentSegment(r *bits.EBSPReader, nalu []byte, sps *hevc.SPS, pps *hevc.PPS,
+	addrRS int) (*sliceSegment, error) {
+
+	entryPoints, err := finishSliceHeader(r, sps, pps)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.AccError(); err != nil {
+		return nil, fmt.Errorf("parse dependent slice segment header: %w", err)
+	}
+	cabacData, droppedEPBs := removeEmulationPreventionBytesWithMap(nalu[r.NrBytesRead():])
+	return &sliceSegment{
+		sps:       sps,
+		pps:       pps,
+		dependent: true,
+		addrRS:    addrRS,
+		cabac:     cabacData,
+		params:    slice.Params{EntryPoints: rebaseEntryPoints(entryPoints, droppedEPBs)},
+	}, nil
 }
 
 // parsePOCAndRefPicSets parses the slice header fields that every picture except
@@ -365,9 +414,12 @@ func (d *Decoder) parseIRAPSegment(nalu []byte, isCRA bool) (*sliceSegment, erro
 	}
 
 	// dependent_slice_segment_flag and slice_segment_address
-	segAddrRS, err := parseSegmentAddress(r, sps, pps, firstSlice)
+	segAddrRS, dependent, err := parseSegmentAddress(r, sps, pps, firstSlice)
 	if err != nil {
 		return nil, err
+	}
+	if dependent {
+		return parseDependentSegment(r, nalu, sps, pps, segAddrRS)
 	}
 
 	// slice_reserved_flag[i]
@@ -513,9 +565,12 @@ func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
 	}
 
 	// dependent_slice_segment_flag and slice_segment_address
-	segAddrRS, err := parseSegmentAddress(r, sps, pps, firstSlice)
+	segAddrRS, dependent, err := parseSegmentAddress(r, sps, pps, firstSlice)
 	if err != nil {
 		return nil, err
+	}
+	if dependent {
+		return parseDependentSegment(r, nalu, sps, pps, segAddrRS)
 	}
 
 	// slice_reserved_flag[i]

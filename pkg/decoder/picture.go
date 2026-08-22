@@ -37,6 +37,14 @@ type picture struct {
 	saoParams   []slice.SaoParams
 	ctbsDecoded int
 
+	// slice, sliceIdx and sliceState describe the slice currently being decoded,
+	// which a dependent slice segment continues: its header fields, its index in
+	// bounds, and the CABAC contexts, QP prediction and neighbour maps it has
+	// built up so far.
+	slice      *sliceSegment
+	sliceIdx   int
+	sliceState *slice.State
+
 	// sliceQPY is the first segment's, and is only the value the deblocking
 	// filter prefills its QP map with; every block a CU covers overrides it
 	// with that CU's own QP.
