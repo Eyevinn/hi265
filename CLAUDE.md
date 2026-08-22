@@ -60,7 +60,10 @@ Grid-based functions that produce Annex-B HEVC NALUs from flat-color CTU pattern
 - `GenerateIDR(p, grid, colors)` — IDR slice NALU
 - `GeneratePSkip(p, poc)` — P-skip slice NALU
 
-External SPS/PPS support (for injecting frames into existing streams):
+External SPS/PPS support (for injecting frames into existing streams). Tiles,
+wavefront parallel processing and `cu_qp_delta` in the PPS are honoured;
+`sign_data_hiding_enabled_flag` and the PPS chroma QP offsets are not (they are
+ignored, not refused), and `weighted_pred_flag` is refused:
 
 - `EncodeIDRSliceFromSPSPPS(sps, pps, grid, colors)` — IDR slice compatible with external parameter sets
 - `EncodePSkipSliceFromSPSPPS(sps, pps, poc)` — P-skip slice compatible with external parameter sets

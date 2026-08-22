@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### cu_qp_delta (encoder)
+- `pkg/encode` writes `cu_qp_delta_abs` where a PPS with
+  `cu_qp_delta_enabled_flag` set requires it: at the first transform unit of each
+  quantization group that codes a coefficient (spec 7.3.8.10), with the group
+  boundary taken from `diff_cu_qp_delta_depth` (7.3.8.4). Such parameter sets —
+  what x265 writes for any rate-controlled encode — were accepted before and
+  produced a stream that desynchronised CABAC where the element was missing. The
+  value is always zero, which is the correct delta for an encoder that codes every
+  CU at the slice QP. The gray and P-skip writers need none, since neither reaches
+  a transform unit that codes coefficients.
+
 #### Wavefront parallel processing (encoder)
 - `pkg/encode` emits WPP: with `entropy_coding_sync_enabled_flag` set — x265's
   default — the slice data is one CABAC substream per CTB row, each closed by an
