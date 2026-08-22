@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A picture width that is not a multiple of the 16x16 CTU coded the wrong
+  samples. A grid cell is one CTU, so `yuv.BuildFrame` lays a grid out wider than
+  such a picture; the grid entry points handed those planes to the slice writers,
+  which index them at the picture width, so every row was read one CTU remainder
+  further along than the last and the encoder coded a sheared picture. The source
+  samples are now repacked at the picture's own stride — the same crop
+  `YUV420Bytes` applies — so a `.265` and a `.yuv` of one pattern agree.
+  `hi265gen -smpte -w 120 -h 80` differed from its own raw output on 14050 of
+  14400 samples at max delta 177; it now differs on 480 at max delta 1. Only the
+  width was affected, so 1920x1080 and 640x360 were never wrong, and widths that
+  are multiples of 16 are byte-identical to before. A grid too small for the
+  picture is now an error instead of a read past the buffer.
+
 ### Added
 
 #### cu_qp_delta (encoder)

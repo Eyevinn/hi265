@@ -52,9 +52,9 @@ func cuQpDeltaCases() []cuQpDeltaCase {
 			depth: 0, qp: 26, maxPatternDelta: 4},
 		{name: "group_8x8_short_ctb_row", width: 128, height: 72, use8x8CU: true,
 			depth: 1, qp: 26, maxPatternDelta: 4},
-		// Partial CTBs at the right edge as well. This one carries no intended
-		// picture to compare against: see hasIntendedPicture.
-		{name: "group_8x8_narrow_ctb_column", width: 120, height: 72, use8x8CU: true, depth: 1, qp: 26},
+		// A narrow right CTB column as well as a short bottom row.
+		{name: "group_8x8_narrow_ctb_column", width: 120, height: 72, use8x8CU: true,
+			depth: 1, qp: 26, maxPatternDelta: 4},
 		// A coarse quantizer leaves most blocks with nothing to code, so most
 		// groups write no delta at all; a fine one makes almost every group write
 		// one.
@@ -87,22 +87,6 @@ func (c cuQpDeltaCase) paramSets(t *testing.T) (annexBPrefix []byte, sps *hevc.S
 	return buf.Bytes(), sps, pps
 }
 
-// hasIntendedPicture reports whether the case can be compared against the
-// picture its grid describes.
-//
-// yuv.BuildFrame lays a grid out at grid.Width*16 samples per row, and the
-// external-SPS/PPS entry points then reset the frame's declared width to the
-// SPS's. When the two differ — any picture whose width is not a multiple of 16 —
-// the encoder walks the source planes with the wrong stride, so both the coded
-// picture and any reference built from the same grid are meaningless. That is a
-// defect in how the grid entry points take a frame, not in anything here, and it
-// is why such a case is still worth running against FFmpeg (the bitstream is
-// self-consistent and has to decode identically) but not against the pattern.
-// Note that only the width matters: a short bottom CTB row strides correctly.
-func (c cuQpDeltaCase) hasIntendedPicture() bool {
-	return c.width%16 == 0
-}
-
 // TestEncodeIDRWithCuQpDelta writes a grid IDR against parameter sets that
 // enable cu_qp_delta and checks the picture comes back.
 //
@@ -115,9 +99,6 @@ func (c cuQpDeltaCase) hasIntendedPicture() bool {
 func TestEncodeIDRWithCuQpDelta(t *testing.T) {
 	for _, c := range cuQpDeltaCases() {
 		t.Run(c.name, func(t *testing.T) {
-			if !c.hasIntendedPicture() {
-				t.Skip("no intended picture to compare against; see hasIntendedPicture")
-			}
 			prefix, sps, pps := c.paramSets(t)
 			grid, colors, err := buildGrid(patTiles, 0, (c.width+15)/16, (c.height+15)/16)
 			if err != nil {

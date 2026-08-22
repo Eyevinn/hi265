@@ -289,7 +289,11 @@ Flags:
 > **Dimension constraint.** Frame width and height must be multiples of 8.
 > Sizes that are not a multiple of the 16x16 CTU — 1920x1080 and 640x360 among
 > them — are fully supported: the picture uses an 8-sample minimum coding block
-> and the partial bottom CTU row is split implicitly, as the spec requires.
+> and the partial CTU row or column is split implicitly, as the spec requires.
+> That holds for a ragged *width* as well as a ragged height: since a grid cell is
+> one CTU, the pattern is laid out wider than such a picture and the source samples
+> are repacked at the picture's own stride before being coded, so the `.265` and
+> the `.yuv` of one pattern describe the same picture.
 > Sizes that are not a multiple of 8 cannot be expressed with a 16x16 CTU
 > without a conformance window, and are rejected with an error naming the
 > nearest usable size.

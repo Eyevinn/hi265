@@ -16,7 +16,7 @@ Phases are ordered by dependency. Sizes are rough: **S** ≈ half a day,
 Nothing else was worth building until generated bitstreams decoded identically in
 a conforming decoder, and until real streams decoded at all.
 
-All eighteen items are closed. The phase started with two known defects and
+All nineteen items are closed. The phase started with two known defects and
 grew: each fix made the next one visible, and the conformance harness (0.2) is
 what turned "FFmpeg disagrees" into a specific spec clause every time. Generated
 content, real x265 output and tiled streams are all bit-exact against FFmpeg now.
@@ -29,7 +29,7 @@ One thing remains, narrowed to something specific rather than left vague:
 
 Ordered by dependency, the fixes were: 0.1 → 0.5 → 0.2 (the harness) → 0.6, 0.7
 (which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11 → 0.13 → 0.14 →
-0.15 → 0.16 → 0.17 → 0.18. The three
+0.15 → 0.16 → 0.17 → 0.18 → 0.19. The three
 small items 0.3, 0.4 and 0.11 were housekeeping alongside.
 
 ### 0.1 MPM candidate-B CTB boundary rule (S) — **fixed**
@@ -636,6 +636,50 @@ delta 177 and 120x72 on 12602 of 12960. Only the width matters. This is why the
 narrow-right-column case above is checked against FFmpeg but not against the
 pattern it was built from.
 
+### 0.19 A picture width that is not a multiple of the CTU (S) — **fixed**
+
+Found while testing 0.18, and the only item on this list that was a live defect
+in a documented flag rather than a missing feature. `hi265gen -w 120` coded the
+wrong samples, silently.
+
+A grid cell is one CTU, so `yuv.BuildFrame` lays a grid out at `grid.Width*16`
+samples per row. `GenerateIDR`, `EncodeIDRSliceFromSPSPPS` and
+`EncodeCRASliceFromSPSPPS` then set the frame's `Width` to the picture's and
+handed the *planes* straight to the slice writers, which index them as
+`src[y*width+x]`. For any picture whose width is not a multiple of 16 the buffer
+is wider than that, so every row was read one CTU remainder further along than the
+one before: the encoder coded a picture sheared sideways, faithfully.
+
+`frame.Frame` already draws the distinction the bug ignored — `Width` is the
+visible picture, `StrideY` the buffer — and `YUV420Bytes` crops on it, which is
+why the raw `.yuv` output was right all along and only the `.265` was wrong.
+`gridSource` now does that same crop once at each entry point and returns packed
+planes, so the two agree by construction. A grid too small for the picture is an
+error rather than a read past the buffer.
+
+Measured with `hi265gen -smpte` against the generator's own raw output, before
+and after:
+
+| size | before | after |
+|---|---|---|
+| 120x72 | 12602 of 12960 differ, max delta 177 | 456, max delta 1 |
+| 120x80 | 14050 of 14400 differ, max delta 177 | 480, max delta 1 |
+| 128x72 | 568, max delta 1 | unchanged |
+| 128x80 | 576, max delta 1 | unchanged |
+
+Only the width was ever affected: a short bottom CTB row strides correctly, which
+is why 1920x1080 and 640x360 — ragged in height, aligned in width — were fine and
+nothing caught this. Widths that are multiples of 16 are byte-identical to before.
+
+Four conformance cases now cover it (`tiles_ragged_width` 120x72,
+`smpte_ragged_width` 200x104, `tiles_ragged_width_tiny` 24x24 and
+`smpte_ragged_width_pskip`), and they had to use a pattern that varies
+horizontally: the two decoders agree on a sheared picture, so only the check
+against the intended pattern catches it, and a flat pattern shears invisibly.
+`TestGridSourceRepacksToPictureWidth` pins the repacking itself against the
+frame's strided layout. Restoring the old behaviour fails exactly those four
+conformance cases and four of the five unit cases.
+
 ### 0.10 Real-world content decoding (L) — **fixed**
 
 x265 output was not bit-exact, and got worse with detail and scale: a 720p
@@ -991,11 +1035,6 @@ Everything through Phase 3 is done, plus 4.1 and 4.3. Remaining, smallest first:
   an intra-plus-freeze one.
 - **Encoder-side conformance window** (in 0.8) — the decoder applies one; the
   generator still rejects dimensions finer than a multiple of 8.
-- **A picture width that is not a multiple of 16** (found in 0.18) — the grid
-  entry points hand the encoder a frame strided at `grid.Width*16` while it walks
-  the planes at the SPS width, so `hi265gen -w 120` codes the wrong samples.
-  Widths that are multiples of 16 are unaffected, and so is a short bottom CTB
-  row. Measured numbers are in 0.18.
 - **`sign_data_hiding_enabled_flag` and the PPS chroma QP offsets from an
   external PPS** (found in 0.18) — ignored rather than refused by the grid IDR
   writer, which is what still stands between it and a default-settings x265 PPS.
