@@ -234,6 +234,10 @@ func encodeGraySliceData(p graySliceParams) [][]byte {
 	// predicted with zero residual, so a neighbour in another tile being
 	// unavailable changes nothing: DC with no neighbours is the mid-grey the
 	// picture is made of anyway.
+	//
+	// That is also why no cu_qp_delta is written whatever the PPS says: every
+	// transform unit has cbf_luma, cbf_cb and cbf_cr clear, and spec 7.3.8.10
+	// codes the element only for a unit that carries a coefficient.
 	return p.seg.encodeCtbs(p.ctuSize, context.SliceTypeI, p.qp,
 		func(enc *cabac.Encoder, models []cabac.CtxState, x, y int) {
 			encodeGrayCUTree(enc, models, x, y, p.ctuSize, p.log2CtuSize, p)

@@ -162,6 +162,69 @@ func splitCuCtxInc(depths *cuDepths, x0, y0, depth int) int {
 	return ctxInc
 }
 
+// quantGroups tracks where cu_qp_delta_abs has to be written. A quantization
+// group is the area that shares one cu_qp_delta: spec 7.3.8.4 clears
+// IsCuQpDeltaCoded at every coding quadtree node whose block is at least
+// Log2MinCuQpDeltaSize, and spec 7.3.8.10 codes the element at the first
+// transform unit within the group that carries any coefficient at all.
+//
+// A nil *quantGroups is a PPS with cu_qp_delta_enabled_flag clear: nothing is
+// tracked and nothing is written. Both methods take a nil receiver so the call
+// sites need no guard.
+//
+// Nothing has to be carried across a tile or a wavefront row, which is where
+// spec 8.6.1 restarts QP prediction: the group is never larger than a CTB, so
+// every CTB begins one and clears the flag anyway.
+type quantGroups struct {
+	// size is the quantization group size in luma samples, CtbSizeY >>
+	// diff_cu_qp_delta_depth.
+	size int
+	// coded is IsCuQpDeltaCoded for the group being written.
+	coded bool
+}
+
+// newQuantGroups returns the tracker for a PPS whose quantization groups are
+// size luma samples across, or nil when cu_qp_delta is disabled.
+func newQuantGroups(size int) *quantGroups {
+	if size <= 0 {
+		return nil
+	}
+	return &quantGroups{size: size}
+}
+
+// startGroup clears the coded flag if this quadtree node begins a quantization
+// group. A node bigger than the group size begins one too; each child that is
+// itself a group simply clears the flag again.
+func (q *quantGroups) startGroup(size int) {
+	if q != nil && size >= q.size {
+		q.coded = false
+	}
+}
+
+// writeDelta writes this group's cu_qp_delta_abs if the transform unit about to
+// be written is the first in the group to code a coefficient. cbf says whether it
+// codes any luma or chroma coefficient; a group made only of all-zero transform
+// units codes no delta at all, which is why the flat areas of a picture cost
+// nothing here.
+func (q *quantGroups) writeDelta(enc *cabac.Encoder, models []cabac.CtxState, cbf bool) {
+	if q == nil || q.coded || !cbf {
+		return
+	}
+	// cu_qp_delta_abs = 0, which is the whole element: spec 9.3.3.10 binarises it
+	// as a truncated Rice prefix of up to five context-coded bins, so zero is the
+	// single bin that ends the prefix immediately, and cu_qp_delta_sign_flag is
+	// only present when the magnitude is non-zero.
+	//
+	// Zero is the only delta this encoder needs. Every CU it writes is quantized
+	// at SliceQpY, so qPY_PRED — an average of the QPs left of and above the group
+	// origin, each falling back to the previous group's (spec 8.6.1) — is SliceQpY
+	// as well, and QpY = qPY_PRED + 0 is exactly the QP the residual was
+	// quantized with. Coding something else would mean choosing a QP per group,
+	// which is a rate control decision this generator does not make.
+	enc.EncodeDecision(0, &models[context.CtxCuQpDeltaAbs])
+	q.coded = true
+}
+
 // encodeCodingQuadtree walks one coding quadtree, writing split_cu_flag exactly
 // where spec 7.3.8.4 codes it and calling code for every CU a decoder will parse.
 //
@@ -172,11 +235,16 @@ func splitCuCtxInc(depths *cuDepths, x0, y0, depth int) int {
 // 16x16 CTU cover a height like 1080 or 360.
 func encodeCodingQuadtree(enc *cabac.Encoder, models []cabac.CtxState,
 	x0, y0, size, depth int, lay codingLayout, picW, picH int,
-	depths *cuDepths, code func(x0, y0, size int)) {
+	depths *cuDepths, qg *quantGroups, code func(x0, y0, size int)) {
 
 	if x0 >= picW || y0 >= picH {
 		return // wholly outside the picture: nothing is coded
 	}
+
+	// Quantization group boundary (spec 7.3.8.4), after the bounds check because
+	// spec 7.3.8.4 does not recurse into a node that starts outside the picture,
+	// so such a node begins no group.
+	qg.startGroup(size)
 
 	fits := x0+size <= picW && y0+size <= picH
 	canSplit := size > lay.minCbSize
@@ -196,7 +264,7 @@ func encodeCodingQuadtree(enc *cabac.Encoder, models []cabac.CtxState,
 		half := size / 2
 		for _, off := range [4][2]int{{0, 0}, {half, 0}, {0, half}, {half, half}} {
 			encodeCodingQuadtree(enc, models, x0+off[0], y0+off[1], half, depth+1,
-				lay, picW, picH, depths, code)
+				lay, picW, picH, depths, qg, code)
 		}
 		return
 	}
@@ -215,10 +283,14 @@ type idrSliceParams struct {
 	// one segment per tile.
 	seg segment
 
-	width                           int
-	height                          int
-	qp                              int
-	use8x8CU                        bool
+	width    int
+	height   int
+	qp       int
+	use8x8CU bool
+	// minCuQpDeltaSize is the quantization group size in luma samples,
+	// CtbSizeY >> diff_cu_qp_delta_depth, or zero when the PPS leaves
+	// cu_qp_delta_enabled_flag clear and no cu_qp_delta is written at all.
+	minCuQpDeltaSize                int
 	ppsID                           uint32
 	numExtraSliceHeaderBits         uint8
 	outputFlagPresent               bool
@@ -326,12 +398,24 @@ func writePOCAndRefPicSets(w *BitWriter, p pocRefPicSetParams) {
 
 func idrSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) idrSliceParams {
 	qp := 26 + int(pps.InitQpMinus26) // slice_qp_delta = 0
-	minCbSize := 1 << (int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3)
+	log2MinCbSize := int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3
+	minCbSize := 1 << log2MinCbSize
+	log2CtbSize := log2MinCbSize + int(sps.Log2DiffMaxMinLumaCodingBlockSize)
+
+	// The quantization group, when the PPS asks for one. diff_cu_qp_delta_depth
+	// is bounded by log2_diff_max_min_luma_coding_block_size, so the group is
+	// never smaller than a minimum-size CU nor larger than a CTB.
+	minCuQpDeltaSize := 0
+	if pps.CuQpDeltaEnabledFlag {
+		minCuQpDeltaSize = 1 << (log2CtbSize - int(pps.DiffCuQpDeltaDepth))
+	}
+
 	return idrSliceParams{
 		width:                           int(sps.PicWidthInLumaSamples),
 		height:                          int(sps.PicHeightInLumaSamples),
 		qp:                              qp,
 		use8x8CU:                        minCbSize == 8,
+		minCuQpDeltaSize:                minCuQpDeltaSize,
 		ppsID:                           pps.PicParameterSetID,
 		numExtraSliceHeaderBits:         pps.NumExtraSliceHeaderBits,
 		outputFlagPresent:               pps.OutputFlagPresentFlag,
@@ -398,7 +482,8 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 
 	// The slice data has to exist before the header can describe it: its
 	// substream lengths are the entry point offsets.
-	subs := encodeIDRSliceData(p.seg, p.width, p.height, p.qp, p.use8x8CU, y, cb, cr)
+	subs := encodeIDRSliceData(p.seg, p.width, p.height, p.qp, p.use8x8CU,
+		p.minCuQpDeltaSize, y, cb, cr)
 	p.seg.writeEntryPointOffsets(w, subs)
 
 	// byte_alignment
@@ -425,7 +510,9 @@ func encodeIDRSlice(seg segment, width, height, qp int, use8x8CU bool, y, cb, cr
 	w.WriteSE(0) // slice_qp_delta = 0 (PPS init_qp_minus26 = qp-26)
 	// Deblocking disabled in PPS → no deblock syntax
 	// loop_filter_across_slices_enabled_flag: not present (PPS flag is 0 and deblock is disabled)
-	subs := encodeIDRSliceData(seg, width, height, qp, use8x8CU, y, cb, cr)
+	// The generated PPS leaves cu_qp_delta_enabled_flag clear, so there are no
+	// quantization groups to write a delta for.
+	subs := encodeIDRSliceData(seg, width, height, qp, use8x8CU, 0, y, cb, cr)
 	seg.writeEntryPointOffsets(w, subs)
 
 	// byte_alignment
@@ -442,7 +529,9 @@ func encodeIDRSlice(seg segment, width, height, qp int, use8x8CU bool, y, cb, cr
 // The CTU size is always 16. With use8x8CU each CTU is split by the coding
 // quadtree into four independently predicted 8x8 CUs (SPS minCbSize = 8),
 // otherwise the CTU is one 16x16 CU (SPS minCbSize = 16).
-func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool, y, cb, cr []uint8) [][]byte {
+func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool,
+	minCuQpDeltaSize int, y, cb, cr []uint8) [][]byte {
+
 	lay := chooseCodingLayout(width, height, use8x8CU)
 	ctuSize := lay.ctuSize
 
@@ -454,14 +543,15 @@ func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool, y, cb
 	reconFrame := frame.NewFrame(width, height)
 	modes := newIntraModes()
 	depths := newCuDepths(width, height, lay.minCbSize)
+	qg := newQuantGroups(minCuQpDeltaSize)
 
 	return seg.encodeCtbs(ctuSize, context.SliceTypeI, qp,
 		func(enc *cabac.Encoder, models []cabac.CtxState, ctuX, ctuY int) {
 			encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
-				width, height, depths,
+				width, height, depths, qg,
 				func(x0, y0, cuSize int) {
 					encodeIDRCU(enc, models, x0, y0, cuSize, ctuSize, lay.minCbSize,
-						width, height, qp, y, cb, cr, reconFrame, modes)
+						width, height, qp, y, cb, cr, reconFrame, modes, qg)
 				})
 		})
 }
@@ -472,7 +562,7 @@ func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool, y, cb
 // the CTB boundary rule in the MPM derivation.
 func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 	cuX, cuY, cuSize, ctuSize, minCbSize, width, height, qp int,
-	y, cb, cr []uint8, reconFrame *frame.Frame, modes *intraModes) {
+	y, cb, cr []uint8, reconFrame *frame.Frame, modes *intraModes, qg *quantGroups) {
 
 	// split_cu_flag is written by the caller.
 	// No pred_mode_flag (I-slice, implicitly intra)
@@ -550,6 +640,12 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 
 	// cbf_luma at depth 0 (context = !trafoDepth = 1, so ctxIdx = CtxCbfLuma + 1)
 	encBool(enc, &models[context.CtxCbfLuma+1], cbfLuma)
+
+	// cu_qp_delta_abs comes between cbf_luma and the residual (spec 7.3.8.10),
+	// once per quantization group and only for a transform unit that codes
+	// something. The transform tree here is never split, so this CU is that one
+	// transform unit.
+	qg.writeDelta(enc, models, cbfLuma || cbfCb || cbfCr)
 
 	// Encode residual if any cbf is set
 	if cbfLuma {
@@ -1041,10 +1137,13 @@ func encodePSkipSliceData(seg segment, width, height, qp, ctuSize, log2MinCbSize
 	}
 	depths := newCuDepths(width, height, lay.minCbSize)
 
+	// No quantization groups: a skipped CU has no transform tree, so there is
+	// never a transform unit to carry a cu_qp_delta however the PPS is set
+	// (spec 7.3.8.10 codes it inside transform_unit).
 	return seg.encodeCtbs(ctuSize, context.SliceTypeP, qp,
 		func(enc *cabac.Encoder, models []cabac.CtxState, ctuX, ctuY int) {
 			encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
-				width, height, depths,
+				width, height, depths, nil,
 				func(x0, y0, _ int) {
 					// cu_skip_flag = 1. ctxInc counts the left and above neighbours
 					// that are skipped; every coded CU here is, so availability alone

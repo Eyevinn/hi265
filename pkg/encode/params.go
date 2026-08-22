@@ -155,27 +155,37 @@ func b2u(v bool) uint8 {
 	return 0
 }
 
-// generatePPS returns the PPS RBSP bytes for the given QP, tile grid and
-// wavefront setting. A grid of one column and one row means no tiles, and the
-// tile syntax is left out. With wpp the slice data carries one CABAC substream
-// per CTB row; the two are mutually exclusive, which the callers enforce.
-func generatePPS(qp, tileCols, tileRows int, wpp bool) []byte {
+// generatePPS returns the PPS RBSP bytes for the given QP, tile grid, wavefront
+// setting and quantization group depth. A grid of one column and one row means no
+// tiles, and the tile syntax is left out. With wpp the slice data carries one
+// CABAC substream per CTB row; the two are mutually exclusive, which the callers
+// enforce.
+//
+// cuQpDeltaDepth is diff_cu_qp_delta_depth, or negative to leave
+// cu_qp_delta_enabled_flag clear. Everything this package generates itself passes
+// a negative value — it codes every CU at the slice QP, so a quantization group
+// would only add a cu_qp_delta of zero to every CTB. The parameter exists so the
+// tests can build the external parameter sets that do enable it, which is where
+// the encoder has to write that element to stay in sync.
+func generatePPS(qp, tileCols, tileRows int, wpp bool, cuQpDeltaDepth int) []byte {
 	w := NewBitWriter()
 
-	w.WriteUE(0)              // pps_pic_parameter_set_id = 0
-	w.WriteUE(0)              // pps_seq_parameter_set_id = 0
-	w.WriteBit(0)             // dependent_slice_segments_enabled_flag = 0
-	w.WriteBit(0)             // output_flag_present_flag = 0
-	w.WriteBits(0, 3)         // num_extra_slice_header_bits = 0
-	w.WriteBit(0)             // sign_data_hiding_enabled_flag = 0
-	w.WriteBit(0)             // cabac_init_present_flag = 0
-	w.WriteUE(0)              // num_ref_idx_l0_default_active_minus1 = 0
-	w.WriteUE(0)              // num_ref_idx_l1_default_active_minus1 = 0
-	w.WriteSE(int32(qp) - 26) // init_qp_minus26
-	w.WriteBit(0)             // constrained_intra_pred_flag = 0
-	w.WriteBit(0)             // transform_skip_enabled_flag = 0
-	w.WriteBit(0)             // cu_qp_delta_enabled_flag = 0
-	// no cb_qp_offset or cr_qp_offset when cu_qp_delta_enabled_flag=0
+	w.WriteUE(0)                         // pps_pic_parameter_set_id = 0
+	w.WriteUE(0)                         // pps_seq_parameter_set_id = 0
+	w.WriteBit(0)                        // dependent_slice_segments_enabled_flag = 0
+	w.WriteBit(0)                        // output_flag_present_flag = 0
+	w.WriteBits(0, 3)                    // num_extra_slice_header_bits = 0
+	w.WriteBit(0)                        // sign_data_hiding_enabled_flag = 0
+	w.WriteBit(0)                        // cabac_init_present_flag = 0
+	w.WriteUE(0)                         // num_ref_idx_l0_default_active_minus1 = 0
+	w.WriteUE(0)                         // num_ref_idx_l1_default_active_minus1 = 0
+	w.WriteSE(int32(qp) - 26)            // init_qp_minus26
+	w.WriteBit(0)                        // constrained_intra_pred_flag = 0
+	w.WriteBit(0)                        // transform_skip_enabled_flag = 0
+	w.WriteBit(b2u(cuQpDeltaDepth >= 0)) // cu_qp_delta_enabled_flag
+	if cuQpDeltaDepth >= 0 {
+		w.WriteUE(uint32(cuQpDeltaDepth)) // diff_cu_qp_delta_depth
+	}
 	w.WriteSE(0)  // pps_cb_qp_offset = 0
 	w.WriteSE(0)  // pps_cr_qp_offset = 0
 	w.WriteBit(0) // pps_slice_chroma_qp_offsets_present_flag = 0

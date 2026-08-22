@@ -79,7 +79,7 @@ func GenerateVPSSPSPPS(p EncodeParams) ([]byte, error) {
 	var buf bytes.Buffer
 	WriteNALU(&buf, naluVPS, generateVPS())
 	WriteNALU(&buf, naluSPS, generateSPS(p.Width, p.Height, p.ColorSpace, p.Range, p.Use8x8CU))
-	WriteNALU(&buf, naluPPS, generatePPS(p.qp(), p.tileCols(), p.tileRows(), p.WPP))
+	WriteNALU(&buf, naluPPS, generatePPS(p.qp(), p.tileCols(), p.tileRows(), p.WPP, -1))
 	return buf.Bytes(), nil
 }
 
@@ -316,7 +316,7 @@ func (e *FrameEncoder) EncodeVPSSPSPPS(buf *bytes.Buffer) {
 	WriteNALU(buf, naluVPS, generateVPS())
 	WriteNALU(buf, naluSPS, generateSPS(e.frameWidth(), e.frameHeight(), e.ColorSpace, e.Range, e.Use8x8CU))
 	p := e.encodeParams()
-	WriteNALU(buf, naluPPS, generatePPS(e.qp(), p.tileCols(), p.tileRows(), p.WPP))
+	WriteNALU(buf, naluPPS, generatePPS(e.qp(), p.tileCols(), p.tileRows(), p.WPP, -1))
 }
 
 // EncodeIDRSlice produces an Annex-B IDR slice (no VPS/SPS/PPS).
@@ -359,7 +359,7 @@ func (e *FrameEncoder) SPSNALUs() [][]byte {
 // PPSNALUs returns the raw PPS NALU (with 2-byte header, no start code) for MP4.
 func (e *FrameEncoder) PPSNALUs() [][]byte {
 	p := e.encodeParams()
-	return [][]byte{buildNALU(naluPPS, generatePPS(e.qp(), p.tileCols(), p.tileRows(), p.WPP))}
+	return [][]byte{buildNALU(naluPPS, generatePPS(e.qp(), p.tileCols(), p.tileRows(), p.WPP, -1))}
 }
 
 func (e *FrameEncoder) encodeParams() EncodeParams {

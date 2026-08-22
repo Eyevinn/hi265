@@ -16,7 +16,7 @@ Phases are ordered by dependency. Sizes are rough: **S** ≈ half a day,
 Nothing else was worth building until generated bitstreams decoded identically in
 a conforming decoder, and until real streams decoded at all.
 
-All seventeen items are closed. The phase started with two known defects and
+All eighteen items are closed. The phase started with two known defects and
 grew: each fix made the next one visible, and the conformance harness (0.2) is
 what turned "FFmpeg disagrees" into a specific spec clause every time. Generated
 content, real x265 output and tiled streams are all bit-exact against FFmpeg now.
@@ -29,7 +29,7 @@ One thing remains, narrowed to something specific rather than left vague:
 
 Ordered by dependency, the fixes were: 0.1 → 0.5 → 0.2 (the harness) → 0.6, 0.7
 (which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11 → 0.13 → 0.14 →
-0.15 → 0.16 → 0.17. The three
+0.15 → 0.16 → 0.17 → 0.18. The three
 small items 0.3, 0.4 and 0.11 were housekeeping alongside.
 
 ### 0.1 MPM candidate-B CTB boundary rule (S) — **fixed**
@@ -567,6 +567,75 @@ included — and `AppendEmptyFrames` now freezes a wavefront stream instead of
 refusing it. The gray length goldens for the eight WPP resolutions were rerecorded;
 they had been lengths of streams that did not decode.
 
+### 0.18 Encoder-side cu_qp_delta (S) — **fixed**
+
+`pkg/encode` wrote no `cu_qp_delta_abs` at all. A PPS with
+`cu_qp_delta_enabled_flag` set — which is what x265 writes whenever rate control
+may vary the QP, so every CRF or bitrate-targeted encode — was accepted anyway
+and the grid IDR/CRA writer produced a stream missing the element spec 7.3.8.10
+codes at the first transform unit of every quantization group that carries a
+coefficient. CABAC desynchronises from that point on. Nothing caught it because
+the generated parameter sets leave the flag clear and no fixture had it set.
+
+Measured before the fix, on streams the encoder happily produced: a 120x72 case
+missed 1514 samples, an 8x8-quantization-group case 24431 of 24576, and one
+128x128 case failed outright in `pkg/decoder` rather than merely decoding wrong.
+
+`quantGroups` now tracks the group: `startGroup` clears `IsCuQpDeltaCoded` at
+every coding quadtree node at least `Log2MinCuQpDeltaSize` across (spec 7.3.8.4),
+after the picture-bounds check because 7.3.8.4 does not recurse into a node
+starting outside the picture, and `writeDelta` writes the element between
+`cbf_luma` and the residual for the first unit in the group that codes anything.
+A nil `*quantGroups` is a PPS with the flag clear, and both methods take a nil
+receiver so the call sites stay clean.
+
+**The value written is always zero, and that is not a shortcut.** Every CU this
+encoder writes is quantized at `SliceQpY`, so `qPY_PRED` — the average of the QPs
+left of and above the group origin, each falling back to the previous group's
+(spec 8.6.1) — is `SliceQpY` too, and `QpY = qPY_PRED + 0` is exactly the QP the
+residual was quantized with. Spec 9.3.3.10 binarises `cu_qp_delta_abs` as a
+truncated Rice prefix, so zero is one context-coded bin and no sign flag. A
+non-zero delta would mean choosing a QP per group, which is a rate control
+decision this generator does not make; the binarisation for larger magnitudes is
+deliberately not written rather than written untested.
+
+Nothing is needed for tiles or wavefront rows, where spec 8.6.1 restarts QP
+prediction: `diff_cu_qp_delta_depth` cannot exceed
+`log2_diff_max_min_luma_coding_block_size`, so a group is never larger than a CTB
+and every CTB begins one anyway. The gray and P-skip writers need nothing either,
+and now say why: a gray picture has every `cbf` clear and a skipped CU has no
+transform tree, so neither ever reaches a transform unit that codes the element.
+`testdata/slices_wpp_2slices_256x128.265` has the flag set, so the gray and
+P-skip tests were already covering that incidentally; `TestGrayAndPSkipNeedNoCuQpDelta`
+now states it.
+
+Measured after: quantization groups of 16x16 and of 8x8, at minimum CB sizes 8
+and 16, with a short bottom CTB row and a narrow right CTB column, at QP 10, 26
+and 40 — all bit-exact against FFmpeg — plus `testdata/cuqp_crf32_128x128.265`,
+a real x265 CRF-32 encode at a 16x16 CTU, for parameter sets this repo did not
+write itself. Removing the emission again fails all seven pattern cases, four of
+the eight FFmpeg cases and the real-PPS case.
+
+**What this did not fix, found while testing it.** Two other things an external
+PPS can ask for and this encoder still ignores rather than refuses:
+`sign_data_hiding_enabled_flag`, which x265 sets by default and which changes how
+the last sign of a coefficient group is coded, and `pps_cb_qp_offset` /
+`pps_cr_qp_offset`, which the chroma path never adds to the luma QP. A
+default-settings x265 PPS therefore still cannot drive the grid IDR writer, and
+says so only for `weighted_pred_flag`, which is refused. The fixture above has
+sign hiding switched off for exactly this reason.
+
+And separately, **the grid entry points take a frame with the wrong stride when
+the picture width is not a multiple of 16.** `yuv.BuildFrame` lays a grid out at
+`grid.Width*16` samples per row and `EncodeIDRSliceFromSPSPPS` then resets the
+frame's declared width to the SPS's, after which the encoder walks the source
+planes at the narrower stride. Measured with `hi265gen -smpte` against its own raw
+output: 128x80 and 112x48 match to within ±1, 128x72 (a short bottom CTB row, which
+strides correctly) also ±1, while 120x80 differs on 14050 of 14400 samples at max
+delta 177 and 120x72 on 12602 of 12960. Only the width matters. This is why the
+narrow-right-column case above is checked against FFmpeg but not against the
+pattern it was built from.
+
 ### 0.10 Real-world content decoding (L) — **fixed**
 
 x265 output was not bit-exact, and got worse with detail and scale: a 720p
@@ -922,6 +991,14 @@ Everything through Phase 3 is done, plus 4.1 and 4.3. Remaining, smallest first:
   an intra-plus-freeze one.
 - **Encoder-side conformance window** (in 0.8) — the decoder applies one; the
   generator still rejects dimensions finer than a multiple of 8.
+- **A picture width that is not a multiple of 16** (found in 0.18) — the grid
+  entry points hand the encoder a frame strided at `grid.Width*16` while it walks
+  the planes at the SPS width, so `hi265gen -w 120` codes the wrong samples.
+  Widths that are multiples of 16 are unaffected, and so is a short bottom CTB
+  row. Measured numbers are in 0.18.
+- **`sign_data_hiding_enabled_flag` and the PPS chroma QP offsets from an
+  external PPS** (found in 0.18) — ignored rather than refused by the grid IDR
+  writer, which is what still stands between it and a default-settings x265 PPS.
 - **5.1 high bit depth decoding** (L) — the real differentiator, and the one item
   that makes hi265 clearly ahead of hi264 rather than level with it. `hi265gray`
   already generates 4:2:0/4:2:2/4:4:4 at 8/10/12-bit, but the decoder is 8-bit
