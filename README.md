@@ -30,11 +30,14 @@ verified across 48 x265 configurations. Everything the generator produces
 decodes identically in FFmpeg and in this decoder, which is checked on every
 `go test` run. See [Build & Test](#build--test).
 
-Tiles decode bit-exactly too, with one slice segment per tile — the shape a
-tile-stitching tool emits — loop filters included: neither deblocking nor SAO
-reaches across a tile boundary when the PPS forbids it, and the per-slice
-deblocking parameters are honoured. Several tiles in one slice segment and
-dependent slice segments are refused with a clear error rather than mis-decoded.
+Tiles decode bit-exactly too, in both shapes a real encoder emits: one slice
+segment per tile, which is what a tile-stitching tool produces, and every tile in
+a single segment reached through entry point offsets, which is what
+`kvazaar --tiles` does by default. Loop filters are included — neither
+deblocking nor SAO reaches across a tile boundary when the PPS forbids it, and
+the per-slice deblocking parameters are honoured. Dependent slice segments, and
+tiles combined with wavefront parallel processing, are refused with a clear
+error rather than mis-decoded.
 
 Not supported: P/B frames with real motion (only zero-motion skip, so inter
 pictures beyond a freeze are out of scope).
@@ -101,8 +104,8 @@ go run ./cmd/hi265dec -colorspace bt709 input.265 out.png
 > (x265's default), SAO, deblocking, sign data hiding, every intra mode, NxN
 > partitions, transform trees down to 4x4, 32x32 transforms, per-quantization-
 > group QP, and the SPS conformance window. Verified against FFmpeg across 60
-> x265 configurations. Tiles with one slice segment per tile decode exactly as
-> well, loop filters included. Not supported: P/B frames with real
+> x265 configurations. Tiles decode exactly as well, in both slice shapes and
+> with both loop filters. Not supported: P/B frames with real
 > motion — only zero-motion skip is implemented, so inter pictures beyond a
 > freeze are out of scope.
 

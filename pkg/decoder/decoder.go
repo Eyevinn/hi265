@@ -13,6 +13,7 @@ import (
 	"github.com/Eyevinn/hi265/internal/loopfilter"
 	"github.com/Eyevinn/hi265/internal/pred"
 	"github.com/Eyevinn/hi265/internal/slice"
+	"github.com/Eyevinn/hi265/internal/tiles"
 	"github.com/Eyevinn/hi265/internal/transform"
 	"github.com/Eyevinn/hi265/pkg/frame"
 )
@@ -184,7 +185,7 @@ func (d *Decoder) decodeSegment(seg *sliceSegment, frames *[]*frame.Frame) error
 	if !seg.intra {
 		refFrame = d.refFrame
 	}
-	if err := reconstructSegment(pic.f, sd, seg.sps, refFrame); err != nil {
+	if err := reconstructSegment(pic.f, sd, seg.sps, refFrame, pic.grid); err != nil {
 		return err
 	}
 
@@ -678,12 +679,25 @@ func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
 // buffer. The loop filters are not applied here: they belong to the finished
 // picture, which may be made of several segments.
 func reconstructSegment(f *frame.Frame, sd *slice.SliceData, sps *hevc.SPS,
-	refFrame *frame.Frame) error {
+	refFrame *frame.Frame, grid *tiles.Grid) error {
 
 	bitDepth := 8
 	picWidth, picHeight := f.Width, f.Height
 
+	// CUs arrive in decoding order, so a tile boundary shows up as a change of
+	// tile from one CU to the next. Crossing it makes everything decoded so far
+	// unavailable for prediction (spec 6.4.1) — the same rule that applies at a
+	// slice segment boundary, which startSegment handles.
+	log2Ctb := log2CtbSize(sps)
+	ctbOfLuma := func(x, y int) int { return (y>>log2Ctb)*grid.CtbsX + (x >> log2Ctb) }
+	tile := -1
+
 	for _, cu := range sd.CUs {
+		if t := ctbOfLuma(cu.X0, cu.Y0); tile >= 0 && grid.TileIDOfRs(t) != tile {
+			clearAvailability(f)
+		}
+		tile = grid.TileIDOfRs(ctbOfLuma(cu.X0, cu.Y0))
+
 		if cu.SkipFlag {
 			// Skip CU: copy from reference frame (zero motion)
 			if refFrame == nil {

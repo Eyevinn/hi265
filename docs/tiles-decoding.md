@@ -1,8 +1,9 @@
 # Tiles decoding in `pkg/decoder`
 
-**Status:** T1–T5 implemented; T6, T7's remaining fixtures and T8 outstanding.
-Tiled streams now decode bit-exactly, loop filters included. Sizes use the
-roadmap's scale — **S** ≈ half a day, **M** ≈ 1–2 days, **L** ≈ 3+ days.
+**Status:** T1–T6 implemented; T7's remaining fixtures and T8 outstanding.
+Both tiling shapes — one slice segment per tile, and every tile in one segment —
+decode bit-exactly, loop filters included. Sizes use the roadmap's scale —
+**S** ≈ half a day, **M** ≈ 1–2 days, **L** ≈ 3+ days.
 
 This is the tiles half of roadmap 0.9. That entry fixed slice-header *parsing*
 for streams with `tiles_enabled_flag` or `entropy_coding_sync_enabled_flag` set,
@@ -52,7 +53,7 @@ CTBs — so T3 is load-bearing for the first tile too, not just for later ones.
 
 The last row is the reason T8 exists.
 
-## Measured after T1–T5
+## Measured after T1–T6
 
 | stream | result |
 |---|---|
@@ -63,6 +64,11 @@ The last row is the reason T8 exists.
 | retiler `merged` (2x1), `grid` (2x2), `h` (1024x256), `nu` (non-uniform) | **bit-exact**, all 5 frames each (was 2 871 – 14 651) |
 | retiler all-intra inputs; kvazaar non-tiled controls | **bit-exact** — no regression |
 | `pa`, `p0` | unchanged: still no error, still wrong (T8) |
+
+T6 added the other tiling shape, every tile in a single slice segment, and it is
+bit-exact across the same range: filters off, deblocking on, SAO on, both on, a
+non-equal 2x1 split at 320x256, and a delta-QP map that makes `cu_qp_delta`
+live. 22 streams in total decode bit-exactly across both shapes.
 
 And the check the caller actually cares about, computed from hi265 decodes
 alone — no ffmpeg anywhere — over `merged` (two tiles) and `grid` (four):
@@ -78,12 +84,13 @@ Every tile's sub-rectangle of the merged picture equals that input's standalone
 decode, sample for sample. That is `retile -verify`'s entire test, and for
 all-intra content it now runs on a bare Go toolchain.
 
-Three streams outside the supported subset are refused rather than mis-decoded:
+What remains outside the supported set is refused rather than mis-decoded:
 
 ```
 picture covered by 16 CTBs, expected 64: slice segments do not tile the picture
 dependent slice segments are not supported
-slice segment spanning several tiles (3 entry point offsets) is not supported
+tiles combined with wavefront parallel processing is not supported
+wavefront parallel processing in a picture of several slice segments is not supported
 ```
 
 ## The narrow target
@@ -114,12 +121,12 @@ picture edge, which is the whole basis of the stitching being valid.
 |---|---|
 | tile geometry in the PPS | **free.** mp4ff parses the whole tile block — `NumTileColumnsMinus1`, `NumTileRowsMinus1`, `UniformSpacingFlag`, `ColumnWidthMinus1`, `RowHeightMinus1`, `LoopFilterAcrossTilesEnabledFlag`. No upstream work needed. |
 | `num_entry_point_offsets` in the slice header | **done by 0.9** — `finishSliceHeader` gates on `TilesEnabledFlag \|\| EntropyCodingSyncEnabledFlag`. |
-| substream splitting | **done by 0.9** — `splitSubstreams` (`internal/slice/slicedata.go`), WPP-only; a segment spanning tiles is refused. |
+| substream splitting | **done (0.9, generalised by T6)** — `splitSubstreams` splits at the entry point offsets for tiles and for WPP alike; what differs is the reset at each substream's first CTB. |
 | spec 6.5.1 scan tables | **done (T2)** — `internal/tiles`, built from the PPS by `tileGrid` (`pkg/decoder/picture.go`). |
 | a picture from several slice segments | **done (T1)** — `picture` in `pkg/decoder/picture.go`; `first_slice_segment_in_pic_flag` opens one, the next first-flag or the end of the stream closes it. Segments that do not add up to the whole picture are an error. |
 | `dependent_slice_segment_flag`, `slice_segment_address`, `num_extra_slice_header_bits` | **done (T2)** — `parseSegmentAddress`; a dependent segment is refused rather than mis-parsed. |
 | CTB iteration | **done (T3)** — `DecodeSliceData` walks tile scan from `SegmentAddressRS` and stops on `end_of_slice_segment_flag`. |
-| neighbour availability | **done for one tile per segment (T4)** — `buildRefSamples` now asks the reconstruction map, which is cleared per segment. The general predicate is still outstanding; see T4. |
+| neighbour availability | **done (T4, T6)** — `buildRefSamples` asks the reconstruction map, which is cleared at every slice segment *and* every tile boundary; the intra mode and CU depth maps reset with it. |
 | SAO merge flag gating | **done (T4b)** — gated on same segment and same tile. |
 | loop filters | **done (T5)** — `deblock.Apply` and `sao.Apply` run once per picture in `finishPicture` and take an `internal/loopfilter.Boundaries`, which knows each CTB's tile and slice and each slice's filter parameters. |
 | inter CUs beyond zero-motion skip | **silently wrong (T8)** — no error, no motion compensation. |
@@ -306,25 +313,39 @@ pictures 1, 2 and 5 and 0 in pictures 3 and 4 — x265 varies it per frame, and 
 survives the stitch verbatim — so a decoder that assumed the PPS value would be
 using the wrong rule on three fifths of that stream.
 
-### T6 — Several tiles in one slice, via entry points (S) — optional
+### T6 — Several tiles in one slice segment, via entry points (S)
 
-Not needed for retiler, but nearly free once 0.9 landed: `splitSubstreams`
-already turns entry point offsets into substreams. Tiles differ from WPP only in
-*when* contexts reset — unconditionally at each tile's first CTB (spec 9.3.1),
-rather than restored from the row above. Worth doing to claim general tiles
-support; skip it if the goal is only the retiler path.
+Not needed for retiler, but this is the *common* shape everywhere else:
+`kvazaar --tiles WxH` puts every tile in one slice segment by default, and so do
+most encoders. `splitSubstreams` already turned entry point offsets into
+substreams for WPP; tiles differ only in what happens when one begins —
+contexts re-initialise unconditionally at each tile's first CTB (spec 9.3.1)
+rather than being restored from the row above.
 
-Two things ride along with it, both already solved for WPP and both currently
-keyed on the wrong event:
+Three things reset at that boundary, and the description below is what landed:
 
-- **QP prediction reset.** `qPY_PREV` is reset to `SliceQpY` at the first
-  quantization group of a slice, of a tile, and of a CTB row under WPP
-  (spec 8.6.1). `DecodeSliceData` does the WPP one; a segment covering several
-  tiles needs it per tile as well. With one segment per tile the fresh
-  `qpState` per segment covers it, which is why T1–T3 could ignore this.
-- **The general availability predicate** from T4 — with several tiles in one
-  segment, "decoded in this segment" stops meaning "same tile", and the
-  segment-scoped decoded map no longer substitutes for the real rule.
+- **CABAC contexts**, from `InitModels` (spec 9.3.1).
+- **QP prediction.** `qPY_PREV` returns to `SliceQpY` at the first quantization
+  group of a slice, of a tile, and of a CTB row under WPP (spec 8.6.1). The WPP
+  case existed; the tile case is new, and shares one `resetToSliceQP` with it.
+- **Neighbour availability.** Nothing in an earlier tile may be predicted from
+  (spec 6.4.1), so the intra mode map and the CU depth map are cleared, and
+  reconstruction clears the sample availability map when the CU stream crosses
+  into another tile. This is T4's general rule arriving where it is actually
+  needed: with several tiles in one segment, "decoded in this segment" stops
+  meaning "same tile".
+
+**Status: done.** Each of the three is load-bearing, and each is pinned by a
+committed vector — removing the context re-initialisation or the availability
+reset changes `tiles_multi_2x2_128x128`, and removing the QP reset changes
+12 272 samples of `tiles_multi_qp_2x2_128x128`, whose delta-QP map is what makes
+`cu_qp_delta` live in the first place.
+
+What is still refused: **tiles combined with wavefront parallel processing**.
+That would make each CTB row of each tile its own substream, with the snapshot
+coming from the row above *within the same tile*. No HEVC profile allows the
+combination — kvazaar calls it experimental and disables WPP when tiles are
+enabled — so it errors rather than guesses.
 
 ### T7 — Tests (S)
 
@@ -456,15 +477,29 @@ rather than choice: T3's tile tables are exactly what T4b's gating needs, and
 without T4 the other three tiles of a 2x2 picture decode as garbage, so there
 would have been nothing to verify.
 
-T5 followed, and with it every tiled stream to hand decodes bit-exactly.
+T5 followed, and then T6 with T4's general rule folded in — the three per-tile
+resets are unobservable one at a time, so they had to land together.
 
-**T8 next**: it is half a day, independent of everything else, and until it
-exists a hi265-backed verdict on a P/B stream is untrustworthy rather than
-merely incomplete — which matters now that the all-intra half genuinely works
-and someone might reasonably point `retile -verify` at an inter stream. T4's
-general predicate and T6 go together, whenever tiles beyond the retiler shape
-matter. T7's last fixture, a committed `hevc-retiler` output with its inputs,
-is worth having whenever the cross-project check should run in CI.
+What is left, in the order that makes each step verifiable:
+
+1. **Dependent slice segments.** The same segment bookkeeping, and it turns
+   "clear availability per segment" into "per slice", since a dependent segment
+   belongs to its predecessor's slice. It also unlocks the streams x265
+   `--slices N` and kvazaar `--slices wpp` produce, both of which pair dependent
+   segments with WPP.
+2. **T8.** Half a day, independent of everything else, and it is where
+   `cu_skip_flag`'s context finally derives its increments from real availability
+   and the neighbours' skip flags rather than from `x0 > 0` / `y0 > 0` — which is
+   a P-slice change, so it belongs with T8 rather than with the tile work.
+3. **Encoder-side tiles.** `pkg/encode` refuses `TilesEnabledFlag` outright, so
+   there is no gray CRA splice into a tiled stream, no `hi265-mp4-extend` on
+   tiled content, and no in-repo tiled vectors. One slice segment per tile is
+   mostly slice-header plumbing, and the finished decoder verifies it in-process.
+4. **T7's last fixture**, a committed `hevc-retiler` output with its inputs, for
+   the cross-project check in CI.
+
+Tiles combined with WPP is the one decoding shape deliberately left out: no
+profile permits it.
 
 ## A related mp4ff gap, now fixed and released
 
