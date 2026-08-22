@@ -396,7 +396,10 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 		w.WriteBit(1) // slice_loop_filter_across_slices_enabled_flag = PPS default (1)
 	}
 
-	p.seg.writeEntryPointOffsets(w)
+	// The slice data has to exist before the header can describe it: its
+	// substream lengths are the entry point offsets.
+	subs := encodeIDRSliceData(p.seg, p.width, p.height, p.qp, p.use8x8CU, y, cb, cr)
+	p.seg.writeEntryPointOffsets(w, subs)
 
 	// byte_alignment
 	w.WriteBit(1)
@@ -404,15 +407,7 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 		w.WriteBit(0)
 	}
 
-	headerBytes := w.Bytes()
-
-	// === Slice data (CABAC) ===
-	cabacBytes := encodeIDRSliceData(p.seg, p.width, p.height, p.qp, p.use8x8CU, y, cb, cr)
-
-	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
-	result = append(result, headerBytes...)
-	result = append(result, cabacBytes...)
-	return result
+	return appendSubstreams(w.Bytes(), subs)
 }
 
 // encodeIDRSlice generates the IDR slice RBSP (header + CABAC data).
@@ -430,7 +425,8 @@ func encodeIDRSlice(seg segment, width, height, qp int, use8x8CU bool, y, cb, cr
 	w.WriteSE(0) // slice_qp_delta = 0 (PPS init_qp_minus26 = qp-26)
 	// Deblocking disabled in PPS → no deblock syntax
 	// loop_filter_across_slices_enabled_flag: not present (PPS flag is 0 and deblock is disabled)
-	seg.writeEntryPointOffsets(w)
+	subs := encodeIDRSliceData(seg, width, height, qp, use8x8CU, y, cb, cr)
+	seg.writeEntryPointOffsets(w, subs)
 
 	// byte_alignment
 	w.WriteBit(1)
@@ -438,25 +434,15 @@ func encodeIDRSlice(seg segment, width, height, qp int, use8x8CU bool, y, cb, cr
 		w.WriteBit(0)
 	}
 
-	headerBytes := w.Bytes()
-
-	// === Slice data (CABAC) ===
-	cabacBytes := encodeIDRSliceData(seg, width, height, qp, use8x8CU, y, cb, cr)
-
-	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
-	result = append(result, headerBytes...)
-	result = append(result, cabacBytes...)
-	return result
+	return appendSubstreams(w.Bytes(), subs)
 }
 
-// encodeIDRSliceData encodes the CABAC slice data for an IDR I-slice.
+// encodeIDRSliceData encodes the CABAC slice data for an IDR I-slice, as the
+// list of substreams it is made of.
 // The CTU size is always 16. With use8x8CU each CTU is split by the coding
 // quadtree into four independently predicted 8x8 CUs (SPS minCbSize = 8),
 // otherwise the CTU is one 16x16 CU (SPS minCbSize = 16).
-func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool, y, cb, cr []uint8) []byte {
-	enc := cabac.NewEncoder()
-	models := context.InitModels(context.SliceTypeI, qp)
-
+func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool, y, cb, cr []uint8) [][]byte {
 	lay := chooseCodingLayout(width, height, use8x8CU)
 	ctuSize := lay.ctuSize
 
@@ -469,23 +455,15 @@ func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool, y, cb
 	modes := newIntraModes()
 	depths := newCuDepths(width, height, lay.minCbSize)
 
-	seg.forEachCtb(ctuSize, func(ctuX, ctuY int, last bool) {
-		encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
-			width, height, depths,
-			func(x0, y0, cuSize int) {
-				encodeIDRCU(enc, models, x0, y0, cuSize, ctuSize, lay.minCbSize,
-					width, height, qp, y, cb, cr, reconFrame, modes)
-			})
-
-		// end_of_slice_segment_flag
-		if last {
-			enc.EncodeTerminate(1)
-		} else {
-			enc.EncodeTerminate(0)
-		}
-	})
-
-	return enc.Flush()
+	return seg.encodeCtbs(ctuSize, context.SliceTypeI, qp,
+		func(enc *cabac.Encoder, models []cabac.CtxState, ctuX, ctuY int) {
+			encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
+				width, height, depths,
+				func(x0, y0, cuSize int) {
+					encodeIDRCU(enc, models, x0, y0, cuSize, ctuSize, lay.minCbSize,
+						width, height, qp, y, cb, cr, reconFrame, modes)
+				})
+		})
 }
 
 // encodeIDRCU encodes a single intra CU of size cuSize (8 or 16) at (cuX, cuY),
@@ -1025,7 +1003,14 @@ func encodePSkipSliceWithParams(p pSkipSliceParams) []byte {
 		w.WriteBit(1) // slice_loop_filter_across_slices_enabled_flag = PPS default (1)
 	}
 
-	p.seg.writeEntryPointOffsets(w)
+	// === Slice data (CABAC) ===
+	// Derive CTU and min CB sizes from SPS parameters. The data comes first
+	// because the header's entry point offsets are its substream lengths.
+	log2MinCbSize := p.log2MinCodingBlockSizeMinus3 + 3
+	ctuLog2 := log2MinCbSize + p.log2DiffMaxMinLumaCodingBlockSize
+	ctuSize := 1 << ctuLog2
+	subs := encodePSkipSliceData(p.seg, p.width, p.height, p.qp, ctuSize, log2MinCbSize)
+	p.seg.writeEntryPointOffsets(w, subs)
 
 	// byte_alignment
 	w.WriteBit(1)
@@ -1033,27 +1018,14 @@ func encodePSkipSliceWithParams(p pSkipSliceParams) []byte {
 		w.WriteBit(0)
 	}
 
-	headerBytes := w.Bytes()
-
-	// === Slice data (CABAC) ===
-	// Derive CTU and min CB sizes from SPS parameters
-	log2MinCbSize := p.log2MinCodingBlockSizeMinus3 + 3
-	ctuLog2 := log2MinCbSize + p.log2DiffMaxMinLumaCodingBlockSize
-	ctuSize := 1 << ctuLog2
-	cabacBytes := encodePSkipSliceData(p.seg, p.width, p.height, p.qp, ctuSize, log2MinCbSize)
-
-	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
-	result = append(result, headerBytes...)
-	result = append(result, cabacBytes...)
-	return result
+	return appendSubstreams(w.Bytes(), subs)
 }
 
-// encodePSkipSliceData encodes the CABAC slice data for a P-skip slice.
+// encodePSkipSliceData encodes the CABAC slice data for a P-skip slice, as the
+// list of substreams it is made of.
 // log2MinCbSize is the minimum coding block size (log2). When ctuSize > minCbSize,
 // split_cu_flag=0 must be written at each quadtree level before cu_skip_flag.
-func encodePSkipSliceData(seg segment, width, height, qp, ctuSize, log2MinCbSize int) []byte {
-	enc := cabac.NewEncoder()
-	models := context.InitModels(context.SliceTypeP, qp)
+func encodePSkipSliceData(seg segment, width, height, qp, ctuSize, log2MinCbSize int) [][]byte {
 	// The segment's own left and top edges in luma samples: a neighbour beyond
 	// them is in another tile, which spec 6.4.1 makes unavailable.
 	segLeft := seg.region.ColStart * ctuSize
@@ -1069,34 +1041,26 @@ func encodePSkipSliceData(seg segment, width, height, qp, ctuSize, log2MinCbSize
 	}
 	depths := newCuDepths(width, height, lay.minCbSize)
 
-	seg.forEachCtb(ctuSize, func(ctuX, ctuY int, last bool) {
-		encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
-			width, height, depths,
-			func(x0, y0, _ int) {
-				// cu_skip_flag = 1. ctxInc counts the left and above neighbours
-				// that are skipped; every coded CU here is, so availability alone
-				// decides it — and a neighbour outside this tile is unavailable,
-				// which is what the decoder's per-tile reset amounts to.
-				ctxInc := 0
-				if x0 > segLeft {
-					ctxInc++
-				}
-				if y0 > segTop {
-					ctxInc++
-				}
-				enc.EncodeDecision(1, &models[context.CtxCuSkipFlag+ctxInc])
-				// merge_idx = 0: when maxMergeCand=1, no bins coded
-			})
-
-		// end_of_slice_segment_flag
-		if last {
-			enc.EncodeTerminate(1)
-		} else {
-			enc.EncodeTerminate(0)
-		}
-	})
-
-	return enc.Flush()
+	return seg.encodeCtbs(ctuSize, context.SliceTypeP, qp,
+		func(enc *cabac.Encoder, models []cabac.CtxState, ctuX, ctuY int) {
+			encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
+				width, height, depths,
+				func(x0, y0, _ int) {
+					// cu_skip_flag = 1. ctxInc counts the left and above neighbours
+					// that are skipped; every coded CU here is, so availability alone
+					// decides it — and a neighbour outside this tile is unavailable,
+					// which is what the decoder's per-tile reset amounts to.
+					ctxInc := 0
+					if x0 > segLeft {
+						ctxInc++
+					}
+					if y0 > segTop {
+						ctxInc++
+					}
+					enc.EncodeDecision(1, &models[context.CtxCuSkipFlag+ctxInc])
+					// merge_idx = 0: when maxMergeCand=1, no bins coded
+				})
+		})
 }
 
 // ceilLog2 returns ceil(log2(n)) for n >= 1.

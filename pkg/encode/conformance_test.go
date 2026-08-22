@@ -84,6 +84,39 @@ func decodeWithFFmpeg(t *testing.T, ffmpeg string, annexB []byte) []byte {
 	return data
 }
 
+// decodeWithFFmpegSequential decodes with FFmpeg's single-threaded HEVC path and
+// returns the raw yuv420p bytes.
+//
+// It matters which path runs for a wavefront stream. Given slice threading and
+// entry point offsets, FFmpeg decodes the CTB rows in parallel, seeking to each
+// substream by its offset — the same way pkg/decoder does, and so blind to
+// anything about a substream except where the header says it starts. Forcing
+// frame threading instead makes FFmpeg read the slice data straight through:
+// take the end_of_subset_one_bit, realign, carry on into the next substream. That
+// path accepts only what is byte-exactly right, which makes it the one reference
+// that can judge our byte alignment. FFmpeg picks between them by picture size
+// and thread count, so the choice is spelled out rather than left to it.
+func decodeWithFFmpegSequential(t *testing.T, ffmpeg string, annexB []byte) []byte {
+	t.Helper()
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.265")
+	out := filepath.Join(dir, "out.yuv")
+	if err := os.WriteFile(in, annexB, 0o600); err != nil {
+		t.Fatalf("write bitstream: %v", err)
+	}
+	cmd := exec.Command(ffmpeg, "-y", "-loglevel", "error",
+		"-threads", "1", "-thread_type", "frame",
+		"-i", in, "-f", "rawvideo", "-pix_fmt", "yuv420p", out)
+	if msg, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ffmpeg decode failed: %v\n%s", err, msg)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read ffmpeg output: %v", err)
+	}
+	return data
+}
+
 // decodeWithHi265 decodes an Annex-B stream with pkg/decoder and returns the
 // raw yuv420p bytes of all frames concatenated.
 func decodeWithHi265(t *testing.T, annexB []byte, width, height, frames int) []byte {

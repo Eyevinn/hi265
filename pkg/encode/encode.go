@@ -17,8 +17,13 @@ type EncodeParams struct {
 	// TileCols and TileRows cut the picture into a uniform tile grid, each tile
 	// coded as its own independent slice segment with no filtering across the
 	// boundaries. Zero or one of each means no tiles.
-	TileCols   int
-	TileRows   int
+	TileCols int
+	TileRows int
+	// WPP sets entropy_coding_sync_enabled_flag: the picture stays one slice
+	// segment, but every CTB row becomes its own CABAC substream, reached through
+	// an entry point offset, so a decoder can run the rows as a wavefront. It
+	// cannot be combined with tiles — no HEVC profile permits that.
+	WPP        bool
 	ColorSpace yuv.ColorSpace // default BT601
 	Range      yuv.Range      // default LimitedRange
 }
@@ -38,10 +43,22 @@ func (p EncodeParams) tileRows() int {
 	return p.TileRows
 }
 
-// segments returns the slice segments this picture is emitted as: one per tile.
+// segments returns the slice segments this picture is emitted as: one per tile,
+// or a single one cut into a substream per CTB row when WPP is set.
 func (p EncodeParams) segments() ([]segment, error) {
 	lay := chooseCodingLayout(p.Width, p.Height, p.Use8x8CU)
-	return segmentsForGrid(p.Width, p.Height, lay.ctuSize, p.tileCols(), p.tileRows())
+	return segmentsForGrid(p.Width, p.Height, lay.ctuSize, p.tileCols(), p.tileRows(), p.WPP)
+}
+
+// validateParallelism rejects the one combination of the two parallelism tools
+// that no HEVC profile permits. It is checked where the parameter sets are
+// written as well as where the slice data is, so a PPS can never end up
+// announcing something the slices do not carry.
+func (p EncodeParams) validateParallelism() error {
+	if p.WPP && (p.tileCols() > 1 || p.tileRows() > 1) {
+		return fmt.Errorf("tiles combined with wavefront parallel processing is not supported")
+	}
+	return nil
 }
 
 func (p EncodeParams) qp() int {
@@ -56,10 +73,13 @@ func GenerateVPSSPSPPS(p EncodeParams) ([]byte, error) {
 	if err := validateFrameDimensions(p.Width, p.Height); err != nil {
 		return nil, err
 	}
+	if err := p.validateParallelism(); err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
 	WriteNALU(&buf, naluVPS, generateVPS())
 	WriteNALU(&buf, naluSPS, generateSPS(p.Width, p.Height, p.ColorSpace, p.Range, p.Use8x8CU))
-	WriteNALU(&buf, naluPPS, generatePPS(p.qp(), p.tileCols(), p.tileRows()))
+	WriteNALU(&buf, naluPPS, generatePPS(p.qp(), p.tileCols(), p.tileRows(), p.WPP))
 	return buf.Bytes(), nil
 }
 
@@ -203,11 +223,12 @@ func EncodePSkipSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) ([]byte, 
 }
 
 func validateSPSPPS(_ *hevc.SPS, pps *hevc.PPS) error {
-	// Tiles are supported, emitted as one independent slice segment per tile.
-	// Wavefront parallel processing is not: it needs one substream per CTB row
-	// with entry point offsets to match, and nothing here writes those.
-	if pps.EntropyCodingSyncEnabledFlag {
-		return fmt.Errorf("wavefront parallel processing not supported")
+	// Tiles are supported, emitted as one independent slice segment per tile, and
+	// so is wavefront parallel processing, as one substream per CTB row of a
+	// single segment. The two together are not: no HEVC profile permits the
+	// combination, and the decoder refuses it as well.
+	if pps.EntropyCodingSyncEnabledFlag && pps.TilesEnabledFlag {
+		return fmt.Errorf("tiles combined with wavefront parallel processing is not supported")
 	}
 	if pps.WeightedPredFlag {
 		return fmt.Errorf("weighted prediction not supported")
@@ -269,6 +290,7 @@ type FrameEncoder struct {
 	Use8x8CU   bool           // code each 16x16 CTU as four 8x8 CUs
 	TileCols   int            // uniform tile columns (0 or 1 = no tiles)
 	TileRows   int            // uniform tile rows (0 or 1 = no tiles)
+	WPP        bool           // one CABAC substream per CTB row (excludes tiles)
 	Width      int            // pixel width (0 = Grid.Width*16)
 	Height     int            // pixel height (0 = Grid.Height*16)
 	ColorSpace yuv.ColorSpace // default BT601
@@ -294,7 +316,7 @@ func (e *FrameEncoder) EncodeVPSSPSPPS(buf *bytes.Buffer) {
 	WriteNALU(buf, naluVPS, generateVPS())
 	WriteNALU(buf, naluSPS, generateSPS(e.frameWidth(), e.frameHeight(), e.ColorSpace, e.Range, e.Use8x8CU))
 	p := e.encodeParams()
-	WriteNALU(buf, naluPPS, generatePPS(e.qp(), p.tileCols(), p.tileRows()))
+	WriteNALU(buf, naluPPS, generatePPS(e.qp(), p.tileCols(), p.tileRows(), p.WPP))
 }
 
 // EncodeIDRSlice produces an Annex-B IDR slice (no VPS/SPS/PPS).
@@ -337,7 +359,7 @@ func (e *FrameEncoder) SPSNALUs() [][]byte {
 // PPSNALUs returns the raw PPS NALU (with 2-byte header, no start code) for MP4.
 func (e *FrameEncoder) PPSNALUs() [][]byte {
 	p := e.encodeParams()
-	return [][]byte{buildNALU(naluPPS, generatePPS(e.qp(), p.tileCols(), p.tileRows()))}
+	return [][]byte{buildNALU(naluPPS, generatePPS(e.qp(), p.tileCols(), p.tileRows(), p.WPP))}
 }
 
 func (e *FrameEncoder) encodeParams() EncodeParams {
@@ -348,6 +370,7 @@ func (e *FrameEncoder) encodeParams() EncodeParams {
 		Use8x8CU:   e.Use8x8CU,
 		TileCols:   e.TileCols,
 		TileRows:   e.TileRows,
+		WPP:        e.WPP,
 		ColorSpace: e.ColorSpace,
 		Range:      e.Range,
 	}

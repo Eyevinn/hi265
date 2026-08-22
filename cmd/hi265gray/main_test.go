@@ -17,6 +17,11 @@ var paramFiles = []string{
 	"testdata/vps_sps_pps_422_10bit.json",
 	"testdata/vps_sps_pps_420_10bit.json",
 	"testdata/vps_sps_pps_420_8bit.json",
+	// x265 at its defaults, which means entropy_coding_sync_enabled_flag is set.
+	// This is the shape a GDR refresh actually has to be spliced into, and the
+	// one the gray encoder used to refuse: the slice data needs one CABAC
+	// substream per CTB row with entry point offsets to match.
+	"testdata/vps_sps_pps_420_8bit_wpp.json",
 }
 
 func TestGrayIDR422_10bit(t *testing.T) {
@@ -25,6 +30,10 @@ func TestGrayIDR422_10bit(t *testing.T) {
 
 func TestGrayIDR420_10bit(t *testing.T) {
 	testGrayIDR(t, "testdata/vps_sps_pps_420_10bit.json")
+}
+
+func TestGrayIDR420_8bitWpp(t *testing.T) {
+	testGrayIDR(t, "testdata/vps_sps_pps_420_8bit_wpp.json")
 }
 
 func TestGrayIDR420_8bit(t *testing.T) {

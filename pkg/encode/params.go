@@ -155,9 +155,11 @@ func b2u(v bool) uint8 {
 	return 0
 }
 
-// generatePPS returns the PPS RBSP bytes for the given QP and tile grid. A grid
-// of one column and one row means no tiles, and the tile syntax is left out.
-func generatePPS(qp, tileCols, tileRows int) []byte {
+// generatePPS returns the PPS RBSP bytes for the given QP, tile grid and
+// wavefront setting. A grid of one column and one row means no tiles, and the
+// tile syntax is left out. With wpp the slice data carries one CABAC substream
+// per CTB row; the two are mutually exclusive, which the callers enforce.
+func generatePPS(qp, tileCols, tileRows int, wpp bool) []byte {
 	w := NewBitWriter()
 
 	w.WriteUE(0)              // pps_pic_parameter_set_id = 0
@@ -182,7 +184,7 @@ func generatePPS(qp, tileCols, tileRows int) []byte {
 	w.WriteBit(0) // transquant_bypass_enabled_flag = 0
 	tiled := tileCols > 1 || tileRows > 1
 	w.WriteBit(b2u(tiled)) // tiles_enabled_flag
-	w.WriteBit(0)          // entropy_coding_sync_enabled_flag = 0
+	w.WriteBit(b2u(wpp))   // entropy_coding_sync_enabled_flag
 	if tiled {
 		w.WriteUE(uint32(tileCols - 1)) // num_tile_columns_minus1
 		w.WriteUE(uint32(tileRows - 1)) // num_tile_rows_minus1

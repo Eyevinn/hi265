@@ -16,7 +16,7 @@ Phases are ordered by dependency. Sizes are rough: **S** ≈ half a day,
 Nothing else was worth building until generated bitstreams decoded identically in
 a conforming decoder, and until real streams decoded at all.
 
-All sixteen items are closed. The phase started with two known defects and
+All seventeen items are closed. The phase started with two known defects and
 grew: each fix made the next one visible, and the conformance harness (0.2) is
 what turned "FFmpeg disagrees" into a specific spec clause every time. Generated
 content, real x265 output and tiled streams are all bit-exact against FFmpeg now.
@@ -29,7 +29,7 @@ One thing remains, narrowed to something specific rather than left vague:
 
 Ordered by dependency, the fixes were: 0.1 → 0.5 → 0.2 (the harness) → 0.6, 0.7
 (which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11 → 0.13 → 0.14 →
-0.15 → 0.16. The three
+0.15 → 0.16 → 0.17. The three
 small items 0.3, 0.4 and 0.11 were housekeeping alongside.
 
 ### 0.1 MPM candidate-B CTB boundary rule (S) — **fixed**
@@ -508,16 +508,64 @@ FFmpeg and in `pkg/decoder`, and match their source pattern to within the same
 PPS decode to uniform mid-grey, with the P-skip picture identical to the IDR
 before it.
 
-**What this surfaced, and did not fix: WPP emission.** A PPS with
+**What this surfaced: WPP emission.** A PPS with
 `entropy_coding_sync_enabled_flag` set — x265's default — needs one substream per
 CTB row with entry point offsets to match. The gray encoder ignored the flag and
 emitted a single continuous substream. FFmpeg accepted such a stream without a
 word and decoded it to garbage: 73 % of a 1280x720 case came out zeros instead of
 mid-grey. Only byte lengths were ever asserted, in tests whose comment claimed
-they had been verified pixel-perfect. Those parameter sets are now refused, and
-the affected tests assert the refusal. This is the next encoder item, and until
-it lands `hi265gray` and `hi265-mp4-extend` cannot serve a default-settings x265
-stream.
+they had been verified pixel-perfect. Those parameter sets were refused here, and
+the affected tests changed to assert the refusal; 0.17 implements the emission
+and turns them back into content checks.
+
+### 0.17 Encoder-side WPP (M) — **fixed**
+
+`pkg/encode` refused `entropy_coding_sync_enabled_flag`, which is x265's
+default. So the two things the tools exist for could not be done to a
+default-settings encode: no gray CRA splice for GDR, no `hi265-mp4-extend`
+freeze. 0.16 left this as the biggest gap in the encoder, and it was.
+
+The slice data is now emitted as one CABAC substream per CTB row, with the
+entry point offsets to reach them. `segment.encodeCtbs` owns the whole CTB loop
+for all three writers — gray, grid IDR/CRA and P-skip — so the substream
+splitting and the context synchronisation live in one place instead of three:
+at the end of a row it writes `end_of_subset_one_bit`, closes the substream on a
+byte boundary and starts a fresh arithmetic coder seeded from the snapshot taken
+after the second CTB of the row above (spec 9.3.1), falling back to initial
+values where there is no second CTB to snapshot. `writeEntryPointOffsets` writes
+their lengths, which forced the header to be written *after* the data it
+describes. `EncodeParams` gained `WPP`, the PPS writer emits the flag, and
+`hi265gen -wpp` exposes it. Tiles with WPP is refused on both sides now — no
+HEVC profile permits it.
+
+**One defect, and it took FFmpeg to see it.** The terminating bin's flush
+already ends in a forced one bit; spec 9.3.4.3.5's note says that bit is the
+`rbsp_stop_one_bit` when it ends a slice segment, and it is equally the
+`alignment_bit_equal_to_one` of the `byte_alignment()` that follows
+`end_of_subset_one_bit`. Writing a second one bit — the obvious reading of
+7.3.2.10 on its own — pushed every substream after the first whose flush landed
+on a byte boundary one byte along.
+
+What makes it worth recording is that **no round trip through `pkg/decoder`
+could have caught it**: the decoder navigates the slice data by the entry point
+offsets alone, so it lands on the right byte whatever the substream ends with.
+Encoder and decoder agreed, bit-exactly, on a stream FFmpeg decoded to garbage
+from CTB row 4 down. FFmpeg reads a single-slice WPP picture sequentially — take
+the terminating bin, realign, carry on — so it only accepts what is byte-exactly
+right. Its *threaded* path, which does use the offsets, agreed with us
+throughout; the disagreement was visible only with `-threads 1`. That is now
+`TestGeneratedWppAgainstFFmpeg`, and reintroducing the extra bit fails six of its
+nine cases while every internal round trip still passes.
+
+Measured, all against FFmpeg and bit-exact: generated WPP pictures at 128x128,
+16x256 (one CTB column, so every row re-initialises), 32x128, 256x16 (one row,
+no substream boundary at all), the ragged 120x72, 8x8 CUs, QP 10 and QP 40, and
+an IDR followed by two P-skips. Gray IDR, gray CRA and P-skip against real x265
+default-settings parameter sets decode to uniform mid-grey at 256x192, 640x352,
+1280x720 and 1920x1080 — the 1280x720 case that used to come out 73 % zeros
+included — and `AppendEmptyFrames` now freezes a wavefront stream instead of
+refusing it. The gray length goldens for the eight WPP resolutions were rerecorded;
+they had been lengths of streams that did not decode.
 
 ### 0.10 Real-world content decoding (L) — **fixed**
 
