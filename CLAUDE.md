@@ -72,10 +72,12 @@ pkg/timecode/      — Public: SMPTE timecode arithmetic and text formatting
 internal/cabac/    — Internal: CABAC arithmetic decoder and encoder engines
 internal/context/  — Internal: Context model initialization (170 contexts)
 internal/slice/    — Internal: Slice data parsing, CTU/CU/TU quadtree
+internal/tiles/    — Internal: Tile geometry and tile scan tables (spec 6.5.1)
 internal/transform/— Internal: Inverse quantization and transform (4x4, 8x8, 16x16)
 internal/pred/     — Internal: Intra prediction modes (planar, DC, angular)
 internal/deblock/  — Internal: Deblocking filter
 internal/sao/      — Internal: Sample Adaptive Offset
+internal/loopfilter/ — Internal: Tile/slice boundaries the loop filters stop at
 cmd/hi265dec/      — CLI: decode HEVC from Annex-B or MP4 to YUV/Y4M/PNG/JPEG
 cmd/hi265gen/      — CLI: generate HEVC bitstreams or raw images from grid patterns
 cmd/hi265gray/     — CLI: generate gray IDR/CRA frames from external VPS/SPS/PPS

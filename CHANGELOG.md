@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Tiles
+- Tiled pictures with one slice segment per tile, the shape `hevc-retiler` emits
+  and kvazaar's `--tiles WxH --slices tiles` produces: the spec 6.5.1 tile scan
+  tables (`internal/tiles`), `slice_segment_address` and
+  `dependent_slice_segment_flag` parsing, CTB iteration in tile scan bounded by
+  the slice segment, and the SAO merge flags gated on the neighbour being in the
+  same tile and segment. Several tiles in one slice segment, dependent
+  slice segments and WPP across several segments are refused with a clear error.
+- Loop filters that stop at tile and slice boundaries: with
+  `loop_filter_across_tiles_enabled_flag` equal to 0 neither deblocking nor SAO
+  reaches across a tile edge, and the same holds at a slice edge whose
+  `slice_loop_filter_across_slices_enabled_flag` is 0 — a flag that was read and
+  discarded before, and whose presence was keyed on the SPS SAO flag instead of
+  the two slice SAO flags. Deblocking also takes its beta and tC offsets and its
+  disabled flag per slice rather than from the picture's first slice. Tiled
+  streams, loop filters included, now decode bit-exactly against FFmpeg.
+- A picture is now assembled from all its slice segments and filtered once, as
+  the spec requires. Multi-slice pictures previously decoded as one bogus frame
+  per slice, tiles or not.
+- Neighbour availability follows spec 6.4.1: a sample in another slice segment
+  or another tile is unavailable, replacing a comparison of raster CTB addresses
+  that granted availability across both.
+
 #### Decoding real encoder output
 - Wavefront parallel processing (`entropy_coding_sync_enabled_flag`), which x265
   enables by default: `num_entry_point_offsets` and the substream offsets are
@@ -134,7 +157,20 @@ size, while a real encoder uses everything.
 - Every `hi265gen` example in the README failed as written: the documented `-f`,
   `-grid`, `-c` and `-digits` are `-gi`, `-gp`, `-gc` and `-text`.
 
+And one defect of a different kind, in a dependency rather than in the codec:
+
+- **`hi265-mp4-extend` refused x265 `--no-deblock` streams.** The slice header
+  parser it reads the last picture's state with missed the spec 7.4.7.1 inference
+  that `slice_deblocking_filter_disabled_flag`, when absent, comes from the PPS,
+  went on to read a `slice_loop_filter_across_slices_enabled_flag` bit that was
+  never coded, and failed `byte_alignment()`. It affected this repo's own
+  `testdata/sincos_128x64.265`; nothing caught it because the other tests extend
+  streams from our generator, which does not have that shape. Fixed upstream
+  (Eyevinn/mp4ff#558) and pinned here by requiring mp4ff v0.56.0.
+
 ### Changed
+- mp4ff bumped from v0.52.0 to v0.56.0, which is now the minimum: it carries the
+  spec 7.4.7.1 slice header inferences that `hi265-mp4-extend` depends on.
 - Generated bitstreams differ from v0.1.0 for non-flat content, deliberately: the
   intra boundary filter and the MPM CTB rule both change what a conforming decoder
   reads. Flat-colour output at multiple-of-16 dimensions is unchanged byte for

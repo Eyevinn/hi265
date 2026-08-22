@@ -2,6 +2,7 @@
 package deblock
 
 import (
+	"github.com/Eyevinn/hi265/internal/loopfilter"
 	"github.com/Eyevinn/hi265/internal/slice"
 	"github.com/Eyevinn/hi265/internal/transform"
 	"github.com/Eyevinn/hi265/pkg/frame"
@@ -35,7 +36,11 @@ func clip3(lo, hi, val int) int {
 
 // Apply applies the HEVC deblocking filter to the reconstructed frame.
 // For I-slices, Bs = 2 at all TU/CU boundary edges.
-func Apply(f *frame.Frame, cus []slice.CodingUnit, sliceQPY, betaOffset, tcOffset int) {
+//
+// bounds carries the picture's tile and slice structure: which edges may not be
+// filtered at all, which slices have deblocking disabled, and each slice's beta
+// and tC offsets. It must not be nil.
+func Apply(f *frame.Frame, cus []slice.CodingUnit, sliceQPY int, bounds *loopfilter.Boundaries) {
 	picW := f.Width
 	picH := f.Height
 
@@ -54,26 +59,64 @@ func Apply(f *frame.Frame, cus []slice.CodingUnit, sliceQPY, betaOffset, tcOffse
 
 	for _, cu := range cus {
 		cuSize := 1 << cu.Log2CbSize
-		markEdges(edgeFlags, gridW, gridH, cu.X0, cu.Y0, cuSize, cuSize, picW, picH)
 
-		// Fill QP map with per-CU QP
+		// The QP map is filled even for a CU whose slice disables deblocking:
+		// an edge on the boundary with an enabled slice averages the QPs of both
+		// sides, so this block's QP is still needed.
 		for y := cu.Y0 / 4; y < (cu.Y0+cuSize)/4 && y < gridH; y++ {
 			for x := cu.X0 / 4; x < (cu.X0+cuSize)/4 && x < gridW; x++ {
 				qpMap[y*gridW+x] = cu.QpY
 			}
 		}
 
+		// slice_deblocking_filter_disabled_flag is per slice, and a tiled
+		// picture can have it set in some tiles and clear in others.
+		if bounds.SliceAtLuma(cu.X0, cu.Y0).DeblockingDisabled {
+			continue
+		}
+
+		markEdges(edgeFlags, gridW, gridH, cu.X0, cu.Y0, cuSize, cuSize, picW, picH)
 		for _, tu := range cu.TransformUnits {
 			trSize := 1 << tu.Log2TrSize
 			markEdges(edgeFlags, gridW, gridH, tu.X0, tu.Y0, trSize, trSize, picW, picH)
 		}
 	}
 
+	clearBoundaryEdges(edgeFlags, gridW, gridH, bounds)
+
 	// Pass 1: Filter vertical edges (left-to-right, top-to-bottom)
-	filterEdges(f, edgeFlags, gridW, gridH, qpMap, betaOffset, tcOffset, true)
+	filterEdges(f, edgeFlags, gridW, gridH, qpMap, bounds, true)
 
 	// Pass 2: Filter horizontal edges (top-to-bottom, left-to-right)
-	filterEdges(f, edgeFlags, gridW, gridH, qpMap, betaOffset, tcOffset, false)
+	filterEdges(f, edgeFlags, gridW, gridH, qpMap, bounds, false)
+}
+
+// clearBoundaryEdges removes the edges no filter may reach across: spec 8.7.2
+// clears filterEdgeFlag on an edge that is a tile boundary with
+// loop_filter_across_tiles_enabled_flag equal to 0, or a slice boundary with
+// that slice's slice_loop_filter_across_slices_enabled_flag equal to 0.
+//
+// Doing it here rather than inside the filter loops is exact because tiles and
+// slices are made of whole CTBs, so no 4x4 block ever straddles one. Chroma
+// needs no separate pass: a chroma edge at (px/2, py/2) lies between the same
+// two CTBs as the luma edge at (px, py).
+func clearBoundaryEdges(edgeFlags []byte, gridW, gridH int, bounds *loopfilter.Boundaries) {
+	for gy := range gridH {
+		for gx := range gridW {
+			flags := edgeFlags[gy*gridW+gx]
+			if flags == 0 {
+				continue
+			}
+			x, y := gx*4, gy*4
+			if flags&1 != 0 && !bounds.CanFilterLuma(x-1, y, x, y) {
+				flags &^= 1
+			}
+			if flags&2 != 0 && !bounds.CanFilterLuma(x, y-1, x, y) {
+				flags &^= 2
+			}
+			edgeFlags[gy*gridW+gx] = flags
+		}
+	}
 }
 
 // markEdges sets edge flags for a block at (x0,y0) with given width/height.
@@ -95,7 +138,7 @@ func markEdges(edgeFlags []byte, gridW, gridH, x0, y0, w, h, _, _ int) {
 // filterEdges filters all edges in one direction.
 func filterEdges(
 	f *frame.Frame, edgeFlags []byte, gridW, gridH int,
-	qpMap []int, betaOffset, tcOffset int, vertical bool,
+	qpMap []int, bounds *loopfilter.Boundaries, vertical bool,
 ) {
 	picW := f.Width
 	picH := f.Height
@@ -139,8 +182,11 @@ func filterEdges(
 			}
 			qPL := (qpP + qpQ + 1) >> 1
 
-			betaIdx := clip3(0, 51, qPL+betaOffset)
-			tcIdx := clip3(0, 53, qPL+2*(bs-1)+tcOffset)
+			// The offsets come from the slice containing the current block, the
+			// q side of the edge, since the edge is that block's boundary.
+			sp := bounds.SliceAtLuma(px, py)
+			betaIdx := clip3(0, 51, qPL+sp.BetaOffset)
+			tcIdx := clip3(0, 53, qPL+2*(bs-1)+sp.TcOffset)
 			beta := betaTable[betaIdx]
 			tC := tcTable[tcIdx]
 
@@ -190,7 +236,7 @@ func filterEdges(
 			}
 			qPL := (qpP + qpQ + 1) >> 1
 			qPC := chromaQPFromLuma(qPL)
-			tcIdx := clip3(0, 53, qPC+2*(bs-1)+tcOffset)
+			tcIdx := clip3(0, 53, qPC+2*(bs-1)+bounds.SliceAtLuma(px, py).TcOffset)
 			tC := tcTable[tcIdx]
 			if tC == 0 {
 				continue

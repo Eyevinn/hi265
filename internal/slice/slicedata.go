@@ -7,6 +7,7 @@ import (
 
 	"github.com/Eyevinn/hi265/internal/cabac"
 	"github.com/Eyevinn/hi265/internal/context"
+	"github.com/Eyevinn/hi265/internal/tiles"
 )
 
 // CodingUnit holds the decoded data for a single CU.
@@ -53,10 +54,13 @@ type SaoParams struct {
 	EoClass [3]int    // edge offset class (EO mode)
 }
 
-// SliceData holds all decoded CUs for a slice.
+// SliceData holds all decoded CUs for a slice segment.
 type SliceData struct {
 	CUs       []CodingUnit
 	SaoParams []SaoParams // one per CTU, indexed by CTU raster address
+	// CtbsDecoded counts the CTBs this segment covered, so a caller assembling
+	// a picture from several segments can tell whether they add up to one.
+	CtbsDecoded int
 }
 
 // Params holds SPS/PPS-derived parameters needed for slice data decoding.
@@ -83,6 +87,17 @@ type Params struct {
 	// EntryPoints holds the byte offset into the slice data of each substream
 	// after the first, from the slice header's entry point offsets.
 	EntryPoints []int
+
+	// Grid is the picture's tile partitioning, which decides the order CTBs are
+	// coded in. Nil means a single tile, where tile scan is raster scan.
+	Grid *tiles.Grid
+	// SegmentAddressRS is slice_segment_address: the raster scan address of the
+	// first CTB of this slice segment. Zero for a picture's only segment.
+	SegmentAddressRS int
+	// SaoParams, when non-nil, is the picture's SAO parameter array, shared by
+	// every slice segment so that a merge can reference a CTB decoded by an
+	// earlier one. A nil value allocates a fresh picture-sized array.
+	SaoParams []SaoParams
 }
 
 // qpState tracks the QP prediction state of spec 8.6.1.
@@ -191,14 +206,43 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 	ctbSize := 1 << p.Log2CtbSize
 	ctbsX := (p.PicWidth + ctbSize - 1) / ctbSize
 	ctbsY := (p.PicHeight + ctbSize - 1) / ctbSize
+	numCTUs := ctbsX * ctbsY
 
-	sd := &SliceData{}
+	grid := p.Grid
+	if grid == nil {
+		grid = tiles.Single(ctbsX, ctbsY)
+	}
+	if grid.NumCtbs() != numCTUs {
+		return nil, fmt.Errorf("tile grid covers %d CTBs, picture has %d",
+			grid.NumCtbs(), numCTUs)
+	}
+	if p.SegmentAddressRS < 0 || p.SegmentAddressRS >= numCTUs {
+		return nil, fmt.Errorf("slice_segment_address %d outside a picture of %d CTBs",
+			p.SegmentAddressRS, numCTUs)
+	}
+	// A slice segment that spans several tiles carries one substream per tile
+	// and resets the CABAC contexts at each tile's first CTB. That is not
+	// implemented; every tiled stream this decoder targets puts one tile in one
+	// slice segment, where the reset at the segment boundary does the same job.
+	if grid.NumTiles() > 1 && len(p.EntryPoints) > 0 {
+		return nil, fmt.Errorf("slice segment spanning several tiles (%d entry point offsets) is not supported",
+			len(p.EntryPoints))
+	}
+
+	sd := &SliceData{SaoParams: p.SaoParams}
+	if sd.SaoParams == nil {
+		sd.SaoParams = make([]SaoParams, numCTUs)
+	} else if len(sd.SaoParams) != numCTUs {
+		return nil, fmt.Errorf("picture SAO array holds %d CTBs, picture has %d",
+			len(sd.SaoParams), numCTUs)
+	}
+
+	// Spec 6.4.1 makes a neighbour that lies in another slice or another tile
+	// unavailable, so these three start empty for every slice segment rather
+	// than carrying over from the segment before: an undecoded neighbour and one
+	// belonging to a different segment then look alike, which is exactly right.
 	modeMap := newIntraModeMap(p.PicWidth, p.PicHeight)
 	depthMap := newCuDepthMap(p.PicWidth, p.PicHeight, 1<<p.Log2MinCbSize)
-
-	numCTUs := ctbsX * ctbsY
-	sd.SaoParams = make([]SaoParams, numCTUs)
-
 	qps := newQpState(p.SliceQPY, p.PicWidth, p.PicHeight, 1<<p.Log2MinCbSize)
 
 	// Wavefront parallel processing splits the slice data into one substream per
@@ -208,6 +252,9 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 	// before it (spec 9.3.1). Without WPP there is a single substream and the
 	// state simply carries on across rows.
 	wpp := p.EntropyCodingSyncEnabled && len(p.EntryPoints) > 0
+	if wpp && p.SegmentAddressRS != 0 {
+		return nil, fmt.Errorf("wavefront parallel processing in a picture of several slice segments is not supported")
+	}
 	substreams, err := splitSubstreams(cabacData, p.EntryPoints, wpp, ctbsY)
 	if err != nil {
 		return nil, err
@@ -220,7 +267,12 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 	ctxModels := context.InitModels(p.SliceType, p.SliceQPY)
 	var syncModels []cabac.CtxState // state saved after the second CTU of a row
 
-	for ctbAddrRS := 0; ctbAddrRS < numCTUs; ctbAddrRS++ {
+	// The segment covers a run of consecutive tile scan addresses starting at
+	// its own, and ends when end_of_slice_segment_flag says so.
+	firstTs := grid.RsToTs(p.SegmentAddressRS)
+
+	for ts := firstTs; ts < numCTUs; ts++ {
+		ctbAddrRS := grid.TsToRs(ts)
 		ctbX := (ctbAddrRS % ctbsX) * ctbSize
 		ctbY := (ctbAddrRS / ctbsX) * ctbSize
 		row := ctbAddrRS / ctbsX
@@ -247,11 +299,19 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 			qps.isCuQpDeltaCoded = false
 		}
 
-		// Decode SAO parameters for this CTU
+		// Decode SAO parameters for this CTU. The merge flags are only coded
+		// when the neighbour they would copy from belongs to this slice segment
+		// and this tile (spec 7.3.8.3) — a bin read for a neighbour across
+		// either boundary was never coded, and desyncs CABAC from there on.
 		if p.SaoLuma || p.SaoChroma {
+			inSegment := func(nRS int) bool {
+				return grid.RsToTs(nRS) >= firstTs && grid.SameTileRs(nRS, ctbAddrRS)
+			}
+			mergeLeftAvail := ctbX > 0 && inSegment(ctbAddrRS-1)
+			mergeUpAvail := ctbY > 0 && inSegment(ctbAddrRS-ctbsX)
 			sd.SaoParams[ctbAddrRS] = decodeSaoParams(
-				dec, ctxModels, ctbX, ctbY, ctbsX, ctbAddrRS,
-				sd.SaoParams, p.SaoLuma, p.SaoChroma,
+				dec, ctxModels, ctbsX, ctbAddrRS, sd.SaoParams,
+				mergeLeftAvail, mergeUpAvail, p.SaoLuma, p.SaoChroma,
 			)
 		}
 
@@ -266,6 +326,8 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 		if wpp && ctbAddrRS%ctbsX == 1 {
 			syncModels = append(syncModels[:0], ctxModels...)
 		}
+
+		sd.CtbsDecoded++
 
 		// end_of_slice_segment_flag
 		endOfSlice := dec.DecodeTerminate()
@@ -305,13 +367,13 @@ func splitSubstreams(cabacData []byte, entryPoints []int, wpp bool, ctbsY int) (
 
 // decodeSaoParams decodes SAO parameters for one CTU per HEVC spec 7.3.8.3.
 func decodeSaoParams(dec *cabac.Decoder, ctx []cabac.CtxState,
-	ctbX, ctbY, ctbsX, ctbAddrRS int, saoParams []SaoParams,
-	saoLuma, saoChroma bool) SaoParams {
+	ctbsX, ctbAddrRS int, saoParams []SaoParams,
+	mergeLeftAvail, mergeUpAvail, saoLuma, saoChroma bool) SaoParams {
 
 	var sao SaoParams
 
 	// sao_merge_left_flag
-	if ctbX > 0 {
+	if mergeLeftAvail {
 		mergeLeft := dec.DecodeDecision(&ctx[context.CtxSaoMergeFlag])
 		if mergeLeft == 1 {
 			return saoParams[ctbAddrRS-1]
@@ -319,7 +381,7 @@ func decodeSaoParams(dec *cabac.Decoder, ctx []cabac.CtxState,
 	}
 
 	// sao_merge_up_flag
-	if ctbY > 0 {
+	if mergeUpAvail {
 		mergeUp := dec.DecodeDecision(&ctx[context.CtxSaoMergeFlag])
 		if mergeUp == 1 {
 			return saoParams[ctbAddrRS-ctbsX]
