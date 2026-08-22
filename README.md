@@ -30,9 +30,15 @@ verified across 48 x265 configurations. Everything the generator produces
 decodes identically in FFmpeg and in this decoder, which is checked on every
 `go test` run. See [Build & Test](#build--test).
 
-The generator emits tiles as well — `hi265gen -tiles 2x2`, and any of the
-external-parameter-set encoders when the PPS enables them — as one independent
-slice segment per tile with no filtering across the boundaries. Tiles decode
+The generator emits both parallelism tools as well. Tiles — `hi265gen -tiles
+2x2`, and any of the external-parameter-set encoders when the PPS enables them —
+become one independent slice segment per tile with no filtering across the
+boundaries. Wavefront parallel processing — `hi265gen -wpp`, or any PPS with
+`entropy_coding_sync_enabled_flag` set, which is what x265 writes by default —
+keeps the picture one slice segment and makes each CTU row its own CABAC
+substream, reached through an entry point offset, with the row's contexts taken
+from the row above. That is what lets `hi265gray` and `hi265-mp4-extend` splice a
+refresh or a freeze into a default-settings x265 stream. Tiles decode
 bit-exactly too, in both shapes a real encoder emits: one slice
 segment per tile, which is what a tile-stitching tool produces, and every tile in
 a single segment reached through entry point offsets, which is what
@@ -42,7 +48,7 @@ the per-slice deblocking parameters are honoured. Multi-slice pictures decode in
 both segment shapes as well: independent slices, each with their own wavefront
 substreams, and dependent segments that continue the slice before them. Tiles
 combined with wavefront parallel processing is refused with a clear error rather
-than mis-decoded — no HEVC profile permits it.
+than mis-decoded, encoding and decoding alike — no HEVC profile permits it.
 
 Not supported: P/B frames with real motion. Only zero-motion skip CUs are
 reconstructed, so inter pictures beyond a freeze are out of scope — and such a
@@ -64,6 +70,7 @@ Most tests are self-contained. Two groups compare against external tools and
 | `TestGeneratorConformance` | ffmpeg | every generated stream decodes identically in FFmpeg and in `pkg/decoder`, and both match the intended pattern |
 | `TestDecodeRealContent` | ffmpeg + x265 | 48 x265 configurations decode bit-exactly |
 | `TestDecodeWPPStreams` | ffmpeg + x265 | wavefront parallel processing, including x265's own defaults |
+| `TestGeneratedWppAgainstFFmpeg` | ffmpeg | generated wavefront streams are byte-exactly right, which a round trip through `pkg/decoder` cannot show: it navigates by the entry point offsets and so cannot see a wrong byte alignment |
 | `TestDeblockExactness` | ffmpeg + x265 | the loop filter is bit-exact, isolated on content that is exact without it |
 
 Point them at specific binaries with `HI265_FFMPEG` and `HI265_X265` if the ones
@@ -261,6 +268,8 @@ Flags:
 | `-fg` | Foreground RGB color for text | `255,255,255` |
 | `-bg` | Background RGB color | `0,0,0` |
 | `-8x8` | Split each 16x16 CTU into four independent 8x8 CUs | off |
+| `-tiles` | Uniform `CxR` tile grid, one independent slice segment per tile, no loop filter across the boundaries | off |
+| `-wpp` | Wavefront parallel processing: one CABAC substream per CTU row (cannot be combined with `-tiles`) | off |
 | `-qp` | Quantization parameter (0-51) | 26 |
 | `-q` | JPEG quality (1-100) | 85 |
 | `-idr-interval` | Frames between IDR keyframes (0 = all-IDR) | 0 |
@@ -372,7 +381,8 @@ parameter sets. Intended for bootstrapping decoders in Gradual Decode Refresh
 The gray frame uses DC prediction with zero residual, making it independent of
 chroma format and bit depth — it works with 4:2:0, 4:2:2, 4:4:4 at any bit
 depth. Each CTU is encoded as the largest possible CU (no quadtree splitting),
-producing compact bitstreams (~275 bytes for 1920x1080, 2x smaller than x265).
+producing compact bitstreams (~344 bytes for 1920x1080 with wavefront parallel
+processing on, against x265's 610 for the same picture).
 The output is an Annex-B bitstream containing VPS + SPS + PPS + IDR slice.
 
 ```bash
@@ -405,6 +415,7 @@ Test parameter sets are included in `cmd/hi265gray/testdata/`:
 | `vps_sps_pps_420_8bit.json` | 4:2:0 8-bit | 128x64, CTU=64 |
 | `vps_sps_pps_420_10bit.json` | 4:2:0 10-bit | 1920x1080, CTU=64 |
 | `vps_sps_pps_422_10bit.json` | 4:2:2 10-bit | 1920x1080, CTU=64 |
+| `vps_sps_pps_420_8bit_wpp.json` | 4:2:0 8-bit | 1280x720, CTU=64, x265 defaults so wavefront parallel processing is on |
 
 ## Library Usage
 

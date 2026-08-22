@@ -147,11 +147,12 @@ func grayIDRSliceParams(sps *hevc.SPS, pps *hevc.PPS) graySliceParams {
 }
 
 func validateGraySPSPPS(_ *hevc.SPS, pps *hevc.PPS) error {
-	// Tiles are supported, as one independent slice segment per tile. Wavefront
-	// parallel processing is not: it would need one substream per CTB row of
-	// every segment, with entry point offsets to match.
-	if pps.EntropyCodingSyncEnabledFlag {
-		return fmt.Errorf("wavefront parallel processing not supported")
+	// Tiles are supported, as one independent slice segment per tile, and so is
+	// wavefront parallel processing, as one substream per CTB row of a single
+	// segment. The two together are not: no HEVC profile permits the combination,
+	// and the decoder refuses it as well.
+	if pps.EntropyCodingSyncEnabledFlag && pps.TilesEnabledFlag {
+		return fmt.Errorf("tiles combined with wavefront parallel processing is not supported")
 	}
 	return nil
 }
@@ -201,7 +202,10 @@ func encodeGrayIDRSlice(p graySliceParams) []byte {
 		w.WriteBit(1) // slice_loop_filter_across_slices_enabled_flag
 	}
 
-	p.seg.writeEntryPointOffsets(w)
+	// The slice data has to exist before the header can describe it: its
+	// substream lengths are the entry point offsets.
+	subs := encodeGraySliceData(p)
+	p.seg.writeEntryPointOffsets(w, subs)
 
 	// byte_alignment
 	w.WriteBit(1)
@@ -209,18 +213,11 @@ func encodeGrayIDRSlice(p graySliceParams) []byte {
 		w.WriteBit(0)
 	}
 
-	headerBytes := w.Bytes()
-
-	// === Slice data (CABAC) ===
-	cabacBytes := encodeGraySliceData(p)
-
-	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
-	result = append(result, headerBytes...)
-	result = append(result, cabacBytes...)
-	return result
+	return appendSubstreams(w.Bytes(), subs)
 }
 
-// encodeGraySliceData encodes CABAC slice data for a gray IDR frame.
+// encodeGraySliceData encodes the CABAC slice data for a gray IDR frame, as the
+// list of substreams it is made of.
 // Every CU uses DC prediction (mode 1) with zero residual.
 // For a uniform gray surface, DC prediction produces the exact value:
 // - First CU: no neighbors → reference samples default to 1<<(bitDepth-1) = mid-gray
@@ -232,25 +229,15 @@ func encodeGrayIDRSlice(p graySliceParams) []byte {
 // use implicit splits down to sub-CUs that fit. This produces ~14x smaller bitstreams
 // than splitting every CTU to minCB, since one large CU needs only one set of intra
 // mode + cbf bins instead of 64 sets for a 64x64 CTU split to 8x8.
-func encodeGraySliceData(p graySliceParams) []byte {
-	enc := cabac.NewEncoder()
-	models := context.InitModels(context.SliceTypeI, p.qp)
-
+func encodeGraySliceData(p graySliceParams) [][]byte {
 	// Only this segment's CTBs, in raster order within its tile. Every CU is DC
 	// predicted with zero residual, so a neighbour in another tile being
 	// unavailable changes nothing: DC with no neighbours is the mid-grey the
 	// picture is made of anyway.
-	p.seg.forEachCtb(p.ctuSize, func(x, y int, last bool) {
-		encodeGrayCUTree(enc, models, x, y, p.ctuSize, p.log2CtuSize, p)
-		// end_of_slice_segment_flag
-		if last {
-			enc.EncodeTerminate(1)
-		} else {
-			enc.EncodeTerminate(0)
-		}
-	})
-
-	return enc.Flush()
+	return p.seg.encodeCtbs(p.ctuSize, context.SliceTypeI, p.qp,
+		func(enc *cabac.Encoder, models []cabac.CtxState, x, y int) {
+			encodeGrayCUTree(enc, models, x, y, p.ctuSize, p.log2CtuSize, p)
+		})
 }
 
 // encodeGrayCUTree recursively processes the coding quadtree.

@@ -67,7 +67,7 @@ func encode8x8Stream(t *testing.T, w, h, qp int, use8x8 bool, y, cb, cr []uint8,
 	var buf bytes.Buffer
 	lay := chooseCodingLayout(w, h, use8x8)
 	WriteNALU(&buf, naluIDRWRadl,
-		encodeIDRSlice(wholePicture(w, h, lay.ctuSize), w, h, qp, use8x8, y, cb, cr))
+		encodeIDRSlice(wholePicture(w, h, lay.ctuSize, false), w, h, qp, use8x8, y, cb, cr))
 	stream = append(stream, buf.Bytes()...)
 
 	for i := 1; i <= pSkips; i++ {

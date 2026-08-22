@@ -80,7 +80,15 @@ func (e *Encoder) EncodeTerminate(binVal uint8) {
 	}
 }
 
-// Flush finalizes the CABAC bitstream and returns the encoded bytes.
+// Flush finalizes the CABAC bitstream and returns the encoded bytes, zero-padded
+// to a whole number of bytes.
+//
+// It is called after the terminating bin that ends a substream, whose flush
+// (spec 9.3.4.3.5) already put a forced one bit at the end of the arithmetic
+// coder's output. That bit is what byte_alignment() calls
+// alignment_bit_equal_to_one at the end of a wavefront row or a tile, and what
+// rbsp_trailing_bits() calls rbsp_stop_one_bit at the end of the slice segment;
+// either way the only thing left to write is the zero padding.
 func (e *Encoder) Flush() []byte {
 	if e.bitPos > 0 {
 		e.buf = append(e.buf, e.curByte)

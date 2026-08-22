@@ -9,6 +9,8 @@ Pure Go HEVC/H.265 decoder for IDR and P-skip frames, plus a bitstream
 generator for producing valid HEVC test content from flat-color 16x16 CTU
 grid patterns. Pixel-perfect match with FFmpeg decoding across 16+ golden
 test cases (SAO, sign hiding, transform skip, deblocking, P-frames, varied QP).
+Tiles and wavefront parallel processing are supported on both sides; the two
+together are not, since no HEVC profile permits it.
 
 ### Dependencies
 - `github.com/Eyevinn/mp4ff` — VPS/SPS/PPS parsing, NAL extraction, MP4 container
@@ -36,6 +38,9 @@ go run ./cmd/hi265gen -gp "AB,CD" -gc A=16,128,128 -gc B=235,128,128 -o test.265
 
 # Generate a tiled picture: one independent slice segment per tile
 go run ./cmd/hi265gen -gp "AB,CD" -gc A=16,128,128 -gc B=235,128,128 -w 128 -h 128 -tiles 2x2 -o tiled.265
+
+# Generate a wavefront picture: one CABAC substream per CTU row (excludes -tiles)
+go run ./cmd/hi265gen -gp "AB,CD" -gc A=16,128,128 -gc B=235,128,128 -w 128 -h 128 -wpp -o wpp.265
 
 # Generate with a per-picture Time Code SEI (payload type 136)
 go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 75 -fps 25 -timecode -o timecode.265

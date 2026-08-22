@@ -156,3 +156,44 @@ func TestAppendEmptyFramesRejectsBadInput(t *testing.T) {
 		t.Error("expected an error for a stream with no coded slice")
 	}
 }
+
+// Extending a wavefront stream, which is what x265 produces at its defaults and
+// so the shape hi265-mp4-extend most often meets. Until WPP emission landed the
+// appended P-skip was refused outright, so the whole tool was unusable on a
+// default-settings encode — the case that motivated it.
+//
+// The fixture is a real x265 --wpp encode; the appended pictures reuse its PPS,
+// so their slice data has to carry one substream per CTB row with entry point
+// offsets to match, and every one must still freeze the source picture exactly.
+func TestAppendEmptyFramesOnWppStream(t *testing.T) {
+	stream, err := os.ReadFile("../../testdata/slices_wpp_2slices_256x128.265")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := LastFrameState(stream)
+	if err != nil {
+		t.Fatalf("LastFrameState: %v", err)
+	}
+	if !state.PPS.EntropyCodingSyncEnabledFlag {
+		t.Fatal("fixture is supposed to have wavefront parallel processing enabled")
+	}
+
+	const appended = 3
+	extended, err := AppendEmptyFrames(stream, appended)
+	if err != nil {
+		t.Fatalf("AppendEmptyFrames: %v", err)
+	}
+	frames, err := decoder.New().DecodeAnnexB(extended)
+	if err != nil {
+		t.Fatalf("decode extended stream: %v", err)
+	}
+	if len(frames) != 1+appended {
+		t.Fatalf("decoded %d frames, want %d", len(frames), 1+appended)
+	}
+	want := frames[0].YUV420Bytes()
+	for i := 1; i < len(frames); i++ {
+		if !bytes.Equal(frames[i].YUV420Bytes(), want) {
+			t.Errorf("appended frame %d differs from the source picture", i)
+		}
+	}
+}

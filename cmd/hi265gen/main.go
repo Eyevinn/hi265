@@ -100,6 +100,7 @@ type options struct {
 	// tileCols and tileRows are parsed from tiles.
 	tileCols    int
 	tileRows    int
+	wpp         bool
 	idrInterval int
 	bpp         int
 	kbps        int
@@ -138,6 +139,9 @@ func parseOptions(fs *flag.FlagSet, args []string) (*options, error) {
 	fs.StringVar(&opts.tiles, "tiles", "",
 		"cut each picture into a uniform CxR tile grid (e.g. 2x2). Each tile is an "+
 			"independent slice segment and no loop filter crosses a tile boundary")
+	fs.BoolVar(&opts.wpp, "wpp", false,
+		"wavefront parallel processing: code each CTU row as its own CABAC substream, "+
+			"so a decoder can run the rows in parallel (cannot be combined with -tiles)")
 	fs.BoolVar(&opts.use8x8, "8x8", false,
 		"code each 16x16 CTU as four independent 8x8 CUs (finer coding granularity)")
 	fs.IntVar(&opts.idrInterval, "idr-interval", 0, "frames between IDR frames (0 = every frame is IDR)")
@@ -314,6 +318,9 @@ func run(args []string) error {
 
 	if opts.tileCols, opts.tileRows, err = parseTileGrid(opts.tiles); err != nil {
 		return err
+	}
+	if opts.wpp && (opts.tileCols > 1 || opts.tileRows > 1) {
+		return fmt.Errorf("-wpp cannot be combined with -tiles: no HEVC profile permits it")
 	}
 
 	// Convert literal \n sequences to newlines in text pattern.
@@ -642,6 +649,7 @@ func generateH265(opts *options, frameW, frameH, mbWidth, mbHeight int,
 		Use8x8CU:   opts.use8x8,
 		TileCols:   opts.tileCols,
 		TileRows:   opts.tileRows,
+		WPP:        opts.wpp,
 		Width:      frameW,
 		Height:     frameH,
 		ColorSpace: cs,
@@ -696,6 +704,7 @@ func generateH265AllIDR(f io.Writer, opts *options, frameW, frameH, mbWidth, mbH
 			Use8x8CU:   opts.use8x8,
 			TileCols:   opts.tileCols,
 			TileRows:   opts.tileRows,
+			WPP:        opts.wpp,
 			Width:      frameW,
 			Height:     frameH,
 			ColorSpace: cs,
@@ -790,6 +799,7 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 		Use8x8CU:   opts.use8x8,
 		TileCols:   opts.tileCols,
 		TileRows:   opts.tileRows,
+		WPP:        opts.wpp,
 		Width:      frameW,
 		Height:     frameH,
 		ColorSpace: cs,
@@ -868,6 +878,7 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 				Use8x8CU:   opts.use8x8,
 				TileCols:   opts.tileCols,
 				TileRows:   opts.tileRows,
+				WPP:        opts.wpp,
 				Width:      frameW,
 				Height:     frameH,
 				ColorSpace: cs,

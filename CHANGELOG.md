@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Wavefront parallel processing (encoder)
+- `pkg/encode` emits WPP: with `entropy_coding_sync_enabled_flag` set — x265's
+  default — the slice data is one CABAC substream per CTB row, each closed by an
+  `end_of_subset_one_bit` on a byte boundary, with the entry point offsets in the
+  slice header to reach them. Each row's contexts come from the snapshot taken
+  after the second CTB of the row above (spec 9.3.1), or from initial values
+  where the picture is one CTB wide. Covers the gray IDR, gray CRA, grid IDR/CRA
+  and P-skip writers, so `hi265gray` and `hi265-mp4-extend` now serve a
+  default-settings x265 stream instead of refusing it.
+- `EncodeParams.WPP` and `hi265gen -wpp` generate wavefront streams from this
+  package's own parameter sets. Combining it with tiles is refused: no HEVC
+  profile permits that.
+
 #### Tiles
 - Tiled pictures with one slice segment per tile, the shape `hevc-retiler` emits
   and kvazaar's `--tiles WxH --slices tiles` produces: the spec 6.5.1 tile scan
