@@ -19,9 +19,20 @@ func EncodeGrayIDRSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) ([]byte, error) 
 		return nil, err
 	}
 
+	segs, err := tileSegments(sps, pps)
+	if err != nil {
+		return nil, err
+	}
 	p := grayIDRSliceParams(sps, pps)
+
+	// A tiled picture is one slice segment per tile, so a tiled parameter set
+	// yields several NALUs. Concatenated they are still one Annex-B stream, and
+	// one access unit.
 	var buf bytes.Buffer
-	WriteNALU(&buf, naluIDRWRadl, encodeGrayIDRSlice(p))
+	for _, sg := range segs {
+		p.seg = sg
+		WriteNALU(&buf, naluIDRWRadl, encodeGrayIDRSlice(p))
+	}
 	return buf.Bytes(), nil
 }
 
@@ -41,12 +52,19 @@ func EncodeGrayCRASliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) ([]byte
 		return nil, err
 	}
 
+	segs, err := tileSegments(sps, pps)
+	if err != nil {
+		return nil, err
+	}
 	p := grayIDRSliceParams(sps, pps)
 	rps := craRefPicSetParams(sps, poc)
 	p.refPicSet = &rps
 
 	var buf bytes.Buffer
-	WriteNALU(&buf, naluCRA, encodeGrayIDRSlice(p))
+	for _, sg := range segs {
+		p.seg = sg
+		WriteNALU(&buf, naluCRA, encodeGrayIDRSlice(p))
+	}
 	return buf.Bytes(), nil
 }
 
@@ -73,6 +91,10 @@ type graySliceParams struct {
 	// refPicSet is nil for an IDR slice and non-nil for a CRA slice, which
 	// carries the POC and reference picture set fields an IDR header omits.
 	refPicSet *pocRefPicSetParams
+
+	// seg says which slice segment of the picture this is, and which CTBs it
+	// covers. Untiled pictures have exactly one.
+	seg segment
 
 	// Slice header fields from PPS/SPS
 	ppsID                           uint32
@@ -125,11 +147,11 @@ func grayIDRSliceParams(sps *hevc.SPS, pps *hevc.PPS) graySliceParams {
 }
 
 func validateGraySPSPPS(_ *hevc.SPS, pps *hevc.PPS) error {
-	if pps.TilesEnabledFlag {
-		return fmt.Errorf("tiles not supported")
-	}
-	if pps.DependentSliceSegmentsEnabledFlag {
-		return fmt.Errorf("dependent slice segments not supported")
+	// Tiles are supported, as one independent slice segment per tile. Wavefront
+	// parallel processing is not: it would need one substream per CTB row of
+	// every segment, with entry point offsets to match.
+	if pps.EntropyCodingSyncEnabledFlag {
+		return fmt.Errorf("wavefront parallel processing not supported")
 	}
 	return nil
 }
@@ -140,9 +162,10 @@ func encodeGrayIDRSlice(p graySliceParams) []byte {
 	w := NewBitWriter()
 
 	// === Slice header ===
-	w.WriteBit(1)      // first_slice_segment_in_pic_flag = 1
-	w.WriteBit(0)      // no_output_of_prior_pics_flag = 0 (present for all IRAP)
-	w.WriteUE(p.ppsID) // slice_pic_parameter_set_id
+	w.WriteBit(p.seg.firstFlag()) // first_slice_segment_in_pic_flag
+	w.WriteBit(0)                 // no_output_of_prior_pics_flag = 0 (all IRAP)
+	w.WriteUE(p.ppsID)            // slice_pic_parameter_set_id
+	p.seg.writeAddress(w)         // dependent flag and slice_segment_address
 
 	for range p.numExtraSliceHeaderBits {
 		w.WriteBit(0)
@@ -178,6 +201,8 @@ func encodeGrayIDRSlice(p graySliceParams) []byte {
 		w.WriteBit(1) // slice_loop_filter_across_slices_enabled_flag
 	}
 
+	p.seg.writeEntryPointOffsets(w)
+
 	// byte_alignment
 	w.WriteBit(1)
 	for w.BitsWritten()%8 != 0 {
@@ -211,24 +236,19 @@ func encodeGraySliceData(p graySliceParams) []byte {
 	enc := cabac.NewEncoder()
 	models := context.InitModels(context.SliceTypeI, p.qp)
 
-	numCTUx := (p.width + p.ctuSize - 1) / p.ctuSize
-	numCTUy := (p.height + p.ctuSize - 1) / p.ctuSize
-	totalCTUs := numCTUx * numCTUy
-
-	ctuIdx := 0
-	for ctuY := 0; ctuY < p.height; ctuY += p.ctuSize {
-		for ctuX := 0; ctuX < p.width; ctuX += p.ctuSize {
-			encodeGrayCUTree(enc, models, ctuX, ctuY, p.ctuSize, p.log2CtuSize, p)
-
-			// end_of_slice_segment_flag
-			ctuIdx++
-			if ctuIdx == totalCTUs {
-				enc.EncodeTerminate(1)
-			} else {
-				enc.EncodeTerminate(0)
-			}
+	// Only this segment's CTBs, in raster order within its tile. Every CU is DC
+	// predicted with zero residual, so a neighbour in another tile being
+	// unavailable changes nothing: DC with no neighbours is the mid-grey the
+	// picture is made of anyway.
+	p.seg.forEachCtb(p.ctuSize, func(x, y int, last bool) {
+		encodeGrayCUTree(enc, models, x, y, p.ctuSize, p.log2CtuSize, p)
+		// end_of_slice_segment_flag
+		if last {
+			enc.EncodeTerminate(1)
+		} else {
+			enc.EncodeTerminate(0)
 		}
-	}
+	})
 
 	return enc.Flush()
 }

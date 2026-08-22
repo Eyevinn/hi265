@@ -30,7 +30,10 @@ verified across 48 x265 configurations. Everything the generator produces
 decodes identically in FFmpeg and in this decoder, which is checked on every
 `go test` run. See [Build & Test](#build--test).
 
-Tiles decode bit-exactly too, in both shapes a real encoder emits: one slice
+The generator emits tiles as well — `hi265gen -tiles 2x2`, and any of the
+external-parameter-set encoders when the PPS enables them — as one independent
+slice segment per tile with no filtering across the boundaries. Tiles decode
+bit-exactly too, in both shapes a real encoder emits: one slice
 segment per tile, which is what a tile-stitching tool produces, and every tile in
 a single segment reached through entry point offsets, which is what
 `kvazaar --tiles` does by default. Loop filters are included — neither

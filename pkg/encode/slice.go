@@ -211,6 +211,10 @@ func encodeCodingQuadtree(enc *cabac.Encoder, models []cabac.CtxState,
 // idrSliceParams holds the parameters needed to write an IRAP (IDR or CRA)
 // slice header when using external SPS/PPS.
 type idrSliceParams struct {
+	// seg says which slice segment of the picture this is; a tiled picture is
+	// one segment per tile.
+	seg segment
+
 	width                           int
 	height                          int
 	qp                              int
@@ -346,9 +350,10 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 	w := NewBitWriter()
 
 	// === Slice header ===
-	w.WriteBit(1)      // first_slice_segment_in_pic_flag = 1
-	w.WriteBit(0)      // no_output_of_prior_pics_flag = 0 (present for all IRAP)
-	w.WriteUE(p.ppsID) // slice_pic_parameter_set_id
+	w.WriteBit(p.seg.firstFlag()) // first_slice_segment_in_pic_flag
+	w.WriteBit(0)                 // no_output_of_prior_pics_flag = 0 (all IRAP)
+	w.WriteUE(p.ppsID)            // slice_pic_parameter_set_id
+	p.seg.writeAddress(w)         // dependent flag and slice_segment_address
 
 	// num_extra_slice_header_bits: skip N zero bits
 	for range p.numExtraSliceHeaderBits {
@@ -391,6 +396,8 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 		w.WriteBit(1) // slice_loop_filter_across_slices_enabled_flag = PPS default (1)
 	}
 
+	p.seg.writeEntryPointOffsets(w)
+
 	// byte_alignment
 	w.WriteBit(1)
 	for w.BitsWritten()%8 != 0 {
@@ -400,7 +407,7 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 	headerBytes := w.Bytes()
 
 	// === Slice data (CABAC) ===
-	cabacBytes := encodeIDRSliceData(p.width, p.height, p.qp, p.use8x8CU, y, cb, cr)
+	cabacBytes := encodeIDRSliceData(p.seg, p.width, p.height, p.qp, p.use8x8CU, y, cb, cr)
 
 	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
 	result = append(result, headerBytes...)
@@ -409,19 +416,21 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 }
 
 // encodeIDRSlice generates the IDR slice RBSP (header + CABAC data).
-func encodeIDRSlice(width, height, qp int, use8x8CU bool, y, cb, cr []uint8) []byte {
+func encodeIDRSlice(seg segment, width, height, qp int, use8x8CU bool, y, cb, cr []uint8) []byte {
 	w := NewBitWriter()
 
 	// === Slice header ===
-	w.WriteBit(1) // first_slice_segment_in_pic_flag = 1
-	w.WriteBit(0) // no_output_of_prior_pics_flag = 0 (IDR only)
-	w.WriteUE(0)  // slice_pic_parameter_set_id = 0
-	w.WriteUE(2)  // slice_type = 2 (I-slice)
+	w.WriteBit(seg.firstFlag()) // first_slice_segment_in_pic_flag
+	w.WriteBit(0)               // no_output_of_prior_pics_flag = 0 (IDR only)
+	w.WriteUE(0)                // slice_pic_parameter_set_id = 0
+	seg.writeAddress(w)
+	w.WriteUE(2) // slice_type = 2 (I-slice)
 	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set
 	// SAO disabled in SPS → no SAO flags
 	w.WriteSE(0) // slice_qp_delta = 0 (PPS init_qp_minus26 = qp-26)
 	// Deblocking disabled in PPS → no deblock syntax
 	// loop_filter_across_slices_enabled_flag: not present (PPS flag is 0 and deblock is disabled)
+	seg.writeEntryPointOffsets(w)
 
 	// byte_alignment
 	w.WriteBit(1)
@@ -432,7 +441,7 @@ func encodeIDRSlice(width, height, qp int, use8x8CU bool, y, cb, cr []uint8) []b
 	headerBytes := w.Bytes()
 
 	// === Slice data (CABAC) ===
-	cabacBytes := encodeIDRSliceData(width, height, qp, use8x8CU, y, cb, cr)
+	cabacBytes := encodeIDRSliceData(seg, width, height, qp, use8x8CU, y, cb, cr)
 
 	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
 	result = append(result, headerBytes...)
@@ -444,39 +453,37 @@ func encodeIDRSlice(width, height, qp int, use8x8CU bool, y, cb, cr []uint8) []b
 // The CTU size is always 16. With use8x8CU each CTU is split by the coding
 // quadtree into four independently predicted 8x8 CUs (SPS minCbSize = 8),
 // otherwise the CTU is one 16x16 CU (SPS minCbSize = 16).
-func encodeIDRSliceData(width, height, qp int, use8x8CU bool, y, cb, cr []uint8) []byte {
+func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool, y, cb, cr []uint8) []byte {
 	enc := cabac.NewEncoder()
 	models := context.InitModels(context.SliceTypeI, qp)
 
 	lay := chooseCodingLayout(width, height, use8x8CU)
 	ctuSize := lay.ctuSize
-	numCTUx := (width + ctuSize - 1) / ctuSize
-	numCTUy := (height + ctuSize - 1) / ctuSize
-	totalCTUs := numCTUx * numCTUy
 
+	// Everything the prediction reads from is per segment. The reconstruction
+	// buffer is picture-sized but only this segment's samples are ever written to
+	// it, so its availability map answers "reconstructed in this tile" — which is
+	// what spec 6.4.1 allows a neighbour to be. The intra mode and CU depth maps
+	// start empty for the same reason.
 	reconFrame := frame.NewFrame(width, height)
 	modes := newIntraModes()
 	depths := newCuDepths(width, height, lay.minCbSize)
 
-	ctuIdx := 0
-	for ctuY := 0; ctuY < height; ctuY += ctuSize {
-		for ctuX := 0; ctuX < width; ctuX += ctuSize {
-			encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
-				width, height, depths,
-				func(x0, y0, cuSize int) {
-					encodeIDRCU(enc, models, x0, y0, cuSize, ctuSize, lay.minCbSize,
-						width, height, qp, y, cb, cr, reconFrame, modes)
-				})
+	seg.forEachCtb(ctuSize, func(ctuX, ctuY int, last bool) {
+		encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
+			width, height, depths,
+			func(x0, y0, cuSize int) {
+				encodeIDRCU(enc, models, x0, y0, cuSize, ctuSize, lay.minCbSize,
+					width, height, qp, y, cb, cr, reconFrame, modes)
+			})
 
-			// end_of_slice_segment_flag
-			ctuIdx++
-			if ctuIdx == totalCTUs {
-				enc.EncodeTerminate(1)
-			} else {
-				enc.EncodeTerminate(0)
-			}
+		// end_of_slice_segment_flag
+		if last {
+			enc.EncodeTerminate(1)
+		} else {
+			enc.EncodeTerminate(0)
 		}
-	}
+	})
 
 	return enc.Flush()
 }
@@ -787,8 +794,7 @@ func computeChromaLevels(ctuX, ctuY, ctuSize, picWidth int, chromaSrc []uint8,
 
 // predictLumaBlock generates DC intra prediction for a luma block.
 func predictLumaBlock(f *frame.Frame, x0, y0, size, mode int) []int32 {
-	ctuSize := 16 // our fixed CTU size
-	neighbors := buildRefSamples(x0, y0, size, f.Width, f.Height, ctuSize,
+	neighbors := pred.BuildRefSamples(x0, y0, size, f.Width, f.Height,
 		func(x, y int) uint8 { return f.GetLumaPixel(x, y) },
 		func(x, y int) bool { return f.IsLumaDecoded(x, y) },
 	)
@@ -798,8 +804,7 @@ func predictLumaBlock(f *frame.Frame, x0, y0, size, mode int) []int32 {
 
 // predictChromaBlock generates intra prediction for a chroma block.
 func predictChromaBlock(f *frame.Frame, comp, x0, y0, size, mode int) []int32 {
-	ctuSize := 8 // chroma CTU size for 4:2:0
-	neighbors := buildRefSamples(x0, y0, size, f.Width/2, f.Height/2, ctuSize,
+	neighbors := pred.BuildRefSamples(x0, y0, size, f.Width/2, f.Height/2,
 		func(x, y int) uint8 { return f.GetChromaPixel(comp, x, y) },
 		func(x, y int) bool { return f.IsLumaDecoded(x*2, y*2) },
 	)
@@ -858,99 +863,6 @@ func chooseBestLumaMode(recon *frame.Frame, ctuX, ctuY, ctuSize, picWidth int, l
 	return bestMode
 }
 
-// buildRefSamples extracts and substitutes reference samples for intra prediction.
-// Mirrors the decoder's buildRefSamples.
-func buildRefSamples(x0, y0, size, picW, picH, ctbSize int,
-	getPixel func(x, y int) uint8, isDecoded func(x, y int) bool) *pred.Neighbors {
-	numCtbX := (picW + ctbSize - 1) / ctbSize
-	curCtbX := x0 / ctbSize
-	curCtbY := y0 / ctbSize
-	curAddr := curCtbY*numCtbX + curCtbX
-
-	isAvailable := func(px, py int) bool {
-		if px < 0 || py < 0 || px >= picW || py >= picH {
-			return false
-		}
-		nCtbX := px / ctbSize
-		nCtbY := py / ctbSize
-		nAddr := nCtbY*numCtbX + nCtbX
-		if nAddr < curAddr {
-			return true
-		}
-		if nAddr == curAddr {
-			return isDecoded(px, py)
-		}
-		return false
-	}
-
-	hasAny := isAvailable(x0-1, y0) || isAvailable(x0, y0-1)
-	if !hasAny {
-		return nil
-	}
-
-	totalSamples := 4*size + 1
-	ref := make([]uint8, totalSamples)
-	avail := make([]bool, totalSamples)
-
-	for i := range 2 * size {
-		y := y0 + 2*size - 1 - i
-		if isAvailable(x0-1, y) {
-			ref[i] = getPixel(x0-1, y)
-			avail[i] = true
-		}
-	}
-
-	tlIdx := 2 * size
-	if isAvailable(x0-1, y0-1) {
-		ref[tlIdx] = getPixel(x0-1, y0-1)
-		avail[tlIdx] = true
-	}
-
-	for i := range 2 * size {
-		x := x0 + i
-		if isAvailable(x, y0-1) {
-			ref[tlIdx+1+i] = getPixel(x, y0-1)
-			avail[tlIdx+1+i] = true
-		}
-	}
-
-	firstAvail := -1
-	for i := range totalSamples {
-		if avail[i] {
-			firstAvail = i
-			break
-		}
-	}
-	if firstAvail < 0 {
-		return nil
-	}
-
-	for i := range firstAvail {
-		ref[i] = ref[firstAvail]
-	}
-	for i := firstAvail + 1; i < totalSamples; i++ {
-		if !avail[i] {
-			ref[i] = ref[i-1]
-		}
-	}
-
-	n := &pred.Neighbors{
-		TopAvail:  true,
-		LeftAvail: true,
-		Top:       make([]uint8, 2*size),
-		Left:      make([]uint8, 2*size),
-	}
-
-	for i := range 2 * size {
-		n.Left[i] = ref[2*size-1-i]
-	}
-	n.TopLeft = ref[tlIdx]
-	copy(n.Top, ref[tlIdx+1:])
-
-	return n
-}
-
-// reconstructLuma reconstructs luma pixels after encoding.
 func reconstructLuma(f *frame.Frame, x0, y0, size, picW, picH, mode int,
 	prediction []int32, cbfLuma bool, levels []int32, qp int) {
 
@@ -993,6 +905,10 @@ func reconstructChroma(f *frame.Frame, comp, cx, cy, chromaTrSize, chromaW, chro
 
 // pSkipSliceParams holds the parameters needed to write a P-skip slice header.
 type pSkipSliceParams struct {
+	// seg says which slice segment of the picture this is; a tiled picture is
+	// one segment per tile.
+	seg segment
+
 	width                             int
 	height                            int
 	qp                                int
@@ -1021,11 +937,12 @@ type pSkipSliceParams struct {
 // use8x8CU to match the SPS written for 8x8 coding granularity. The picture is
 // one 16x16 skip CU per CTU either way; with minCb=8 that needs an explicit
 // split_cu_flag = 0 at depth 0.
-func encodePSkipSlice(width, height, qp, poc int, use8x8CU bool) []byte {
+func encodePSkipSlice(seg segment, width, height, qp, poc int, use8x8CU bool) []byte {
 	lay := chooseCodingLayout(width, height, use8x8CU)
 	log2MinCbMinus3 := lay.log2MinCbSize - 3
 	log2Diff := lay.log2CtuSize - lay.log2MinCbSize
 	return encodePSkipSliceWithParams(pSkipSliceParams{
+		seg:                               seg,
 		width:                             width,
 		height:                            height,
 		qp:                                qp,
@@ -1041,8 +958,9 @@ func encodePSkipSliceWithParams(p pSkipSliceParams) []byte {
 	w := NewBitWriter()
 
 	// === Slice header ===
-	w.WriteBit(1)      // first_slice_segment_in_pic_flag = 1
-	w.WriteUE(p.ppsID) // slice_pic_parameter_set_id
+	w.WriteBit(p.seg.firstFlag()) // first_slice_segment_in_pic_flag
+	w.WriteUE(p.ppsID)            // slice_pic_parameter_set_id
+	p.seg.writeAddress(w)         // dependent flag and slice_segment_address
 	// num_extra_slice_header_bits: skip N zero bits
 	for range p.numExtraSliceHeaderBits {
 		w.WriteBit(0)
@@ -1107,6 +1025,8 @@ func encodePSkipSliceWithParams(p pSkipSliceParams) []byte {
 		w.WriteBit(1) // slice_loop_filter_across_slices_enabled_flag = PPS default (1)
 	}
 
+	p.seg.writeEntryPointOffsets(w)
+
 	// byte_alignment
 	w.WriteBit(1)
 	for w.BitsWritten()%8 != 0 {
@@ -1120,7 +1040,7 @@ func encodePSkipSliceWithParams(p pSkipSliceParams) []byte {
 	log2MinCbSize := p.log2MinCodingBlockSizeMinus3 + 3
 	ctuLog2 := log2MinCbSize + p.log2DiffMaxMinLumaCodingBlockSize
 	ctuSize := 1 << ctuLog2
-	cabacBytes := encodePSkipSliceData(p.width, p.height, p.qp, ctuSize, log2MinCbSize)
+	cabacBytes := encodePSkipSliceData(p.seg, p.width, p.height, p.qp, ctuSize, log2MinCbSize)
 
 	result := make([]byte, 0, len(headerBytes)+len(cabacBytes))
 	result = append(result, headerBytes...)
@@ -1131,12 +1051,13 @@ func encodePSkipSliceWithParams(p pSkipSliceParams) []byte {
 // encodePSkipSliceData encodes the CABAC slice data for a P-skip slice.
 // log2MinCbSize is the minimum coding block size (log2). When ctuSize > minCbSize,
 // split_cu_flag=0 must be written at each quadtree level before cu_skip_flag.
-func encodePSkipSliceData(width, height, qp, ctuSize, log2MinCbSize int) []byte {
+func encodePSkipSliceData(seg segment, width, height, qp, ctuSize, log2MinCbSize int) []byte {
 	enc := cabac.NewEncoder()
 	models := context.InitModels(context.SliceTypeP, qp)
-	numCTUx := (width + ctuSize - 1) / ctuSize
-	numCTUy := (height + ctuSize - 1) / ctuSize
-	totalCTUs := numCTUx * numCTUy
+	// The segment's own left and top edges in luma samples: a neighbour beyond
+	// them is in another tile, which spec 6.4.1 makes unavailable.
+	segLeft := seg.region.ColStart * ctuSize
+	segTop := seg.region.RowStart * ctuSize
 
 	// The layout comes from the SPS the caller is matching, not from
 	// chooseCodingLayout: an external SPS may use any minimum CB size.
@@ -1148,35 +1069,32 @@ func encodePSkipSliceData(width, height, qp, ctuSize, log2MinCbSize int) []byte 
 	}
 	depths := newCuDepths(width, height, lay.minCbSize)
 
-	ctuIdx := 0
-	for ctuY := 0; ctuY < height; ctuY += ctuSize {
-		for ctuX := 0; ctuX < width; ctuX += ctuSize {
-			encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
-				width, height, depths,
-				func(x0, y0, _ int) {
-					// cu_skip_flag = 1. ctxInc counts the left and above
-					// neighbours that are skipped; every coded CU here is, so
-					// availability alone decides it.
-					ctxInc := 0
-					if x0 > 0 {
-						ctxInc++
-					}
-					if y0 > 0 {
-						ctxInc++
-					}
-					enc.EncodeDecision(1, &models[context.CtxCuSkipFlag+ctxInc])
-					// merge_idx = 0: when maxMergeCand=1, no bins coded
-				})
+	seg.forEachCtb(ctuSize, func(ctuX, ctuY int, last bool) {
+		encodeCodingQuadtree(enc, models, ctuX, ctuY, ctuSize, 0, lay,
+			width, height, depths,
+			func(x0, y0, _ int) {
+				// cu_skip_flag = 1. ctxInc counts the left and above neighbours
+				// that are skipped; every coded CU here is, so availability alone
+				// decides it — and a neighbour outside this tile is unavailable,
+				// which is what the decoder's per-tile reset amounts to.
+				ctxInc := 0
+				if x0 > segLeft {
+					ctxInc++
+				}
+				if y0 > segTop {
+					ctxInc++
+				}
+				enc.EncodeDecision(1, &models[context.CtxCuSkipFlag+ctxInc])
+				// merge_idx = 0: when maxMergeCand=1, no bins coded
+			})
 
-			// end_of_slice_segment_flag
-			ctuIdx++
-			if ctuIdx == totalCTUs {
-				enc.EncodeTerminate(1)
-			} else {
-				enc.EncodeTerminate(0)
-			}
+		// end_of_slice_segment_flag
+		if last {
+			enc.EncodeTerminate(1)
+		} else {
+			enc.EncodeTerminate(0)
 		}
-	}
+	})
 
 	return enc.Flush()
 }

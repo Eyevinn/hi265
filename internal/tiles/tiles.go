@@ -164,3 +164,31 @@ func tileOf(bd []int, p int) int {
 
 func colWidth(colBd []int, i int) int  { return colBd[i+1] - colBd[i] }
 func rowHeight(rowBd []int, j int) int { return rowBd[j+1] - rowBd[j] }
+
+// Region is the rectangle of CTBs a tile covers, as half-open ranges.
+type Region struct {
+	ColStart, ColEnd int
+	RowStart, RowEnd int
+}
+
+// FirstCtbRS returns the raster scan address of the region's first CTB, which is
+// the slice_segment_address of a slice segment covering exactly this tile.
+func (r Region) FirstCtbRS(ctbsX int) int { return r.RowStart*ctbsX + r.ColStart }
+
+// NumCtbs returns how many CTBs the region holds.
+func (r Region) NumCtbs() int { return (r.ColEnd - r.ColStart) * (r.RowEnd - r.RowStart) }
+
+// Regions returns every tile's CTB rectangle, in tile order — which is the order
+// their slice segments appear in the bitstream.
+func (g *Grid) Regions() []Region {
+	out := make([]Region, 0, g.NumTiles())
+	for j := 0; j+1 < len(g.rowBd); j++ {
+		for i := 0; i+1 < len(g.colBd); i++ {
+			out = append(out, Region{
+				ColStart: g.colBd[i], ColEnd: g.colBd[i+1],
+				RowStart: g.rowBd[j], RowEnd: g.rowBd[j+1],
+			})
+		}
+	}
+	return out
+}

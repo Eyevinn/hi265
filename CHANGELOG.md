@@ -38,12 +38,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or another tile is unavailable, replacing a comparison of raster CTB addresses
   that granted availability across both.
 
+#### Encoding tiles
+- Every slice encoder emits tiles as one independent slice segment per tile:
+  `EncodeGrayIDRSliceFromSPSPPS`, `EncodeGrayCRASliceFromSPSPPS`,
+  `EncodePSkipSliceFromSPSPPS`, `EncodeIDRSliceFromSPSPPS` and
+  `EncodeCRASliceFromSPSPPS` accept a tiled external PPS, so a gray CRA refresh
+  can be spliced into a tiled stream and `hi265-mp4-extend` can freeze one. The
+  return shape is unchanged: concatenated NALUs are still one Annex-B stream.
+- `EncodeParams.TileCols` / `TileRows` and `hi265gen -tiles CxR` generate tiled
+  pictures from this package's own parameter sets, with
+  `loop_filter_across_tiles_enabled_flag = 0`. Generated 2x2, 4x1 and 1x8 grids
+  decode bit-exactly in FFmpeg and in `pkg/decoder`.
+- A parameter set with wavefront parallel processing enabled is now refused by
+  the encoders rather than silently mis-encoded; see below.
+
 #### Refusing what cannot be decoded
 - A P or B picture with real motion is refused, naming the CU that stopped it,
   instead of decoding to a plausible-looking wrong picture: `pred_mode_flag` is
   parsed, and an inter CU that is not a zero-motion skip errors. Only zero-motion
   skip CUs are reconstructed, and previously such a stream produced no error at
   all.
+- The encoder kept its own copy of the intra reference sample construction, still
+  comparing raster CTB addresses to decide availability — the rule the decoder
+  dropped when tiles landed. A tiled encode therefore predicted the first CU of
+  each tile from the neighbouring tile, which in a fresh encoder frame reads as
+  zero: the decoder substituted 128 as it should and reconstructed 255 where the
+  source was 235, with both decoders agreeing. Encoder and decoder now share
+  `internal/pred.BuildRefSamples`.
+- `EncodeGrayIDRSliceFromSPSPPS` and the other encoders silently ignored
+  `entropy_coding_sync_enabled_flag`, emitting one continuous CABAC substream for
+  a parameter set that promises one per CTB row. FFmpeg accepted such a stream
+  and decoded it to garbage — 73 % of a 1280x720 case came out zeros instead of
+  mid-grey — and only byte lengths were asserted. Those parameter sets are
+  refused until the encoder can emit WPP.
 - `cu_skip_flag`'s context counts how many of the left and above neighbours were
   themselves skipped (spec 9.3.4.2.2) rather than whether those positions are
   inside the picture — the old form agrees with the spec only for all-skip content

@@ -16,7 +16,7 @@ Phases are ordered by dependency. Sizes are rough: **S** ≈ half a day,
 Nothing else was worth building until generated bitstreams decoded identically in
 a conforming decoder, and until real streams decoded at all.
 
-All fifteen items are closed. The phase started with two known defects and
+All sixteen items are closed. The phase started with two known defects and
 grew: each fix made the next one visible, and the conformance harness (0.2) is
 what turned "FFmpeg disagrees" into a specific spec clause every time. Generated
 content, real x265 output and tiled streams are all bit-exact against FFmpeg now.
@@ -29,7 +29,7 @@ One thing remains, narrowed to something specific rather than left vague:
 
 Ordered by dependency, the fixes were: 0.1 → 0.5 → 0.2 (the harness) → 0.6, 0.7
 (which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11 → 0.13 → 0.14 →
-0.15. The three
+0.15 → 0.16. The three
 small items 0.3, 0.4 and 0.11 were housekeeping alongside.
 
 ### 0.1 MPM candidate-B CTB boundary rule (S) — **fixed**
@@ -467,6 +467,57 @@ Two regression tests: the library refuses a small committed kvazaar P-frame
 vector, and the CLI refuses that mp4 while decoding its first picture with
 `-n 1`, asserting the CU position so a header misparse cannot pass as the same
 failure.
+
+### 0.16 Encoder-side tiles (M) — **fixed**
+
+`pkg/encode` refused `tiles_enabled_flag` outright, so the two things the tools
+exist for could not be done to a tiled stream: no gray CRA splice for GDR, no
+`hi265-mp4-extend` freeze, and no way to generate a tiled test vector in-repo.
+
+Every path now emits one independent slice segment per tile — the shape that
+needs no entry point offsets, since CABAC initialises and terminates at a segment
+boundary anyway. A `segment` value carries which tile a slice is writing, and
+each writer bounds its CTB loop by that region and terminates there. That covers
+`EncodeGrayIDRSliceFromSPSPPS`, `EncodeGrayCRASliceFromSPSPPS`,
+`EncodePSkipSliceFromSPSPPS`, `EncodeIDRSliceFromSPSPPS` and
+`EncodeCRASliceFromSPSPPS`, plus the generated parameter sets: `EncodeParams`
+gained `TileCols`/`TileRows`, the PPS writer emits the tile syntax with
+`loop_filter_across_tiles_enabled_flag = 0`, and `hi265gen -tiles CxR` exposes
+it. The API shape did not change: several NALUs concatenated are still one
+Annex-B stream, and `avc.ConvertByteStreamToNaluSample` splits them correctly for
+the MP4 path.
+
+Two things had to match the decoder exactly, and one of them was already wrong:
+
+- **`cu_skip_flag`'s context** must stop counting neighbours at the tile edge,
+  since the decoder resets availability there.
+- **Reference sample availability.** `pkg/encode` kept its own copy of
+  `buildRefSamples`, still comparing raster CTB addresses — the rule the decoder
+  dropped in 0.13. So the first CU of every tile after the first predicted from
+  the neighbouring tile's samples: from a *fresh* encoder frame those read as 0,
+  the residual was coded against a prediction of 0, and the decoder — correctly
+  substituting 128 — reconstructed 255 where the source was 235. A flat grey
+  picture came out with three of its four tiles saturated, while both decoders
+  agreed with each other, which is exactly the failure mode a duplicated
+  implementation produces. The two now share `internal/pred.BuildRefSamples`,
+  1907 bytes of duplication deleted.
+
+Measured: generated tiled pictures at 2x2, 4x1 and 1x8 decode bit-exactly in
+FFmpeg and in `pkg/decoder`, and match their source pattern to within the same
+±2 as the untiled encode. Gray IDR, gray CRA and P-skip against a tiled external
+PPS decode to uniform mid-grey, with the P-skip picture identical to the IDR
+before it.
+
+**What this surfaced, and did not fix: WPP emission.** A PPS with
+`entropy_coding_sync_enabled_flag` set — x265's default — needs one substream per
+CTB row with entry point offsets to match. The gray encoder ignored the flag and
+emitted a single continuous substream. FFmpeg accepted such a stream without a
+word and decoded it to garbage: 73 % of a 1280x720 case came out zeros instead of
+mid-grey. Only byte lengths were ever asserted, in tests whose comment claimed
+they had been verified pixel-perfect. Those parameter sets are now refused, and
+the affected tests assert the refusal. This is the next encoder item, and until
+it lands `hi265gray` and `hi265-mp4-extend` cannot serve a default-settings x265
+stream.
 
 ### 0.10 Real-world content decoding (L) — **fixed**
 
