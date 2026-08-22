@@ -2,6 +2,7 @@ package decoder
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/Eyevinn/hi265/pkg/frame"
@@ -266,4 +267,23 @@ func TestDecodeDependentSegmentsDeblock128x128(t *testing.T) {
 func TestDecodeTwoSlicesWpp256x128(t *testing.T) {
 	testGolden(t, "../../testdata/slices_wpp_2slices_256x128.265",
 		"../../testdata/golden/slices_wpp_2slices_256x128.yuv", 256, 128)
+}
+
+// A P picture with real motion vectors must be refused rather than
+// approximated. Only zero-motion skip CUs are reconstructed, so an inter CU that
+// carries a motion vector, a merge candidate or a reference index has no
+// prediction to build from — and returning the picture anyway would hand the
+// caller something that looks like a decode and is not one.
+func TestDecodeInterMotionIsRefused(t *testing.T) {
+	data, err := os.ReadFile("../../testdata/pframe_motion_128x64.265")
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := New().DecodeAnnexB(data)
+	if err == nil {
+		t.Fatalf("expected the inter picture to be refused, got %d frames", len(frames))
+	}
+	if !strings.Contains(err.Error(), "motion compensation is not implemented") {
+		t.Errorf("the error should name the limitation, got: %v", err)
+	}
 }

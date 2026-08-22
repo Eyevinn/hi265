@@ -16,7 +16,7 @@ Phases are ordered by dependency. Sizes are rough: **S** ≈ half a day,
 Nothing else was worth building until generated bitstreams decoded identically in
 a conforming decoder, and until real streams decoded at all.
 
-All fourteen items are closed. The phase started with two known defects and
+All fifteen items are closed. The phase started with two known defects and
 grew: each fix made the next one visible, and the conformance harness (0.2) is
 what turned "FFmpeg disagrees" into a specific spec clause every time. Generated
 content, real x265 output and tiled streams are all bit-exact against FFmpeg now.
@@ -28,7 +28,8 @@ One thing remains, narrowed to something specific rather than left vague:
   those are rejected with a clear error instead.
 
 Ordered by dependency, the fixes were: 0.1 → 0.5 → 0.2 (the harness) → 0.6, 0.7
-(which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11 → 0.13 → 0.14. The three
+(which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11 → 0.13 → 0.14 →
+0.15. The three
 small items 0.3, 0.4 and 0.11 were housekeeping alongside.
 
 ### 0.1 MPM candidate-B CTB boundary rule (S) — **fixed**
@@ -423,6 +424,50 @@ Still missing: a dependent segment that begins **mid-row**, which is the one pat
 the resume-from-stored-contexts branch exists for and which neither encoder here
 emits. And tiles combined with WPP, which no profile permits.
 
+### 0.15 Refusing what cannot be reconstructed (S) — **fixed**
+
+Only zero-motion skip CUs are reconstructed, and a P or B picture with real
+motion used to decode **without any error at all**: `cu_skip_flag` came back 0,
+the CU was then parsed as if it were intra, and the result was a picture that
+looked plausible and was wrong — 62 to 90 % of bytes off, growing frame by frame.
+A caller could not tell that apart from a successful decode, which makes any
+differential check built on this decoder untrustworthy for inter content.
+
+Three things landed:
+
+- **`pred_mode_flag`** is parsed for a non-skipped CU in a P or B slice, and an
+  inter CU errors with its position: "inter CU at (304,120): motion compensation
+  is not implemented, only zero-motion skip CUs decode".
+- **`cu_skip_flag`'s context** now counts how many of the left and above
+  neighbours were themselves skipped (spec 9.3.4.2.2), from a per-minimum-CB map
+  that reads unavailable exactly where spec 6.4.1 says a neighbour is — undecoded,
+  or in another slice or tile. It used to ask whether those positions were inside
+  the *picture*, which agrees with the spec only for all-skip content in a single
+  slice with no tiles. That is precisely what the P-frame tests contained, so
+  nothing caught it.
+- **`pred_weight_table`** is parsed rather than skipped, and
+  **`ref_pic_lists_modification`** is refused when `NumPocTotalCurr` says it is
+  present — which meant counting `NumPocTotalCurr` from the reference picture
+  set, inline or taken from the SPS.
+
+The weighted prediction gap was the surprise. x265 enables it **by default**, so
+every P slice from default settings carries the table; skipping it left the
+reader mid-header and the entry point offsets that follow read as garbage —
+71713 into a 482-byte payload. `testdata/hevc_1idr_1p.mp4`, a real 720p encode
+committed to this repo, has never decoded past its first picture for that reason.
+Its IDR is bit-exact against FFmpeg; its P picture is now refused at the inter CU
+at (304,120), which is also the proof that the header parses. **The 0.10 table
+below claims that file decodes "exact": that was only ever true of its first
+picture.**
+
+A stream that signals no actual weight decodes on, since default weights predict
+the plain reference sample, which is what a zero-motion skip copy produces.
+
+Two regression tests: the library refuses a small committed kvazaar P-frame
+vector, and the CLI refuses that mp4 while decoding its first picture with
+`-n 1`, asserting the CU position so a header misparse cannot pass as the same
+failure.
+
 ### 0.10 Real-world content decoding (L) — **fixed**
 
 x265 output was not bit-exact, and got worse with detail and scale: a 720p
@@ -470,7 +515,7 @@ Verified against FFmpeg:
 |---|---|---|
 | sweep: 3 contents x 5 rate modes x 4 geometries | mostly desync | **60/60 bit-exact** |
 | `testsrc2` 720p, x265 full defaults | 1379837 differ, max 245 | exact |
-| `testdata/hevc_1idr_1p.mp4` (real 720p encode) | panic | exact |
+| `testdata/hevc_1idr_1p.mp4` (real 720p encode), first picture | panic | exact (its P picture needs motion compensation — see 0.15) |
 | colour bars 640x352 / 640x360 / 1920x1080 | 1311–99760 differ | exact |
 | `gradients`, `testsrc2` 128x64, QP 26/34 | 29–1624 differ | exact |
 
@@ -772,10 +817,10 @@ Everything through Phase 3 is done, plus 4.1 and 4.3. Remaining, smallest first:
   stored-contexts path exists and is spec-shaped, but no encoder to hand emits
   such a stream, so it is untested by any fixture. Everything else about slices
   and tiles is bit-exact.
-- **Refusing inter CUs the decoder cannot reconstruct** (tiles document, T8) — a
-  P slice that is not all zero-motion skip decodes to garbage with no error,
-  which makes any differential check built on hi265 untrustworthy for inter
-  streams.
+- **Motion compensation** — P and B pictures with real motion are refused with a
+  clear message as of 0.15, rather than decoded wrongly, but they are still out of
+  reach. This is the one item that would make hi265 a general decoder rather than
+  an intra-plus-freeze one.
 - **Encoder-side conformance window** (in 0.8) — the decoder applies one; the
   generator still rejects dimensions finer than a multiple of 8.
 - **5.1 high bit depth decoding** (L) — the real differentiator, and the one item

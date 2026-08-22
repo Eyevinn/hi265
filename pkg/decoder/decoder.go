@@ -218,6 +218,48 @@ func (d *Decoder) decodeSegment(seg *sliceSegment, frames *[]*frame.Frame) error
 	return nil
 }
 
+// parsePredWeightTable parses pred_weight_table (spec 7.3.6.3) and reports
+// whether any weight is actually signalled. When none is, every reference
+// predicts unweighted and the table only cost bits.
+//
+// The per-reference flags carry a presence condition on the reference picture's
+// layer and POC, which only bites for multi-layer streams and for a picture used
+// as its own reference. Neither is supported, so the flags are always read.
+func parsePredWeightTable(r *bits.EBSPReader, sliceType, numRefIdxL0, numRefIdxL1 int) bool {
+	r.ReadExpGolomb()    // luma_log2_weight_denom
+	r.ReadSignedGolomb() // delta_chroma_log2_weight_denom (4:2:0 always has chroma)
+	lists := [2]int{numRefIdxL0, numRefIdxL1}
+	if sliceType != context.SliceTypeB {
+		lists[1] = 0
+	}
+	weighted := false
+	for _, n := range lists {
+		lumaFlags := make([]bool, n)
+		chromaFlags := make([]bool, n)
+		for i := range n {
+			lumaFlags[i] = r.ReadFlag()
+		}
+		for i := range n {
+			chromaFlags[i] = r.ReadFlag()
+		}
+		for i := range n {
+			if lumaFlags[i] {
+				weighted = true
+				r.ReadSignedGolomb() // delta_luma_weight
+				r.ReadSignedGolomb() // luma_offset
+			}
+			if chromaFlags[i] {
+				weighted = true
+				for range 2 {
+					r.ReadSignedGolomb() // delta_chroma_weight
+					r.ReadSignedGolomb() // delta_chroma_offset
+				}
+			}
+		}
+	}
+	return weighted
+}
+
 // parseSegmentAddress reads the fields that only a slice segment other than the
 // first of a picture carries (spec 7.3.6.1): the dependent flag and the segment
 // address. A dependent segment's header stops there — everything else about the
@@ -269,7 +311,9 @@ func parseDependentSegment(r *bits.EBSPReader, nalu []byte, sps *hevc.SPS, pps *
 // the short-term and long-term reference picture sets, and
 // slice_temporal_mvp_enabled_flag. It returns the POC LSB and the slice-level
 // temporal MVP flag.
-func parsePOCAndRefPicSets(r *bits.EBSPReader, sps *hevc.SPS) (pocLsb int, temporalMvpEnabled bool, err error) {
+func parsePOCAndRefPicSets(r *bits.EBSPReader, sps *hevc.SPS) (
+	pocLsb int, temporalMvpEnabled bool, numPocTotalCurr int, err error) {
+
 	pocLsbBits := int(sps.Log2MaxPicOrderCntLsbMinus4) + 4
 	pocLsb = int(r.Read(pocLsbBits))
 
@@ -277,9 +321,27 @@ func parsePOCAndRefPicSets(r *bits.EBSPReader, sps *hevc.SPS) (pocLsb int, tempo
 	stRefPicSetSpsFlag := r.ReadFlag()
 	if stRefPicSetSpsFlag {
 		numSets := int(sps.NumShortTermRefPicSets)
+		idx := 0
 		if numSets > 1 {
-			nBits := ceilLog2(numSets)
-			r.Read(nBits)
+			idx = int(r.Read(ceilLog2(numSets)))
+		}
+		// NumPocTotalCurr counts the reference pictures this picture may use
+		// (spec 7.4.7.2); it decides whether ref_pic_lists_modification is
+		// present at all.
+		if idx < len(sps.ShortTermRefPicSets) {
+			set := sps.ShortTermRefPicSets[idx]
+			for _, used := range set.UsedByCurrPicS0 {
+				if used {
+					numPocTotalCurr++
+				}
+			}
+			for _, used := range set.UsedByCurrPicS1 {
+				if used {
+					numPocTotalCurr++
+				}
+			}
+		} else {
+			numPocTotalCurr = -1 // set not parsed: count unknown
 		}
 	} else {
 		// Inline short_term_ref_pic_set (st_rps_idx = num_short_term_ref_pic_sets)
@@ -294,18 +356,22 @@ func parsePOCAndRefPicSets(r *bits.EBSPReader, sps *hevc.SPS) (pocLsb int, tempo
 			r.ReadFlag()      // delta_rps_sign
 			r.ReadExpGolomb() // abs_delta_rps_minus1
 			// Need reference RPS to know num_delta_pocs - not supported yet
-			return 0, false, fmt.Errorf("inter_ref_pic_set_prediction_flag=1 not supported")
+			return 0, false, 0, fmt.Errorf("inter_ref_pic_set_prediction_flag=1 not supported")
 		}
 		// Direct mode: list delta POCs
 		numNegPics := int(r.ReadExpGolomb())
 		numPosPics := int(r.ReadExpGolomb())
 		for range numNegPics {
 			r.ReadExpGolomb() // delta_poc_s0_minus1
-			r.ReadFlag()      // used_by_curr_pic_s0_flag
+			if r.ReadFlag() { // used_by_curr_pic_s0_flag
+				numPocTotalCurr++
+			}
 		}
 		for range numPosPics {
 			r.ReadExpGolomb() // delta_poc_s1_minus1
-			r.ReadFlag()      // used_by_curr_pic_s1_flag
+			if r.ReadFlag() { // used_by_curr_pic_s1_flag
+				numPocTotalCurr++
+			}
 		}
 	}
 
@@ -321,9 +387,14 @@ func parsePOCAndRefPicSets(r *bits.EBSPReader, sps *hevc.SPS) (pocLsb int, tempo
 				if sps.NumLongTermRefPics > 1 {
 					r.Read(ceilLog2(int(sps.NumLongTermRefPics))) // lt_idx_sps
 				}
+				// The used flag of an SPS long-term entry is not read back here,
+				// so the count becomes unknown rather than wrong.
+				numPocTotalCurr = -1
 			} else {
-				r.Read(pocLsbBits) // poc_lsb_lt
-				r.ReadFlag()       // used_by_curr_pic_lt_flag
+				r.Read(pocLsbBits)                        // poc_lsb_lt
+				if r.ReadFlag() && numPocTotalCurr >= 0 { // used_by_curr_pic_lt_flag
+					numPocTotalCurr++
+				}
 			}
 			if r.ReadFlag() { // delta_poc_msb_present_flag
 				r.ReadExpGolomb() // delta_poc_msb_cycle_lt
@@ -336,7 +407,7 @@ func parsePOCAndRefPicSets(r *bits.EBSPReader, sps *hevc.SPS) (pocLsb int, tempo
 		temporalMvpEnabled = r.ReadFlag()
 	}
 
-	return pocLsb, temporalMvpEnabled, nil
+	return pocLsb, temporalMvpEnabled, numPocTotalCurr, nil
 }
 
 // decodeIRAP decodes an intra random access point slice NALU: an IDR, or a CRA
@@ -438,7 +509,7 @@ func (d *Decoder) parseIRAPSegment(nalu []byte, isCRA bool) (*sliceSegment, erro
 	// IDR: no pic_order_cnt_lsb, no short_term_ref_pic_set.
 	// CRA: POC lsb, reference picture sets and temporal MVP flag are present.
 	if isCRA {
-		if _, _, err := parsePOCAndRefPicSets(r, sps); err != nil {
+		if _, _, _, err := parsePOCAndRefPicSets(r, sps); err != nil {
 			return nil, err
 		}
 	}
@@ -587,7 +658,7 @@ func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
 	}
 
 	// pic_order_cnt_lsb, reference picture sets, slice_temporal_mvp_enabled_flag
-	_, sliceTemporalMvpEnabled, err := parsePOCAndRefPicSets(r, sps)
+	_, sliceTemporalMvpEnabled, numPocTotalCurr, err := parsePOCAndRefPicSets(r, sps)
 	if err != nil {
 		return nil, err
 	}
@@ -611,9 +682,14 @@ func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
 		}
 	}
 
-	// ref_pic_lists_modification (skip for simple case with 1 ref)
-	// Present if ListsModificationPresentFlag && NumPocTotalCurr > 1
-	// For our simple IPP... with 1 ref, NumPocTotalCurr=1, so not present
+	// ref_pic_lists_modification, present when the PPS allows it and there is
+	// more than one candidate reference to reorder (spec 7.3.6.1). With a single
+	// reference there is nothing to reorder and the syntax is absent, which is
+	// the only case handled: reading it would mean building the reference lists.
+	if pps.ListsModificationPresentFlag && numPocTotalCurr != 1 {
+		return nil, fmt.Errorf(
+			"ref_pic_lists_modification is not supported (NumPocTotalCurr %d)", numPocTotalCurr)
+	}
 
 	// mvd_l1_zero_flag (B-slice only)
 	if sliceType == context.SliceTypeB {
@@ -637,8 +713,22 @@ func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
 		}
 	}
 
-	// pred_weight_table (if weighted pred)
-	// Not present for our test vectors (--no-weightp)
+	// pred_weight_table, which x265 emits by default: weighted_pred_flag is on
+	// unless --no-weightp. Skipping it left the reader mid-header, and the entry
+	// point offsets that follow then read as garbage.
+	if (pps.WeightedPredFlag && sliceType == context.SliceTypeP) ||
+		(pps.WeightedBipredFlag && sliceType == context.SliceTypeB) {
+		numRefIdxL1 := 0
+		if sliceType == context.SliceTypeB {
+			numRefIdxL1 = int(pps.NumRefIdxL1DefaultActiveMinus1) + 1
+		}
+		if weighted := parsePredWeightTable(r, sliceType, numRefIdxL0, numRefIdxL1); weighted {
+			// Default weights predict the plain reference sample, which a
+			// zero-motion skip copy already produces. Real weights scale it, and
+			// nothing here applies them.
+			return nil, fmt.Errorf("weighted prediction with signalled weights is not supported")
+		}
+	}
 
 	// five_minus_max_num_merge_cand
 	fiveMinusMerge := int(r.ReadExpGolomb())

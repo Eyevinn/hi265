@@ -81,7 +81,8 @@ type State struct {
 	// address, the SAO merge flags among them (spec 7.3.8.3).
 	sliceAddrRS int
 	modeMap     *intraModeMap
-	depthMap    *cuDepthMap
+	depthMap    *minCbMap
+	skipMap     *minCbMap
 	qps         *qpState
 	// ctx is the context state stored when the previous segment of this slice
 	// ended (spec 9.3.2.4), which a dependent segment resumes from.
@@ -97,7 +98,8 @@ func newState(p *Params, addrRS int) *State {
 	return &State{
 		sliceAddrRS: addrRS,
 		modeMap:     newIntraModeMap(p.PicWidth, p.PicHeight),
-		depthMap:    newCuDepthMap(p.PicWidth, p.PicHeight, 1<<p.Log2MinCbSize),
+		depthMap:    newMinCbMap(p.PicWidth, p.PicHeight, 1<<p.Log2MinCbSize),
+		skipMap:     newMinCbMap(p.PicWidth, p.PicHeight, 1<<p.Log2MinCbSize),
 		qps:         newQpState(p.SliceQPY, p.PicWidth, p.PicHeight, 1<<p.Log2MinCbSize),
 	}
 }
@@ -307,7 +309,7 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 		st = newState(&p, p.SegmentAddressRS)
 	}
 	sd.State = st
-	modeMap, depthMap, qps := st.modeMap, st.depthMap, st.qps
+	modeMap, depthMap, skipMap, qps := st.modeMap, st.depthMap, st.skipMap, st.qps
 	sliceFirstTs := grid.RsToTs(st.sliceAddrRS)
 
 	// Wavefront parallel processing splits the slice data into one substream per
@@ -379,6 +381,7 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 			qps.resetToSliceQP(p.SliceQPY)
 			modeMap.reset()
 			depthMap.reset()
+			skipMap.reset()
 		}
 
 		if sync && ctbAddrRS%ctbsX == 0 && ts > firstTs {
@@ -419,7 +422,8 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 			)
 		}
 
-		cus, err := decodeCodingQuadtree(dec, ctxModels, ctbX, ctbY, p.Log2CtbSize, 0, &p, modeMap, depthMap, qps)
+		cus, err := decodeCodingQuadtree(dec, ctxModels, ctbX, ctbY, p.Log2CtbSize, 0, &p,
+			modeMap, depthMap, skipMap, qps)
 		if err != nil {
 			return nil, fmt.Errorf("CTU (%d,%d): %w", ctbX, ctbY, err)
 		}
@@ -637,7 +641,7 @@ func decodeSaoOffsetAbs(dec *cabac.Decoder) int {
 // decodeCodingQuadtree recursively splits the CTU into CUs.
 func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	x0, y0, log2CbSize, depth int, p *Params,
-	modeMap *intraModeMap, depthMap *cuDepthMap, qps *qpState,
+	modeMap *intraModeMap, depthMap, skipMap *minCbMap, qps *qpState,
 ) ([]CodingUnit, error) {
 
 	// Quantization group boundary, spec 7.3.8.4.
@@ -691,7 +695,7 @@ func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 		for _, pos := range positions {
 			if pos[0] < p.PicWidth && pos[1] < p.PicHeight {
 				cus, err := decodeCodingQuadtree(dec, ctx, pos[0], pos[1],
-					newLog2CbSize, depth+1, p, modeMap, depthMap, qps)
+					newLog2CbSize, depth+1, p, modeMap, depthMap, skipMap, qps)
 				if err != nil {
 					return nil, err
 				}
@@ -705,7 +709,7 @@ func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	depthMap.set(x0, y0, cbSize, depth)
 
 	// Decode coding unit
-	cu, err := decodeCodingUnit(dec, ctx, x0, y0, log2CbSize, p, modeMap, qps)
+	cu, err := decodeCodingUnit(dec, ctx, x0, y0, log2CbSize, p, modeMap, skipMap, qps)
 	if err != nil {
 		return nil, err
 	}
@@ -714,7 +718,8 @@ func decodeCodingQuadtree(dec *cabac.Decoder, ctx []cabac.CtxState,
 
 // decodeCodingUnit decodes a single CU.
 func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
-	x0, y0, log2CbSize int, p *Params, modeMap *intraModeMap, qps *qpState) (CodingUnit, error) {
+	x0, y0, log2CbSize int, p *Params, modeMap *intraModeMap, skipMap *minCbMap,
+	qps *qpState) (CodingUnit, error) {
 
 	cu := CodingUnit{
 		X0:         x0,
@@ -726,22 +731,20 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 
 	// For P/B-slices: decode cu_skip_flag
 	if p.SliceType != context.SliceTypeI {
-		// cu_skip_flag context: 3 contexts based on left/above neighbors
+		// The context is the number of neighbours that were themselves skipped,
+		// left plus above (spec 9.3.4.2.2). An unavailable neighbour contributes
+		// nothing, and the map reads -1 exactly where a neighbour is unavailable:
+		// undecoded, or in another slice or tile.
 		ctxInc := 0
-		// Check left neighbor skip
-		// For simplicity, use availability-based context (similar to split_cu_flag)
-		if x0 > 0 {
+		if skipMap.get(x0-1, y0) == 1 {
 			ctxInc++
 		}
-		if y0 > 0 {
+		if skipMap.get(x0, y0-1) == 1 {
 			ctxInc++
-		}
-		// Clamp to valid context range (0-2)
-		if ctxInc > 2 {
-			ctxInc = 2
 		}
 		skipFlag := dec.DecodeDecision(&ctx[context.CtxCuSkipFlag+ctxInc])
 		cu.SkipFlag = skipFlag == 1
+		skipMap.set(x0, y0, cbSize, int(skipFlag))
 
 		if cu.SkipFlag {
 			cu.PredMode = 0 // inter
@@ -766,6 +769,21 @@ func decodeCodingUnit(dec *cabac.Decoder, ctx []cabac.CtxState,
 			cu.QpY = qps.currentQP
 			qps.setQP(x0, y0, cbSize, cu.QpY)
 			return cu, nil
+		}
+	}
+
+	// pred_mode_flag distinguishes an intra CU from an inter one in a P or B
+	// slice (spec 7.3.8.5); an I slice has neither the flag nor the choice.
+	if p.SliceType != context.SliceTypeI {
+		if dec.DecodeDecision(&ctx[context.CtxPredModeFlag]) == 0 {
+			// MODE_INTER, and not the zero-motion skip that reconstruction can
+			// handle: the prediction unit that follows carries merge flags,
+			// reference indices and motion vector differences, none of which this
+			// decoder derives motion from. Stopping here is the point: decoding
+			// on would return a picture that looks plausible and is wrong.
+			return cu, fmt.Errorf(
+				"inter CU at (%d,%d): motion compensation is not implemented, only zero-motion skip CUs decode",
+				x0, y0)
 		}
 	}
 
@@ -1678,36 +1696,41 @@ func sortMPM(mpm [3]int) [3]int {
 	return sorted
 }
 
-// cuDepthMap tracks CU split depths at minimum CB granularity.
-type cuDepthMap struct {
-	depths     []int // flat array, indexed as [y/minCb * widthMinCb + x/minCb]
+// minCbMap holds one value per minimum coding block, which is the granularity
+// the context derivations need for their left and above neighbours: the CU split
+// depth for split_cu_flag, and cu_skip_flag for the next CU's own. A value of -1
+// means no CU has been decoded there — which is also how a neighbour in another
+// slice or another tile reads, since the map is per slice and reset at every
+// tile boundary.
+type minCbMap struct {
+	values     []int // flat array, indexed as [y/minCb * widthMinCb + x/minCb]
 	minCbSize  int
 	widthMinCb int
 }
 
-func newCuDepthMap(picW, picH, minCbSize int) *cuDepthMap {
+func newMinCbMap(picW, picH, minCbSize int) *minCbMap {
 	w := (picW + minCbSize - 1) / minCbSize
 	h := (picH + minCbSize - 1) / minCbSize
-	depths := make([]int, w*h)
-	for i := range depths {
-		depths[i] = -1 // unavailable
+	values := make([]int, w*h)
+	for i := range values {
+		values[i] = -1 // unavailable
 	}
-	return &cuDepthMap{depths: depths, minCbSize: minCbSize, widthMinCb: w}
+	return &minCbMap{values: values, minCbSize: minCbSize, widthMinCb: w}
 }
 
 // reset marks every block unavailable again, which is what crossing into a new
 // tile means: spec 6.4.1 allows no neighbour from another tile.
-func (m *cuDepthMap) reset() {
-	for i := range m.depths {
-		m.depths[i] = -1
+func (m *minCbMap) reset() {
+	for i := range m.values {
+		m.values[i] = -1
 	}
 }
 
 // set stores the depth for all minCb blocks covered by the CU at (x0,y0) of given
 // size. Writes outside the map are dropped rather than panicking, so a malformed
 // stream cannot take the decoder down.
-func (m *cuDepthMap) set(x0, y0, cuSize, depth int) {
-	heightMinCb := len(m.depths) / m.widthMinCb
+func (m *minCbMap) set(x0, y0, cuSize, value int) {
+	heightMinCb := len(m.values) / m.widthMinCb
 	for y := y0 / m.minCbSize; y < (y0+cuSize)/m.minCbSize; y++ {
 		if y < 0 || y >= heightMinCb {
 			continue
@@ -1716,18 +1739,18 @@ func (m *cuDepthMap) set(x0, y0, cuSize, depth int) {
 			if x < 0 || x >= m.widthMinCb {
 				continue
 			}
-			m.depths[y*m.widthMinCb+x] = depth
+			m.values[y*m.widthMinCb+x] = value
 		}
 	}
 }
 
 // get returns the CU depth at pixel position (x,y), or -1 if unavailable.
-func (m *cuDepthMap) get(x, y int) int {
+func (m *minCbMap) get(x, y int) int {
 	bx, by := x/m.minCbSize, y/m.minCbSize
-	if bx < 0 || by < 0 || bx >= m.widthMinCb || by*m.widthMinCb+bx >= len(m.depths) {
+	if bx < 0 || by < 0 || bx >= m.widthMinCb || by*m.widthMinCb+bx >= len(m.values) {
 		return -1
 	}
-	return m.depths[by*m.widthMinCb+bx]
+	return m.values[by*m.widthMinCb+bx]
 }
 
 // intraModeMap tracks decoded intra luma prediction modes at 4x4 PU granularity.
@@ -1746,7 +1769,7 @@ func newIntraModeMap(picW, picH int) *intraModeMap {
 	return &intraModeMap{modes: modes, width4: w}
 }
 
-// reset marks every block unavailable again; see cuDepthMap.reset.
+// reset marks every block unavailable again; see minCbMap.reset.
 func (m *intraModeMap) reset() {
 	for i := range m.modes {
 		m.modes[i] = -1
