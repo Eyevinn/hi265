@@ -147,8 +147,17 @@ func generateSPS(width, height int, cs yuv.ColorSpace, rng yuv.Range, use8x8CU b
 	return w.Bytes()
 }
 
-// generatePPS returns the PPS RBSP bytes for the given QP.
-func generatePPS(qp int) []byte {
+// b2u turns a flag into the bit that encodes it.
+func b2u(v bool) uint8 {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+// generatePPS returns the PPS RBSP bytes for the given QP and tile grid. A grid
+// of one column and one row means no tiles, and the tile syntax is left out.
+func generatePPS(qp, tileCols, tileRows int) []byte {
 	w := NewBitWriter()
 
 	w.WriteUE(0)              // pps_pic_parameter_set_id = 0
@@ -171,9 +180,17 @@ func generatePPS(qp int) []byte {
 	w.WriteBit(0) // weighted_pred_flag = 0
 	w.WriteBit(0) // weighted_bipred_flag = 0
 	w.WriteBit(0) // transquant_bypass_enabled_flag = 0
-	w.WriteBit(0) // tiles_enabled_flag = 0
-	w.WriteBit(0) // entropy_coding_sync_enabled_flag = 0
-	// no tile/WPP info
+	tiled := tileCols > 1 || tileRows > 1
+	w.WriteBit(b2u(tiled)) // tiles_enabled_flag
+	w.WriteBit(0)          // entropy_coding_sync_enabled_flag = 0
+	if tiled {
+		w.WriteUE(uint32(tileCols - 1)) // num_tile_columns_minus1
+		w.WriteUE(uint32(tileRows - 1)) // num_tile_rows_minus1
+		w.WriteBit(1)                   // uniform_spacing_flag = 1
+		// Filtering across a tile boundary would make the tiles depend on each
+		// other, which is the opposite of why anyone asks for them.
+		w.WriteBit(0) // loop_filter_across_tiles_enabled_flag = 0
+	}
 	w.WriteBit(0) // loop_filter_across_slices_enabled_flag = 0
 	w.WriteBit(1) // deblocking_filter_control_present_flag = 1
 	w.WriteBit(0) // deblocking_filter_override_enabled_flag = 0

@@ -79,23 +79,27 @@ func (c *colorFlags) Set(s string) error {
 }
 
 type options struct {
-	version     bool
-	grid        string
-	colors      colorFlags
-	imgFile     string
-	format      string
-	rgb         bool
-	smpte       bool
-	width       int
-	height      int
-	numFrames   int
-	text        string
-	textScale   int
-	textBg      string
-	fg          string
-	bg          string
-	qp          int
-	use8x8      bool
+	version   bool
+	grid      string
+	colors    colorFlags
+	imgFile   string
+	format    string
+	rgb       bool
+	smpte     bool
+	width     int
+	height    int
+	numFrames int
+	text      string
+	textScale int
+	textBg    string
+	fg        string
+	bg        string
+	qp        int
+	use8x8    bool
+	tiles     string
+	// tileCols and tileRows are parsed from tiles.
+	tileCols    int
+	tileRows    int
 	idrInterval int
 	bpp         int
 	kbps        int
@@ -131,6 +135,9 @@ func parseOptions(fs *flag.FlagSet, args []string) (*options, error) {
 	fs.StringVar(&opts.fg, "fg", "255,255,255", "foreground RGB color for text (R,G,B)")
 	fs.StringVar(&opts.bg, "bg", "0,0,0", "background RGB color for text (R,G,B)")
 	fs.IntVar(&opts.qp, "qp", 26, "quantization parameter (0-51)")
+	fs.StringVar(&opts.tiles, "tiles", "",
+		"cut each picture into a uniform CxR tile grid (e.g. 2x2). Each tile is an "+
+			"independent slice segment and no loop filter crosses a tile boundary")
 	fs.BoolVar(&opts.use8x8, "8x8", false,
 		"code each 16x16 CTU as four independent 8x8 CUs (finer coding granularity)")
 	fs.IntVar(&opts.idrInterval, "idr-interval", 0, "frames between IDR frames (0 = every frame is IDR)")
@@ -272,6 +279,24 @@ func main() {
 	}
 }
 
+// parseTileGrid reads a CxR tile grid, where an empty string means no tiles.
+func parseTileGrid(spec string) (cols, rows int, err error) {
+	if spec == "" {
+		return 1, 1, nil
+	}
+	parts := strings.SplitN(strings.ToLower(spec), "x", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("bad -tiles %q, want CxR such as 2x2", spec)
+	}
+	if cols, err = strconv.Atoi(parts[0]); err != nil || cols < 1 {
+		return 0, 0, fmt.Errorf("bad -tiles column count in %q", spec)
+	}
+	if rows, err = strconv.Atoi(parts[1]); err != nil || rows < 1 {
+		return 0, 0, fmt.Errorf("bad -tiles row count in %q", spec)
+	}
+	return cols, rows, nil
+}
+
 func run(args []string) error {
 	fs := flag.NewFlagSet(appName, flag.ContinueOnError)
 	opts, err := parseOptions(fs, args)
@@ -285,6 +310,10 @@ func run(args []string) error {
 	if opts.version {
 		fmt.Printf("%s %s\n", appName, internal.GetVersion())
 		return nil
+	}
+
+	if opts.tileCols, opts.tileRows, err = parseTileGrid(opts.tiles); err != nil {
+		return err
 	}
 
 	// Convert literal \n sequences to newlines in text pattern.
@@ -611,6 +640,8 @@ func generateH265(opts *options, frameW, frameH, mbWidth, mbHeight int,
 		Colors:     colors,
 		QP:         opts.qp,
 		Use8x8CU:   opts.use8x8,
+		TileCols:   opts.tileCols,
+		TileRows:   opts.tileRows,
 		Width:      frameW,
 		Height:     frameH,
 		ColorSpace: cs,
@@ -663,6 +694,8 @@ func generateH265AllIDR(f io.Writer, opts *options, frameW, frameH, mbWidth, mbH
 			Colors:     colors,
 			QP:         opts.qp,
 			Use8x8CU:   opts.use8x8,
+			TileCols:   opts.tileCols,
+			TileRows:   opts.tileRows,
 			Width:      frameW,
 			Height:     frameH,
 			ColorSpace: cs,
@@ -755,6 +788,8 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 		Colors:     colors,
 		QP:         opts.qp,
 		Use8x8CU:   opts.use8x8,
+		TileCols:   opts.tileCols,
+		TileRows:   opts.tileRows,
 		Width:      frameW,
 		Height:     frameH,
 		ColorSpace: cs,
@@ -831,6 +866,8 @@ func generateMP4(opts *options, frameW, frameH, mbWidth, mbHeight int,
 				Colors:     c,
 				QP:         opts.qp,
 				Use8x8CU:   opts.use8x8,
+				TileCols:   opts.tileCols,
+				TileRows:   opts.tileRows,
 				Width:      frameW,
 				Height:     frameH,
 				ColorSpace: cs,

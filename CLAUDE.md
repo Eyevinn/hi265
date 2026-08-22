@@ -34,6 +34,9 @@ go run ./cmd/hi265dec input.265 output.yuv
 # Generate HEVC bitstream from grid pattern
 go run ./cmd/hi265gen -gp "AB,CD" -gc A=16,128,128 -gc B=235,128,128 -o test.265
 
+# Generate a tiled picture: one independent slice segment per tile
+go run ./cmd/hi265gen -gp "AB,CD" -gc A=16,128,128 -gc B=235,128,128 -w 128 -h 128 -tiles 2x2 -o tiled.265
+
 # Generate with a per-picture Time Code SEI (payload type 136)
 go run ./cmd/hi265gen -smpte -w 192 -h 96 -n 75 -fps 25 -timecode -o timecode.265
 

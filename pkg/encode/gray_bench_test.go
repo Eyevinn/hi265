@@ -2,7 +2,6 @@ package encode
 
 import (
 	"encoding/hex"
-	"fmt"
 	"testing"
 
 	"github.com/Eyevinn/mp4ff/hevc"
@@ -49,6 +48,9 @@ func parseGrayBenchSPSPPS(tb testing.TB, spsHex, ppsHex string) (*hevc.SPS, *hev
 func BenchmarkGrayIDR1920x1080(b *testing.B) {
 	for _, tc := range grayBenchCases {
 		sps, pps := parseGrayBenchSPSPPS(b, tc.sps, tc.pps)
+		if pps.EntropyCodingSyncEnabledFlag {
+			continue // refused, so there is nothing to measure
+		}
 		b.Run(tc.name, func(b *testing.B) {
 			var out []byte
 			for i := 0; i < b.N; i++ {
@@ -59,8 +61,16 @@ func BenchmarkGrayIDR1920x1080(b *testing.B) {
 	}
 }
 
-func TestGrayIDRSize1920x1080(t *testing.T) {
-	// x265 IDR slice sizes (from x265 with --no-sao --no-deblock --no-signhide)
+// These 1920x1080 parameter sets come from x265 at its defaults, which means
+// wavefront parallel processing is on. Emitting WPP needs one CABAC substream
+// per CTB row, each byte-aligned after an end_of_subset_one_bit, with entry
+// point offsets in the header to match — none of which the gray encoder writes.
+// It used to ignore the flag and emit a single continuous substream: FFmpeg
+// accepted that stream without complaint and decoded it to garbage (73 % of the
+// 1280x720 case came out as zeros rather than mid-grey), and only the byte
+// length was ever asserted. Refusing is the honest answer until the encoder can
+// emit WPP; the x265 sizes stay here for the comparison to resume against.
+func TestGrayIDRRefusesWpp1920x1080(t *testing.T) {
 	x265Sizes := map[string]int{
 		"420_8bit":  610,
 		"420_10bit": 610,
@@ -70,13 +80,13 @@ func TestGrayIDRSize1920x1080(t *testing.T) {
 	for _, tc := range grayBenchCases {
 		t.Run(tc.name, func(t *testing.T) {
 			sps, pps := parseGrayBenchSPSPPS(t, tc.sps, tc.pps)
-			idr, err := EncodeGrayIDRSliceFromSPSPPS(sps, pps)
-			if err != nil {
-				t.Fatal(err)
+			if !pps.EntropyCodingSyncEnabledFlag {
+				t.Skip("this parameter set has WPP off; the size comparison belongs here again")
 			}
-			x265Size := x265Sizes[tc.name]
-			fmt.Printf("  %-12s hi265gray: %5d bytes   x265: %5d bytes   ratio: %.1fx\n",
-				tc.name, len(idr), x265Size, float64(len(idr))/float64(x265Size))
+			if _, err := EncodeGrayIDRSliceFromSPSPPS(sps, pps); err == nil {
+				t.Errorf("expected WPP to be refused (x265 emits %d bytes for this case)",
+					x265Sizes[tc.name])
+			}
 		})
 	}
 }
@@ -131,8 +141,10 @@ var grayResolutionCases = []struct {
 }
 
 // TestGrayIDRMultiResolution validates gray IDR encoding at various resolutions
-// by checking the output length matches the expected golden value.
-// Golden values verified pixel-perfect against FFmpeg decode (all Y=128).
+// by checking the output length matches the expected golden value. The cases
+// whose parameter sets enable wavefront parallel processing are refused instead;
+// see TestGrayIDRRefusesWpp1920x1080 for why, and note that the length goldens
+// recorded for them were lengths of streams that did not decode.
 func TestGrayIDRMultiResolution(t *testing.T) {
 	for _, tc := range grayResolutionCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -143,6 +155,12 @@ func TestGrayIDRMultiResolution(t *testing.T) {
 			ctu := 1 << (log2MinCb + int(sps.Log2DiffMaxMinLumaCodingBlockSize))
 
 			idr, err := EncodeGrayIDRSliceFromSPSPPS(sps, pps)
+			if pps.EntropyCodingSyncEnabledFlag {
+				if err == nil {
+					t.Fatal("expected a WPP parameter set to be refused")
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("encode: %v", err)
 			}

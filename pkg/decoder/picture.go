@@ -57,7 +57,7 @@ type picture struct {
 // first_slice_segment_in_pic_flag.
 func (d *Decoder) startPicture(seg *sliceSegment) error {
 	sps := seg.sps
-	grid, err := tileGrid(sps, seg.pps)
+	grid, err := tiles.FromPPS(sps, seg.pps)
 	if err != nil {
 		return err
 	}
@@ -126,61 +126,8 @@ func (d *Decoder) finishPicture(frames *[]*frame.Frame) error {
 	return nil
 }
 
-// log2CtbSize returns Log2CtbSizeY for an SPS.
-func log2CtbSize(sps *hevc.SPS) int {
-	return int(sps.Log2MinLumaCodingBlockSizeMinus3) + 3 +
-		int(sps.Log2DiffMaxMinLumaCodingBlockSize)
-}
+// log2CtbSize and picSizeInCtbs are the parameter set derivations, which live in
+// internal/tiles so the encoder reads the same syntax the same way.
+func log2CtbSize(sps *hevc.SPS) int { return tiles.Log2CtbSize(sps) }
 
-// picSizeInCtbs returns the picture dimensions in CTBs.
-func picSizeInCtbs(sps *hevc.SPS) (ctbsX, ctbsY int) {
-	ctbSize := 1 << log2CtbSize(sps)
-	ctbsX = (int(sps.PicWidthInLumaSamples) + ctbSize - 1) / ctbSize
-	ctbsY = (int(sps.PicHeightInLumaSamples) + ctbSize - 1) / ctbSize
-	return ctbsX, ctbsY
-}
-
-// tileGrid derives the tile scan tables of spec 6.5.1 from the PPS. Without
-// tiles the picture is one tile, where tile scan is plain raster scan.
-func tileGrid(sps *hevc.SPS, pps *hevc.PPS) (*tiles.Grid, error) {
-	ctbsX, ctbsY := picSizeInCtbs(sps)
-	if !pps.TilesEnabledFlag {
-		return tiles.Single(ctbsX, ctbsY), nil
-	}
-
-	cols := int(pps.NumTileColumnsMinus1) + 1
-	rows := int(pps.NumTileRowsMinus1) + 1
-
-	var colWidths, rowHeights []int
-	if pps.UniformSpacingFlag {
-		colWidths = tiles.UniformSizes(ctbsX, cols)
-		rowHeights = tiles.UniformSizes(ctbsY, rows)
-	} else {
-		var err error
-		if colWidths, err = tiles.ExplicitSizes(ctbsX, plusOne(pps.ColumnWidthMinus1)); err != nil {
-			return nil, fmt.Errorf("PPS tile columns: %w", err)
-		}
-		if rowHeights, err = tiles.ExplicitSizes(ctbsY, plusOne(pps.RowHeightMinus1)); err != nil {
-			return nil, fmt.Errorf("PPS tile rows: %w", err)
-		}
-	}
-
-	grid, err := tiles.New(ctbsX, ctbsY, colWidths, rowHeights)
-	if err != nil {
-		return nil, err
-	}
-	if grid.NumTiles() != cols*rows {
-		return nil, fmt.Errorf("tile grid has %d tiles, PPS signals %dx%d",
-			grid.NumTiles(), cols, rows)
-	}
-	return grid, nil
-}
-
-// plusOne converts the PPS's minus1-coded tile sizes to sizes in CTBs.
-func plusOne(minus1 []uint) []int {
-	out := make([]int, len(minus1))
-	for i, v := range minus1 {
-		out[i] = int(v) + 1
-	}
-	return out
-}
+func picSizeInCtbs(sps *hevc.SPS) (ctbsX, ctbsY int) { return tiles.PicSizeInCtbs(sps) }

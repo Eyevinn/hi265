@@ -511,11 +511,25 @@ What is left, in the order that makes each step verifiable:
    bit-exactly.
 2. ~~**T8.**~~ **Done** — see roadmap 0.15, including the `cu_skip_flag` context
    and two header fields the parser used to assume away.
-3. **Encoder-side tiles.** `pkg/encode` refuses `TilesEnabledFlag` outright, so
-   there is no gray CRA splice into a tiled stream, no `hi265-mp4-extend` on
-   tiled content, and no in-repo tiled vectors. One slice segment per tile is
-   mostly slice-header plumbing, and the finished decoder verifies it in-process.
-4. **T7's last fixture**, a committed `hevc-retiler` output with its inputs, for
+3. ~~**Encoder-side tiles.**~~ **Done** — see roadmap 0.16. Every external-PPS
+   path (gray IDR, gray CRA, P-skip, grid IDR/CRA) emits one independent slice
+   segment per tile, the generated parameter sets can carry a tile grid, and
+   `hi265gen -tiles CxR` produces tiled vectors in-repo. What it uncovered: the
+   encoder kept its own copy of the reference sample construction, still using
+   the raster-address availability rule the decoder had already dropped, so a
+   tiled encode predicted from samples the decoder would not have. Both now share
+   `internal/pred.BuildRefSamples`.
+4. **WPP emission.** Not tiles, but the same class of gap and now the biggest
+   one in the encoder: a PPS with `entropy_coding_sync_enabled_flag` set — which
+   is x265's default — needs one CABAC substream per CTB row, each byte-aligned
+   after an `end_of_subset_one_bit`, with entry point offsets in the header. The
+   gray encoder used to ignore the flag and emit a single continuous substream;
+   FFmpeg accepted that stream and decoded it to garbage (73 % of a 1280x720 case
+   came out zeros rather than mid-grey), and only its byte length was ever
+   asserted. It is now refused. Until this lands, `hi265gray` and
+   `hi265-mp4-extend` cannot serve a default-settings x265 stream, which is the
+   GDR case that motivated them.
+5. **T7's last fixture**, a committed `hevc-retiler` output with its inputs, for
    the cross-project check in CI.
 
 Tiles combined with WPP is the one decoding shape deliberately left out: no

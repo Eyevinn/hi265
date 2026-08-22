@@ -10,12 +10,38 @@ import (
 
 // EncodeParams holds parameters for HEVC encoding.
 type EncodeParams struct {
-	Width      int            // must be a multiple of 8
-	Height     int            // must be a multiple of 8
-	QP         int            // 0-51, default 26
-	Use8x8CU   bool           // code each 16x16 CTU as four 8x8 CUs
+	Width    int  // must be a multiple of 8
+	Height   int  // must be a multiple of 8
+	QP       int  // 0-51, default 26
+	Use8x8CU bool // code each 16x16 CTU as four 8x8 CUs
+	// TileCols and TileRows cut the picture into a uniform tile grid, each tile
+	// coded as its own independent slice segment with no filtering across the
+	// boundaries. Zero or one of each means no tiles.
+	TileCols   int
+	TileRows   int
 	ColorSpace yuv.ColorSpace // default BT601
 	Range      yuv.Range      // default LimitedRange
+}
+
+// tileCols and tileRows normalise the tile grid: unset means one.
+func (p EncodeParams) tileCols() int {
+	if p.TileCols < 1 {
+		return 1
+	}
+	return p.TileCols
+}
+
+func (p EncodeParams) tileRows() int {
+	if p.TileRows < 1 {
+		return 1
+	}
+	return p.TileRows
+}
+
+// segments returns the slice segments this picture is emitted as: one per tile.
+func (p EncodeParams) segments() ([]segment, error) {
+	lay := chooseCodingLayout(p.Width, p.Height, p.Use8x8CU)
+	return segmentsForGrid(p.Width, p.Height, lay.ctuSize, p.tileCols(), p.tileRows())
 }
 
 func (p EncodeParams) qp() int {
@@ -33,7 +59,7 @@ func GenerateVPSSPSPPS(p EncodeParams) ([]byte, error) {
 	var buf bytes.Buffer
 	WriteNALU(&buf, naluVPS, generateVPS())
 	WriteNALU(&buf, naluSPS, generateSPS(p.Width, p.Height, p.ColorSpace, p.Range, p.Use8x8CU))
-	WriteNALU(&buf, naluPPS, generatePPS(p.qp()))
+	WriteNALU(&buf, naluPPS, generatePPS(p.qp(), p.tileCols(), p.tileRows()))
 	return buf.Bytes(), nil
 }
 
@@ -50,8 +76,15 @@ func GenerateIDR(p EncodeParams, grid *yuv.Grid, colors yuv.ColorMap) ([]byte, e
 	f.Width = p.Width
 	f.Height = p.Height
 
+	segs, err := p.segments()
+	if err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
-	WriteNALU(&buf, naluIDRWRadl, encodeIDRSlice(p.Width, p.Height, p.qp(), p.Use8x8CU, f.Y, f.Cb, f.Cr))
+	for _, sg := range segs {
+		WriteNALU(&buf, naluIDRWRadl,
+			encodeIDRSlice(sg, p.Width, p.Height, p.qp(), p.Use8x8CU, f.Y, f.Cb, f.Cr))
+	}
 	return buf.Bytes(), nil
 }
 
@@ -61,8 +94,14 @@ func GeneratePSkip(p EncodeParams, poc int) ([]byte, error) {
 	if err := validateFrameDimensions(p.Width, p.Height); err != nil {
 		return nil, err
 	}
+	segs, err := p.segments()
+	if err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
-	WriteNALU(&buf, naluTrailR, encodePSkipSlice(p.Width, p.Height, p.qp(), poc, p.Use8x8CU))
+	for _, sg := range segs {
+		WriteNALU(&buf, naluTrailR, encodePSkipSlice(sg, p.Width, p.Height, p.qp(), poc, p.Use8x8CU))
+	}
 	return buf.Bytes(), nil
 }
 
@@ -83,9 +122,20 @@ func EncodeIDRSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, grid *yuv.Grid, colo
 	f.Width = w
 	f.Height = h
 
+	segs, err := tileSegments(sps, pps)
+	if err != nil {
+		return nil, err
+	}
 	sp := idrSliceParamsFromSPSPPS(sps, pps)
+
+	// A tiled picture is one independent slice segment per tile. Each is coded
+	// as if the rest of the picture were not there, which is what makes the tile
+	// boundaries real: nothing outside a tile is available to predict from.
 	var buf bytes.Buffer
-	WriteNALU(&buf, naluIDRWRadl, encodeIDRSliceWithParams(sp, f.Y, f.Cb, f.Cr))
+	for _, sg := range segs {
+		sp.seg = sg
+		WriteNALU(&buf, naluIDRWRadl, encodeIDRSliceWithParams(sp, f.Y, f.Cb, f.Cr))
+	}
 	return buf.Bytes(), nil
 }
 
@@ -115,12 +165,19 @@ func EncodeCRASliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, grid *yuv.Grid, colo
 	f.Width = w
 	f.Height = h
 
+	segs, err := tileSegments(sps, pps)
+	if err != nil {
+		return nil, err
+	}
 	sp := idrSliceParamsFromSPSPPS(sps, pps)
 	rps := craRefPicSetParams(sps, poc)
 	sp.refPicSet = &rps
 
 	var buf bytes.Buffer
-	WriteNALU(&buf, naluCRA, encodeIDRSliceWithParams(sp, f.Y, f.Cb, f.Cr))
+	for _, sg := range segs {
+		sp.seg = sg
+		WriteNALU(&buf, naluCRA, encodeIDRSliceWithParams(sp, f.Y, f.Cb, f.Cr))
+	}
 	return buf.Bytes(), nil
 }
 
@@ -131,18 +188,26 @@ func EncodePSkipSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) ([]byte, 
 		return nil, err
 	}
 
+	segs, err := tileSegments(sps, pps)
+	if err != nil {
+		return nil, err
+	}
 	p := pSkipSliceParamsFromSPSPPS(sps, pps, poc)
+
 	var buf bytes.Buffer
-	WriteNALU(&buf, naluTrailR, encodePSkipSliceWithParams(p))
+	for _, sg := range segs {
+		p.seg = sg
+		WriteNALU(&buf, naluTrailR, encodePSkipSliceWithParams(p))
+	}
 	return buf.Bytes(), nil
 }
 
-func validateSPSPPS(sps *hevc.SPS, pps *hevc.PPS) error {
-	if pps.TilesEnabledFlag {
-		return fmt.Errorf("tiles not supported")
-	}
-	if pps.DependentSliceSegmentsEnabledFlag {
-		return fmt.Errorf("dependent slice segments not supported")
+func validateSPSPPS(_ *hevc.SPS, pps *hevc.PPS) error {
+	// Tiles are supported, emitted as one independent slice segment per tile.
+	// Wavefront parallel processing is not: it needs one substream per CTB row
+	// with entry point offsets to match, and nothing here writes those.
+	if pps.EntropyCodingSyncEnabledFlag {
+		return fmt.Errorf("wavefront parallel processing not supported")
 	}
 	if pps.WeightedPredFlag {
 		return fmt.Errorf("weighted prediction not supported")
@@ -202,6 +267,8 @@ type FrameEncoder struct {
 	Colors     yuv.ColorMap
 	QP         int
 	Use8x8CU   bool           // code each 16x16 CTU as four 8x8 CUs
+	TileCols   int            // uniform tile columns (0 or 1 = no tiles)
+	TileRows   int            // uniform tile rows (0 or 1 = no tiles)
 	Width      int            // pixel width (0 = Grid.Width*16)
 	Height     int            // pixel height (0 = Grid.Height*16)
 	ColorSpace yuv.ColorSpace // default BT601
@@ -226,7 +293,8 @@ func (e *FrameEncoder) Encode() ([]byte, error) {
 func (e *FrameEncoder) EncodeVPSSPSPPS(buf *bytes.Buffer) {
 	WriteNALU(buf, naluVPS, generateVPS())
 	WriteNALU(buf, naluSPS, generateSPS(e.frameWidth(), e.frameHeight(), e.ColorSpace, e.Range, e.Use8x8CU))
-	WriteNALU(buf, naluPPS, generatePPS(e.qp()))
+	p := e.encodeParams()
+	WriteNALU(buf, naluPPS, generatePPS(e.qp(), p.tileCols(), p.tileRows()))
 }
 
 // EncodeIDRSlice produces an Annex-B IDR slice (no VPS/SPS/PPS).
@@ -268,7 +336,8 @@ func (e *FrameEncoder) SPSNALUs() [][]byte {
 
 // PPSNALUs returns the raw PPS NALU (with 2-byte header, no start code) for MP4.
 func (e *FrameEncoder) PPSNALUs() [][]byte {
-	return [][]byte{buildNALU(naluPPS, generatePPS(e.qp()))}
+	p := e.encodeParams()
+	return [][]byte{buildNALU(naluPPS, generatePPS(e.qp(), p.tileCols(), p.tileRows()))}
 }
 
 func (e *FrameEncoder) encodeParams() EncodeParams {
@@ -277,6 +346,8 @@ func (e *FrameEncoder) encodeParams() EncodeParams {
 		Height:     e.frameHeight(),
 		QP:         e.qp(),
 		Use8x8CU:   e.Use8x8CU,
+		TileCols:   e.TileCols,
+		TileRows:   e.TileRows,
 		ColorSpace: e.ColorSpace,
 		Range:      e.Range,
 	}
