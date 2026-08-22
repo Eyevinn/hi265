@@ -546,6 +546,36 @@ func conformanceCases() []conformanceCase {
 			name: "smpte_text_overlay_qp26", width: 192, height: 96, qp: 26, frames: 1,
 			pattern: patSMPTEText, maxPatternDelta: 4, maxPatternMean: 0.5,
 		},
+		// Picture widths that are not a multiple of the 16-sample CTU, so the
+		// rightmost CTU column is only partly inside the picture.
+		//
+		// A grid cell is one CTU, so yuv.BuildFrame lays these out wider than the
+		// picture and the source planes have to be repacked at the picture's own
+		// stride before anything reads them. They were not, and the encoder coded a
+		// picture sheared sideways by the remainder on every row — invisible to a
+		// comparison between the two decoders, since both faithfully decode the
+		// sheared version, and caught only by the pattern check below. The pattern
+		// has to vary horizontally for that to bite, which rules out patFlat.
+		{
+			name: "tiles_ragged_width", width: 120, height: 72, qp: 26, frames: 1,
+			pattern: patTiles, maxPatternDelta: 4, maxPatternMean: 0.5,
+		},
+		{
+			name: "smpte_ragged_width", width: 200, height: 104, qp: 26, frames: 1,
+			pattern: patSMPTE, maxPatternDelta: 4, maxPatternMean: 0.5,
+		},
+		// The smallest ragged picture there is: one partial CTU, and the minimum
+		// coding block size the SPS can express.
+		{
+			name: "tiles_ragged_width_tiny", width: 24, height: 24, qp: 26, frames: 1,
+			pattern: patTiles, maxPatternDelta: 4, maxPatternMean: 0.5,
+		},
+		// A ragged width with a P-skip following, so the freeze copies a picture
+		// whose rightmost CTU is partial.
+		{
+			name: "smpte_ragged_width_pskip", width: 120, height: 72, qp: 26, frames: 3,
+			idrInterval: 3, pattern: patSMPTE, maxPatternDelta: 4, maxPatternMean: 0.5,
+		},
 	}
 }
 

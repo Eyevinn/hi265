@@ -83,18 +83,54 @@ func GenerateVPSSPSPPS(p EncodeParams) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// gridSource builds the source samples of a width x height picture from a grid,
+// packed at the picture's own width — which is the stride the slice writers index
+// the planes at.
+//
+// The repacking is the point. yuv.BuildFrame lays a grid out at grid.Width*16
+// samples per row, because a grid cell is one CTU, so a picture whose width is not
+// a multiple of 16 is narrower than the buffer holding it: its rightmost CTU is
+// only partly inside the picture. Handing those planes to a writer that indexes
+// them as src[y*width+x] shears the picture sideways by the remainder on every
+// row, and the encoder then faithfully codes the sheared version. Measured with
+// hi265gen -smpte at 120x80 before this existed: 14050 of 14400 samples differed
+// from the generator's own raw output, at a maximum delta of 177.
+//
+// The crop is YUV420Bytes', which is exactly what the raw output paths write, so a
+// .265 and a .yuv built from one grid describe the same picture.
+func gridSource(grid *yuv.Grid, colors yuv.ColorMap, width, height int) (y, cb, cr []uint8, err error) {
+	f, err := yuv.BuildFrame(grid, colors)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if f.Width < width || f.Height < height {
+		return nil, nil, nil, fmt.Errorf(
+			"grid covers %dx%d samples, too small for a %dx%d picture",
+			f.Width, f.Height, width, height)
+	}
+	// Width and Height become the visible picture while the planes keep the
+	// grid's stride, which is the distinction YUV420Bytes crops on.
+	f.Width, f.Height = width, height
+
+	buf := f.YUV420Bytes()
+	lumaSize := width * height
+	chromaSize := (width / 2) * (height / 2)
+	return buf[:lumaSize],
+		buf[lumaSize : lumaSize+chromaSize],
+		buf[lumaSize+chromaSize : lumaSize+2*chromaSize],
+		nil
+}
+
 // GenerateIDR returns Annex-B bytes containing an IDR slice NALU.
 // The grid and colors define the per-CTU content (each grid cell is one 16x16 CTU).
 func GenerateIDR(p EncodeParams, grid *yuv.Grid, colors yuv.ColorMap) ([]byte, error) {
 	if err := validateFrameDimensions(p.Width, p.Height); err != nil {
 		return nil, err
 	}
-	f, err := yuv.BuildFrame(grid, colors)
+	y, cb, cr, err := gridSource(grid, colors, p.Width, p.Height)
 	if err != nil {
 		return nil, err
 	}
-	f.Width = p.Width
-	f.Height = p.Height
 
 	segs, err := p.segments()
 	if err != nil {
@@ -103,7 +139,7 @@ func GenerateIDR(p EncodeParams, grid *yuv.Grid, colors yuv.ColorMap) ([]byte, e
 	var buf bytes.Buffer
 	for _, sg := range segs {
 		WriteNALU(&buf, naluIDRWRadl,
-			encodeIDRSlice(sg, p.Width, p.Height, p.qp(), p.Use8x8CU, f.Y, f.Cb, f.Cr))
+			encodeIDRSlice(sg, p.Width, p.Height, p.qp(), p.Use8x8CU, y, cb, cr))
 	}
 	return buf.Bytes(), nil
 }
@@ -135,12 +171,10 @@ func EncodeIDRSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, grid *yuv.Grid, colo
 
 	w := int(sps.PicWidthInLumaSamples)
 	h := int(sps.PicHeightInLumaSamples)
-	f, err := yuv.BuildFrame(grid, colors)
+	y, cb, cr, err := gridSource(grid, colors, w, h)
 	if err != nil {
 		return nil, err
 	}
-	f.Width = w
-	f.Height = h
 
 	segs, err := tileSegments(sps, pps)
 	if err != nil {
@@ -154,7 +188,7 @@ func EncodeIDRSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, grid *yuv.Grid, colo
 	var buf bytes.Buffer
 	for _, sg := range segs {
 		sp.seg = sg
-		WriteNALU(&buf, naluIDRWRadl, encodeIDRSliceWithParams(sp, f.Y, f.Cb, f.Cr))
+		WriteNALU(&buf, naluIDRWRadl, encodeIDRSliceWithParams(sp, y, cb, cr))
 	}
 	return buf.Bytes(), nil
 }
@@ -178,12 +212,10 @@ func EncodeCRASliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, grid *yuv.Grid, colo
 
 	w := int(sps.PicWidthInLumaSamples)
 	h := int(sps.PicHeightInLumaSamples)
-	f, err := yuv.BuildFrame(grid, colors)
+	y, cb, cr, err := gridSource(grid, colors, w, h)
 	if err != nil {
 		return nil, err
 	}
-	f.Width = w
-	f.Height = h
 
 	segs, err := tileSegments(sps, pps)
 	if err != nil {
@@ -196,7 +228,7 @@ func EncodeCRASliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, grid *yuv.Grid, colo
 	var buf bytes.Buffer
 	for _, sg := range segs {
 		sp.seg = sg
-		WriteNALU(&buf, naluCRA, encodeIDRSliceWithParams(sp, f.Y, f.Cb, f.Cr))
+		WriteNALU(&buf, naluCRA, encodeIDRSliceWithParams(sp, y, cb, cr))
 	}
 	return buf.Bytes(), nil
 }
