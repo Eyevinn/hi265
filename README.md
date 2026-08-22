@@ -72,6 +72,7 @@ Most tests are self-contained. Two groups compare against external tools and
 | `TestDecodeWPPStreams` | ffmpeg + x265 | wavefront parallel processing, including x265's own defaults |
 | `TestGeneratedWppAgainstFFmpeg` | ffmpeg | generated wavefront streams are byte-exactly right, which a round trip through `pkg/decoder` cannot show: it navigates by the entry point offsets and so cannot see a wrong byte alignment |
 | `TestEncodeIDRWithCuQpDeltaAgainstFFmpeg` | ffmpeg | `cu_qp_delta_abs` is written in the right place with the right binarisation, at both quantization group sizes |
+| `TestEncodeIDRWithSignHidingAgainstFFmpeg` | ffmpeg | the hidden `coeff_sign_flag` is omitted in the right place — the half that changes the bin count; the parity itself is pinned by `TestEncodeIDRWithSignHiding` |
 | `TestDeblockExactness` | ffmpeg + x265 | the loop filter is bit-exact, isolated on content that is exact without it |
 
 Point them at specific binaries with `HI265_FFMPEG` and `HI265_X265` if the ones
@@ -481,11 +482,12 @@ extended, err := encode.AppendEmptyFrames(annexB, 25)
 > and `cu_qp_delta_enabled_flag` (a zero delta at the first coefficient-carrying
 > transform unit of each quantization group) are all written correctly, and tiles
 > combined with wavefront processing is refused since no profile permits it.
-> `weighted_pred_flag` is refused too. Still **ignored rather than refused** by
-> the grid IDR/CRA writer: `sign_data_hiding_enabled_flag`, which x265 sets by
-> default, and `pps_cb_qp_offset`/`pps_cr_qp_offset`, which the chroma path does
-> not add to the luma QP. The gray and P-skip writers are unaffected by all three,
-> since they code no coefficients.
+> `sign_data_hiding_enabled_flag` (x265's default: the sign of a sub-block's
+> lowest-frequency significant coefficient carried by the parity of its levels) is
+> written correctly as well, and `weighted_pred_flag` is refused. Still **ignored
+> rather than refused** by the grid IDR/CRA writer: `pps_cb_qp_offset` and
+> `pps_cr_qp_offset`, which the chroma path does not add to the luma QP. The gray
+> and P-skip writers are unaffected, since they code no coefficients.
 
 ```go
 // Time Code SEI (payload type 136). HEVC carries the SMPTE timecode here rather

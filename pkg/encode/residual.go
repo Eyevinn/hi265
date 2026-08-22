@@ -133,9 +133,18 @@ func quantize(coeffs []int32, size, qp int) []int32 {
 	return levels
 }
 
-// encodeResidualCoding encodes residual coefficients for one TU using CABAC.
+// encodeResidualCoding writes one transform block's residual_coding() syntax
+// (spec 7.3.8.11).
+//
+// With signDataHiding it MODIFIES levels IN PLACE. The sign of each qualifying
+// sub-block's lowest-frequency significant coefficient is not coded at all: the
+// decoder infers it from the parity of the sub-block's absolute levels, so the
+// encoder has to make that parity say the right thing, which sometimes means
+// moving one level by a step. The caller has to reconstruct from this same slice
+// afterwards — reconstructing from the levels as they were handed in would
+// predict later blocks from samples no decoder will have.
 func encodeResidualCoding(enc *cabac.Encoder, models []cabac.CtxState,
-	levels []int32, log2TrafoSize int, isLuma bool, scanIdx int) {
+	levels []int32, log2TrafoSize int, isLuma bool, scanIdx int, signDataHiding bool) {
 
 	size := 1 << log2TrafoSize
 
@@ -324,6 +333,18 @@ foundLast:
 			continue
 		}
 
+		// Sign data hiding (spec 7.3.8.11). The sign of the lowest-frequency
+		// significant coefficient of this sub-block is not coded when the two
+		// significant ends are more than three scan positions apart; the decoder
+		// reads it off the parity of the sub-block's absolute levels instead. Fix
+		// the parity here, after the significance map is settled and before any bin
+		// that depends on a magnitude has been written.
+		signHidden := signDataHiding && (lastScanPosInSb-firstScanPos) > 3
+		if signHidden {
+			hideSignParity(levels, size, sbOriginX, sbOriginY, coeffScanOrder,
+				firstScanPos, lastScanPosInSb)
+		}
+
 		// ctxSet derivation — must match decoder exactly
 		ctxSet := 0
 		if isLuma && i > 0 {
@@ -402,6 +423,10 @@ foundLast:
 			if !sigFlags[n] {
 				continue
 			}
+			if signHidden && n == firstScanPos {
+				// Carried by the parity hideSignParity just arranged.
+				continue
+			}
 			cx := sbOriginX + coeffScanOrder[n][0]
 			cy := sbOriginY + coeffScanOrder[n][1]
 			lev := levels[cy*size+cx]
@@ -478,6 +503,57 @@ func encodeLastSigCoeff(enc *cabac.Encoder, models []cabac.CtxState,
 		for k := ySuffixLen - 1; k >= 0; k-- {
 			enc.EncodeBypass(uint8((ySuffixVal >> k) & 1))
 		}
+	}
+}
+
+// hideSignParity makes the parity of a sub-block's absolute levels carry the sign
+// of its lowest-frequency significant coefficient, which is how a decoder reads it
+// when that sign is hidden: an odd sum means negative. It moves one level by a
+// step when the parity does not already agree, and leaves levels untouched when it
+// does.
+//
+// It only ever increases a magnitude. Decreasing one could take it to zero, and
+// every sig_coeff_flag of the sub-block has already been written by the time this
+// runs — the significance map, firstScanPos, lastScanPosInSb and therefore the
+// decision to hide a sign at all would stop matching what was coded. Increasing
+// cannot move any of them.
+//
+// Which coefficient it picks barely matters for distortion. Every coefficient of a
+// transform block shares one quantizer step here, since nothing writes scaling
+// lists, so a step on any single one costs the same reconstruction error; and the
+// dead-zone quantizer biases levels low, so increasing tends to move toward the
+// unquantized value rather than away from it. The highest-frequency significant
+// coefficient is chosen because it is the one whose value matters least. HM runs a
+// rate-distortion search over the candidates instead, which would need the
+// pre-quantization coefficients down here for a gain of at most one step on one
+// coefficient.
+func hideSignParity(levels []int32, size, sbOriginX, sbOriginY int,
+	coeffScanOrder [][2]int, firstScanPos, lastScanPosInSb int) {
+
+	at := func(n int) int {
+		return (sbOriginY+coeffScanOrder[n][1])*size + sbOriginX + coeffScanOrder[n][0]
+	}
+
+	// Positions that are not significant hold zero, so summing the whole run is
+	// the same as summing the significant ones — which is what the decoder does.
+	sumAbs := int32(0)
+	for n := firstScanPos; n <= lastScanPosInSb; n++ {
+		if v := levels[at(n)]; v < 0 {
+			sumAbs -= v
+		} else {
+			sumAbs += v
+		}
+	}
+
+	negative := levels[at(firstScanPos)] < 0
+	if (sumAbs%2 == 1) == negative {
+		return // the parity already says what the sign is
+	}
+
+	if i := at(lastScanPosInSb); levels[i] < 0 {
+		levels[i]--
+	} else {
+		levels[i]++
 	}
 }
 
