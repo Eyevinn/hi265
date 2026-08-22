@@ -16,7 +16,7 @@ Phases are ordered by dependency. Sizes are rough: **S** ≈ half a day,
 Nothing else was worth building until generated bitstreams decoded identically in
 a conforming decoder, and until real streams decoded at all.
 
-All nineteen items are closed. The phase started with two known defects and
+All twenty items are closed. The phase started with two known defects and
 grew: each fix made the next one visible, and the conformance harness (0.2) is
 what turned "FFmpeg disagrees" into a specific spec clause every time. Generated
 content, real x265 output and tiled streams are all bit-exact against FFmpeg now.
@@ -29,7 +29,7 @@ One thing remains, narrowed to something specific rather than left vague:
 
 Ordered by dependency, the fixes were: 0.1 → 0.5 → 0.2 (the harness) → 0.6, 0.7
 (which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11 → 0.13 → 0.14 →
-0.15 → 0.16 → 0.17 → 0.18 → 0.19. The three
+0.15 → 0.16 → 0.17 → 0.18 → 0.19 → 0.20. The three
 small items 0.3, 0.4 and 0.11 were housekeeping alongside.
 
 ### 0.1 MPM candidate-B CTB boundary rule (S) — **fixed**
@@ -680,6 +680,67 @@ against the intended pattern catches it, and a flat pattern shears invisibly.
 frame's strided layout. Restoring the old behaviour fails exactly those four
 conformance cases and four of the five unit cases.
 
+### 0.20 Encoder-side sign data hiding (M) — **fixed**
+
+`pkg/encode` ignored `sign_data_hiding_enabled_flag`, which x265 sets by default.
+It was the last thing standing between the grid IDR/CRA writer and a
+default-settings x265 PPS, and 0.18 recorded it while implementing `cu_qp_delta`.
+
+Where a sub-block's significant coefficients span more than three scan positions,
+spec 7.3.8.11 codes no `coeff_sign_flag` for the lowest-frequency one: the decoder
+takes that sign from the parity of the sub-block's absolute levels, an odd sum
+meaning negative. The encoder wrote the sign anyway, so the decoder read a bin
+that was never coded for it and everything after was misaligned.
+
+Two halves, and both are needed. `encodeResidualCoding` now skips the sign, and
+`hideSignParity` makes the parity say what the sign was — moving one level by a
+step when it does not already. It only ever *increases* a magnitude: by then every
+`sig_coeff_flag` of the sub-block has been written, and a decrement could reach
+zero and leave the significance map, `firstScanPos`, `lastScanPosInSb` and hence
+the decision to hide a sign at all disagreeing with what was coded. Which
+coefficient it picks hardly matters for distortion — every coefficient of a
+transform block shares one quantizer step here, so a step on any single one costs
+the same, and the dead-zone quantizer biases levels low so increasing tends to
+move toward the unquantized value. HM does a rate-distortion search instead, which
+would need the pre-quantization coefficients threaded into the residual writer for
+a gain of at most one step on one coefficient.
+
+The adjustment happens *inside* `encodeResidualCoding`, which now modifies its
+`levels` argument in place, because the caller reconstructs from that same slice
+straight afterwards. Reconstructing from the levels as handed in would predict
+later blocks from samples no decoder will ever have.
+
+Measured, before and after, on the two new fixtures with the two patterns dense
+enough to reach the path:
+
+| | honoured | ignored (before) |
+|---|---|---|
+| `patDiagonal` | max delta 3, mean 0.14 | max delta 217, mean 11.7 |
+| `patSMPTEText` | max delta 5, mean 0.34 | max delta 220, mean 35.6 |
+
+and against the constant-QP fixture the desynchronisation was bad enough that the
+slice terminated early and `pkg/decoder` refused the picture outright — "covered
+by 20 CTBs, expected 72". All four combinations are now bit-exact against FFmpeg.
+
+**Most of what this generator makes cannot reach sign hiding**, which is worth
+recording because it is what made the gap invisible and what would make a test
+vacuous. A flat CTU predicted from a uniform edge leaves a constant residual, and
+the transform of a constant is one DC coefficient, so the span is zero. Measured
+over every pattern, QP 4 to 40: `patFlat`, `patTiles` and `patSMPTE` never exceed
+a span of 0; `patSMPTEText` and `patDiagonal` reach 9 with a 16x16 CU and only 3
+with 8x8 CUs. So sign hiding fires only on those two patterns at `minCb` 16 — 32
+and 36 sub-blocks respectively, of which 18 and 20 need a parity adjustment.
+`TestSignHidingFiresOnlyOnDenseContent` asserts both directions, so the tests
+cannot quietly stop exercising the feature.
+
+**And a note on what the two-decoder comparison cannot see.** Omitting the right
+sign but leaving the parity wrong is a well-formed bitstream: FFmpeg and
+`pkg/decoder` read it identically, both arriving at the same wrong sign, and the
+FFmpeg comparison passes. Only the check against the source pattern fails.
+Verified by breaking exactly that. This is the third time in this stretch of work
+that agreement between two decoders was not enough — the WPP byte alignment
+(0.17) and the ragged-width shear (0.19) were the others.
+
 ### 0.10 Real-world content decoding (L) — **fixed**
 
 x265 output was not bit-exact, and got worse with detail and scale: a 720p
@@ -1035,9 +1096,10 @@ Everything through Phase 3 is done, plus 4.1 and 4.3. Remaining, smallest first:
   an intra-plus-freeze one.
 - **Encoder-side conformance window** (in 0.8) — the decoder applies one; the
   generator still rejects dimensions finer than a multiple of 8.
-- **`sign_data_hiding_enabled_flag` and the PPS chroma QP offsets from an
-  external PPS** (found in 0.18) — ignored rather than refused by the grid IDR
-  writer, which is what still stands between it and a default-settings x265 PPS.
+- **The PPS chroma QP offsets from an external PPS** (found in 0.18) — a non-zero
+  `pps_cb_qp_offset` or `pps_cr_qp_offset` is ignored rather than refused: the
+  chroma path derives its QP from the luma QP alone. Sign data hiding, the other
+  half of that entry, is done in 0.20.
 - **5.1 high bit depth decoding** (L) — the real differentiator, and the one item
   that makes hi265 clearly ahead of hi264 rather than level with it. `hi265gray`
   already generates 4:2:0/4:2:2/4:4:4 at 8/10/12-bit, but the decoder is 8-bit

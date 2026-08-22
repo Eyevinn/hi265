@@ -162,6 +162,21 @@ func splitCuCtxInc(depths *cuDepths, x0, y0, depth int) int {
 	return ctxInc
 }
 
+// codingOptions are the PPS switches that change what a slice's data has to
+// contain, as opposed to how the picture is carved up. The zero value is what the
+// parameter sets this package generates itself ask for: neither switch set.
+type codingOptions struct {
+	// minCuQpDeltaSize is the quantization group size in luma samples,
+	// CtbSizeY >> diff_cu_qp_delta_depth, or zero when the PPS leaves
+	// cu_qp_delta_enabled_flag clear and no cu_qp_delta is written at all.
+	minCuQpDeltaSize int
+	// signDataHiding mirrors sign_data_hiding_enabled_flag: in a sub-block whose
+	// significant coefficients span more than three scan positions, the sign of
+	// the lowest-frequency one is not coded and the parity of the absolute levels
+	// carries it instead.
+	signDataHiding bool
+}
+
 // quantGroups tracks where cu_qp_delta_abs has to be written. A quantization
 // group is the area that shares one cu_qp_delta: spec 7.3.8.4 clears
 // IsCuQpDeltaCoded at every coding quadtree node whose block is at least
@@ -287,10 +302,8 @@ type idrSliceParams struct {
 	height   int
 	qp       int
 	use8x8CU bool
-	// minCuQpDeltaSize is the quantization group size in luma samples,
-	// CtbSizeY >> diff_cu_qp_delta_depth, or zero when the PPS leaves
-	// cu_qp_delta_enabled_flag clear and no cu_qp_delta is written at all.
-	minCuQpDeltaSize                int
+	// opts carries the PPS switches that change what the slice data contains.
+	opts                            codingOptions
 	ppsID                           uint32
 	numExtraSliceHeaderBits         uint8
 	outputFlagPresent               bool
@@ -405,9 +418,9 @@ func idrSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) idrSliceParams {
 	// The quantization group, when the PPS asks for one. diff_cu_qp_delta_depth
 	// is bounded by log2_diff_max_min_luma_coding_block_size, so the group is
 	// never smaller than a minimum-size CU nor larger than a CTB.
-	minCuQpDeltaSize := 0
+	opts := codingOptions{signDataHiding: pps.SignDataHidingEnabledFlag}
 	if pps.CuQpDeltaEnabledFlag {
-		minCuQpDeltaSize = 1 << (log2CtbSize - int(pps.DiffCuQpDeltaDepth))
+		opts.minCuQpDeltaSize = 1 << (log2CtbSize - int(pps.DiffCuQpDeltaDepth))
 	}
 
 	return idrSliceParams{
@@ -415,7 +428,7 @@ func idrSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) idrSliceParams {
 		height:                          int(sps.PicHeightInLumaSamples),
 		qp:                              qp,
 		use8x8CU:                        minCbSize == 8,
-		minCuQpDeltaSize:                minCuQpDeltaSize,
+		opts:                            opts,
 		ppsID:                           pps.PicParameterSetID,
 		numExtraSliceHeaderBits:         pps.NumExtraSliceHeaderBits,
 		outputFlagPresent:               pps.OutputFlagPresentFlag,
@@ -483,7 +496,7 @@ func encodeIDRSliceWithParams(p idrSliceParams, y, cb, cr []uint8) []byte {
 	// The slice data has to exist before the header can describe it: its
 	// substream lengths are the entry point offsets.
 	subs := encodeIDRSliceData(p.seg, p.width, p.height, p.qp, p.use8x8CU,
-		p.minCuQpDeltaSize, y, cb, cr)
+		p.opts, y, cb, cr)
 	p.seg.writeEntryPointOffsets(w, subs)
 
 	// byte_alignment
@@ -510,9 +523,9 @@ func encodeIDRSlice(seg segment, width, height, qp int, use8x8CU bool, y, cb, cr
 	w.WriteSE(0) // slice_qp_delta = 0 (PPS init_qp_minus26 = qp-26)
 	// Deblocking disabled in PPS → no deblock syntax
 	// loop_filter_across_slices_enabled_flag: not present (PPS flag is 0 and deblock is disabled)
-	// The generated PPS leaves cu_qp_delta_enabled_flag clear, so there are no
-	// quantization groups to write a delta for.
-	subs := encodeIDRSliceData(seg, width, height, qp, use8x8CU, 0, y, cb, cr)
+	// The generated PPS sets neither cu_qp_delta_enabled_flag nor
+	// sign_data_hiding_enabled_flag, so the zero value is what this slice wants.
+	subs := encodeIDRSliceData(seg, width, height, qp, use8x8CU, codingOptions{}, y, cb, cr)
 	seg.writeEntryPointOffsets(w, subs)
 
 	// byte_alignment
@@ -530,7 +543,7 @@ func encodeIDRSlice(seg segment, width, height, qp int, use8x8CU bool, y, cb, cr
 // quadtree into four independently predicted 8x8 CUs (SPS minCbSize = 8),
 // otherwise the CTU is one 16x16 CU (SPS minCbSize = 16).
 func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool,
-	minCuQpDeltaSize int, y, cb, cr []uint8) [][]byte {
+	opts codingOptions, y, cb, cr []uint8) [][]byte {
 
 	lay := chooseCodingLayout(width, height, use8x8CU)
 	ctuSize := lay.ctuSize
@@ -543,7 +556,7 @@ func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool,
 	reconFrame := frame.NewFrame(width, height)
 	modes := newIntraModes()
 	depths := newCuDepths(width, height, lay.minCbSize)
-	qg := newQuantGroups(minCuQpDeltaSize)
+	qg := newQuantGroups(opts.minCuQpDeltaSize)
 
 	return seg.encodeCtbs(ctuSize, context.SliceTypeI, qp,
 		func(enc *cabac.Encoder, models []cabac.CtxState, ctuX, ctuY int) {
@@ -551,7 +564,7 @@ func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool,
 				width, height, depths, qg,
 				func(x0, y0, cuSize int) {
 					encodeIDRCU(enc, models, x0, y0, cuSize, ctuSize, lay.minCbSize,
-						width, height, qp, y, cb, cr, reconFrame, modes, qg)
+						width, height, qp, y, cb, cr, reconFrame, modes, qg, opts.signDataHiding)
 				})
 		})
 }
@@ -562,7 +575,8 @@ func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool,
 // the CTB boundary rule in the MPM derivation.
 func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 	cuX, cuY, cuSize, ctuSize, minCbSize, width, height, qp int,
-	y, cb, cr []uint8, reconFrame *frame.Frame, modes *intraModes, qg *quantGroups) {
+	y, cb, cr []uint8, reconFrame *frame.Frame, modes *intraModes, qg *quantGroups,
+	signDataHiding bool) {
 
 	// split_cu_flag is written by the caller.
 	// No pred_mode_flag (I-slice, implicitly intra)
@@ -650,7 +664,7 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 	// Encode residual if any cbf is set
 	if cbfLuma {
 		scanIdx := slice.ScanIdxForIntraMode(lumaMode, log2TrSize, true)
-		encodeResidualCoding(enc, models, lumaLevels, log2TrSize, true, scanIdx)
+		encodeResidualCoding(enc, models, lumaLevels, log2TrSize, true, scanIdx, signDataHiding)
 	}
 
 	// Reconstruct luma
@@ -675,7 +689,7 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 			chromaLevels := computeChromaLevels(cuX, cuY, cuSize, width,
 				chromaSrc, qp, chromaMode, reconFrame, comp)
 			encodeResidualCoding(enc, models, chromaLevels, log2ChromaTrSize, false,
-				chromaScanIdx)
+				chromaScanIdx, signDataHiding)
 			reconstructChroma(reconFrame, comp, cuX/2, cuY/2, chromaTrSize,
 				width/2, height/2, chromaMode, chromaLevels, qp)
 		} else {

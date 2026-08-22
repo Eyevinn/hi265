@@ -24,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Sign data hiding (encoder)
+- `pkg/encode` honours `sign_data_hiding_enabled_flag`, which x265 sets by
+  default. Where a sub-block's significant coefficients span more than three scan
+  positions, the sign of the lowest-frequency one is no longer coded and the parity
+  of the sub-block's absolute levels carries it instead (spec 7.3.8.11), one level
+  moving by a step where the parity does not already agree. The flag used to be
+  ignored, which desynchronised CABAC from the first such sub-block: the same
+  streams came out at max delta 217 against their source, or were refused outright
+  by `pkg/decoder`. Together with cu_qp_delta this leaves only the PPS chroma QP
+  offsets unhandled from a default-settings x265 PPS.
+
 #### cu_qp_delta (encoder)
 - `pkg/encode` writes `cu_qp_delta_abs` where a PPS with
   `cu_qp_delta_enabled_flag` set requires it: at the first transform unit of each
