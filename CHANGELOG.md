@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the slice segment, and the SAO merge flags gated on the neighbour being in the
   same tile and segment. Several tiles in one slice segment, dependent
   slice segments and WPP across several segments are refused with a clear error.
+- Several tiles in one slice segment, reached through entry point offsets — what
+  `kvazaar --tiles` emits by default, and most encoders with it. Each tile is its
+  own CABAC substream, and three things restart at its first CTB: the contexts
+  (spec 9.3.1), `qPY_PREV` (8.6.1), and neighbour availability, since nothing in
+  an earlier tile may be predicted from (6.4.1). Tiles combined with wavefront
+  parallel processing is refused: no HEVC profile allows it.
 - Loop filters that stop at tile and slice boundaries: with
   `loop_filter_across_tiles_enabled_flag` equal to 0 neither deblocking nor SAO
   reaches across a tile edge, and the same holds at a slice edge whose

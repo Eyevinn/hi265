@@ -215,3 +215,28 @@ func TestDecodeTilesSao2x2_128x128(t *testing.T) {
 	testGolden(t, "../../testdata/tiles_2x2_sao_128x128.265",
 		"../../testdata/golden/tiles_2x2_sao_128x128.yuv", 128, 128)
 }
+
+// Several tiles in one slice segment, reached through entry point offsets —
+// kvazaar's default when tiles are enabled, and what most encoders emit. Each
+// tile is its own CABAC substream: the contexts are re-initialised, QP
+// prediction restarts and no earlier tile is available for prediction.
+func TestDecodeTilesMultiPerSegment2x2_128x128(t *testing.T) {
+	testGolden(t, "../../testdata/tiles_multi_2x2_128x128.265",
+		"../../testdata/golden/tiles_multi_2x2_128x128.yuv", 128, 128)
+}
+
+// The same shape with both loop filters on. One slice covers every tile here,
+// so slice_loop_filter_across_slices_enabled_flag cannot protect a seam — this
+// is the vector that pins the tile rule on its own.
+func TestDecodeTilesMultiPerSegmentFilters2x2_128x128(t *testing.T) {
+	testGolden(t, "../../testdata/tiles_multi_filters_2x2_128x128.265",
+		"../../testdata/golden/tiles_multi_filters_2x2_128x128.yuv", 128, 128)
+}
+
+// A delta-QP map makes cu_qp_delta live, which is what makes the per-tile reset
+// of qPY_PREV (spec 8.6.1) observable: without it the predicted QP walks in from
+// the previous tile and every coefficient dequantises against the wrong step.
+func TestDecodeTilesMultiPerSegmentQP2x2_128x128(t *testing.T) {
+	testGolden(t, "../../testdata/tiles_multi_qp_2x2_128x128.265",
+		"../../testdata/golden/tiles_multi_qp_2x2_128x128.yuv", 128, 128)
+}

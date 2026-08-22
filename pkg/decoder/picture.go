@@ -75,10 +75,17 @@ func (d *Decoder) startPicture(seg *sliceSegment) error {
 // per-segment. Spec 6.4.1 makes a neighbour unavailable when it lies in another
 // slice or another tile, and the map is what the intra prediction availability
 // test consults; a sample reconstructed by an earlier segment must not be
-// predicted from even though it sits in this same buffer.
+// predicted from even though it sits in this same buffer. Reconstruction clears
+// it again at every tile boundary inside the segment, for the same reason.
 func (p *picture) startSegment() {
-	for i := range p.f.LumaDecoded {
-		p.f.LumaDecoded[i] = false
+	clearAvailability(p.f)
+}
+
+// clearAvailability marks every sample of the picture as not-yet-reconstructed
+// for the purpose of neighbour availability. The samples themselves stay put.
+func clearAvailability(f *frame.Frame) {
+	for i := range f.LumaDecoded {
+		f.LumaDecoded[i] = false
 	}
 }
 

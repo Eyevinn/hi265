@@ -142,6 +142,16 @@ func newQpState(sliceQPY, picW, picH, minCbSize int) *qpState {
 	}
 }
 
+// resetToSliceQP restarts QP prediction from SliceQpY, which spec 8.6.1 requires
+// at the first quantization group of a slice, of a tile, and of a CTB row when
+// wavefront parallel processing is on.
+func (q *qpState) resetToSliceQP(sliceQPY int) {
+	q.currentQP = sliceQPY
+	q.qpYPrev = sliceQPY
+	q.qpYPred = sliceQPY
+	q.isCuQpDeltaCoded = false
+}
+
 // qpAt returns the QP of the decoded block covering (x, y), or -1.
 func (q *qpState) qpAt(x, y int) int {
 	if x < 0 || y < 0 {
@@ -220,13 +230,12 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 		return nil, fmt.Errorf("slice_segment_address %d outside a picture of %d CTBs",
 			p.SegmentAddressRS, numCTUs)
 	}
-	// A slice segment that spans several tiles carries one substream per tile
-	// and resets the CABAC contexts at each tile's first CTB. That is not
-	// implemented; every tiled stream this decoder targets puts one tile in one
-	// slice segment, where the reset at the segment boundary does the same job.
-	if grid.NumTiles() > 1 && len(p.EntryPoints) > 0 {
-		return nil, fmt.Errorf("slice segment spanning several tiles (%d entry point offsets) is not supported",
-			len(p.EntryPoints))
+	// Tiles and wavefront parallel processing together would make each CTB row
+	// of each tile its own substream, with the context snapshot coming from the
+	// row above within the same tile. No HEVC profile allows the combination
+	// (kvazaar calls it experimental), so it is refused rather than guessed at.
+	if grid.NumTiles() > 1 && p.EntropyCodingSyncEnabled {
+		return nil, fmt.Errorf("tiles combined with wavefront parallel processing is not supported")
 	}
 
 	sd := &SliceData{SaoParams: p.SaoParams}
@@ -255,7 +264,11 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 	if wpp && p.SegmentAddressRS != 0 {
 		return nil, fmt.Errorf("wavefront parallel processing in a picture of several slice segments is not supported")
 	}
-	substreams, err := splitSubstreams(cabacData, p.EntryPoints, wpp, ctbsY)
+	if wpp && len(p.EntryPoints)+1 != ctbsY {
+		return nil, fmt.Errorf("WPP: %d entry point offsets for %d CTU rows",
+			len(p.EntryPoints), ctbsY)
+	}
+	substreams, err := splitSubstreams(cabacData, p.EntryPoints)
 	if err != nil {
 		return nil, err
 	}
@@ -270,12 +283,40 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 	// The segment covers a run of consecutive tile scan addresses starting at
 	// its own, and ends when end_of_slice_segment_flag says so.
 	firstTs := grid.RsToTs(p.SegmentAddressRS)
+	// substream indexes into substreams; tile tracks which tile the previous CTB
+	// belonged to, so the first CTB of the next one can be recognised.
+	substream := 0
+	tile := grid.TileIDOfRs(p.SegmentAddressRS)
 
 	for ts := firstTs; ts < numCTUs; ts++ {
 		ctbAddrRS := grid.TsToRs(ts)
 		ctbX := (ctbAddrRS % ctbsX) * ctbSize
 		ctbY := (ctbAddrRS / ctbsX) * ctbSize
 		row := ctbAddrRS / ctbsX
+
+		// A tile boundary inside this slice segment. Each tile of the segment is
+		// its own substream, reached through an entry point offset, and it starts
+		// from a clean slate: the CABAC contexts are re-initialised rather than
+		// carried over (spec 9.3.1), QP prediction restarts from SliceQpY
+		// (8.6.1), and nothing decoded in an earlier tile is available for
+		// prediction (6.4.1).
+		if t := grid.TileIDOfRs(ctbAddrRS); t != tile {
+			tile = t
+			substream++
+			if substream >= len(substreams) {
+				return nil, fmt.Errorf(
+					"tiles: no substream for the tile at CTB %d; the segment carries %d entry point offsets",
+					ctbAddrRS, len(p.EntryPoints))
+			}
+			dec, err = cabac.NewDecoder(substreams[substream])
+			if err != nil {
+				return nil, fmt.Errorf("tiles: init CABAC for the tile at CTB %d: %w", ctbAddrRS, err)
+			}
+			ctxModels = context.InitModels(p.SliceType, p.SliceQPY)
+			qps.resetToSliceQP(p.SliceQPY)
+			modeMap.reset()
+			depthMap.reset()
+		}
 
 		if wpp && ctbAddrRS%ctbsX == 0 && row > 0 {
 			// Start of a CTU row: open its substream and take the context state
@@ -288,15 +329,13 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 			if err != nil {
 				return nil, fmt.Errorf("WPP: init CABAC for CTU row %d: %w", row, err)
 			}
+			substream = row
 			if syncModels != nil {
 				ctxModels = append(ctxModels[:0], syncModels...)
 			} else {
 				ctxModels = context.InitModels(p.SliceType, p.SliceQPY)
 			}
-			qps.currentQP = p.SliceQPY
-			qps.qpYPrev = p.SliceQPY
-			qps.qpYPred = p.SliceQPY
-			qps.isCuQpDeltaCoded = false
+			qps.resetToSliceQP(p.SliceQPY)
 		}
 
 		// Decode SAO parameters for this CTU. The merge flags are only coded
@@ -334,29 +373,36 @@ func DecodeSliceData(cabacData []byte, p Params) (*SliceData, error) {
 		if endOfSlice == 1 {
 			break
 		}
-		// With WPP the row ends with end_of_subset_one_bit followed by byte
-		// alignment, but the next row is reached through its entry point, so
-		// those trailing bits are simply left behind with the substream.
+		// A row under WPP, and a tile within a segment, both end with
+		// end_of_subset_one_bit followed by byte alignment. The next substream is
+		// reached through its entry point, so those trailing bits are simply left
+		// behind with the one that ended.
+	}
+
+	// Every substream the header announced belongs to this segment, so any left
+	// over means the segment ended earlier than its entry points describe.
+	if substream != len(substreams)-1 {
+		return nil, fmt.Errorf("slice segment used %d of its %d substreams",
+			substream+1, len(substreams))
 	}
 
 	return sd, nil
 }
 
-// splitSubstreams divides the slice data at the entry point offsets. Without
-// WPP the whole slice is one substream.
-func splitSubstreams(cabacData []byte, entryPoints []int, wpp bool, ctbsY int) ([][]byte, error) {
-	if !wpp {
+// splitSubstreams divides the slice data at the entry point offsets. A segment
+// with no entry points is a single substream. The offsets mean the same thing
+// for tiles as for wavefront parallel processing — where the next substream
+// begins — only what happens at that point differs: a tile re-initialises the
+// CABAC contexts, a WPP row inherits them from the row above.
+func splitSubstreams(cabacData []byte, entryPoints []int) ([][]byte, error) {
+	if len(entryPoints) == 0 {
 		return [][]byte{cabacData}, nil
-	}
-	if len(entryPoints)+1 != ctbsY {
-		return nil, fmt.Errorf("WPP: %d entry point offsets for %d CTU rows",
-			len(entryPoints), ctbsY)
 	}
 	subs := make([][]byte, 0, len(entryPoints)+1)
 	start := 0
 	for _, ep := range entryPoints {
 		if ep <= start || ep > len(cabacData) {
-			return nil, fmt.Errorf("WPP: entry point %d outside slice data of %d bytes",
+			return nil, fmt.Errorf("entry point %d outside slice data of %d bytes",
 				ep, len(cabacData))
 		}
 		subs = append(subs, cabacData[start:ep])
@@ -1535,6 +1581,14 @@ func newCuDepthMap(picW, picH, minCbSize int) *cuDepthMap {
 	return &cuDepthMap{depths: depths, minCbSize: minCbSize, widthMinCb: w}
 }
 
+// reset marks every block unavailable again, which is what crossing into a new
+// tile means: spec 6.4.1 allows no neighbour from another tile.
+func (m *cuDepthMap) reset() {
+	for i := range m.depths {
+		m.depths[i] = -1
+	}
+}
+
 // set stores the depth for all minCb blocks covered by the CU at (x0,y0) of given
 // size. Writes outside the map are dropped rather than panicking, so a malformed
 // stream cannot take the decoder down.
@@ -1576,6 +1630,13 @@ func newIntraModeMap(picW, picH int) *intraModeMap {
 		modes[i] = -1 // unavailable
 	}
 	return &intraModeMap{modes: modes, width4: w}
+}
+
+// reset marks every block unavailable again; see cuDepthMap.reset.
+func (m *intraModeMap) reset() {
+	for i := range m.modes {
+		m.modes[i] = -1
+	}
 }
 
 // set stores a mode for all 4x4 blocks within the PU at (x0, y0) of given size.

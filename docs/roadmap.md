@@ -250,9 +250,8 @@ Verified bit-exact against FFmpeg on flat content, all with WPP on:
 | x265 defaults (WPP + SAO + sign hiding + 32x32 TBs), 256x192 | exact |
 | x265 defaults, 1280x720 | exact |
 
-**Tiles** were left for later here, and are done as of 0.13. The per-tile CABAC
-reset, needed only when one slice segment spans several tiles, is still missing
-and refused with a clear error.
+**Tiles** were left for later here, and are done as of 0.13 — including the
+per-tile CABAC reset for a slice segment that spans several tiles.
 
 ### 0.11 Chroma QP table was off by one at qPi 34 (S) — **fixed**
 
@@ -281,7 +280,7 @@ its items T1–T4b. Before this, every tiled stream failed on its *second* slice
 segment with `slice header: expected stop bit 1, got 0`, because
 `slice_segment_address` was never read.
 
-Six things landed, the first five in that order out of necessity rather than
+Seven things landed, the first five in that order out of necessity rather than
 taste:
 
 1. **A picture from several slice segments.** `first_slice_segment_in_pic_flag`
@@ -326,8 +325,18 @@ taste:
    x265 varies it per frame, so in `grid.265` it is 1 in three pictures and 0 in
    two, verbatim through the stitch.
 
-Measured with kvazaar (`--tiles WxH --slices tiles`, the one shape x265 cannot
-produce) and with `hevc-retiler` output:
+7. **Several tiles in one slice segment**, which is what `kvazaar --tiles` emits
+   by default and what most encoders do — the retiler's one-slice-per-tile shape
+   is the unusual one. Each tile of the segment is a substream reached through an
+   entry point offset, and three things reset at its first CTB: the CABAC
+   contexts (spec 9.3.1), `qPY_PREV` (8.6.1), and neighbour availability, since
+   nothing in an earlier tile may be predicted from (6.4.1). All three are
+   load-bearing and each is pinned by a committed vector — the QP one needed a
+   delta-QP map to become observable at all, since without `cu_qp_delta` the
+   predicted QP never moves.
+
+Measured with kvazaar (`--tiles WxH [--slices tiles]`, the shape x265 cannot
+produce at all) and with `hevc-retiler` output:
 
 | stream | before | after T1–T4 | after T5 |
 |---|---|---|---|
@@ -336,6 +345,7 @@ produce) and with `hevc-retiler` output:
 | tiled with deblocking on, 256x256 | header error | 1 972 differ | **exact** |
 | retiler `merged`, `grid`, `h`, `nu` (5 frames each) | header error | 2 871–14 651 differ | **exact** |
 | the same streams' standalone inputs | exact | exact | exact |
+| several tiles per segment: filters off, deblocking, SAO, both, non-equal 2x1, delta-QP | refused | refused | **exact** |
 
 The middle column's differences all sat within the loop filter's reach of a tile
 seam and nowhere else, which is what identified the remaining work as exactly
@@ -346,14 +356,14 @@ The check the caller cares about now runs without ffmpeg: each tile's
 sub-rectangle of a merged picture equals that input's standalone decode under
 hi265 alone, every frame. That is `retile -verify`'s whole test.
 
-Still outstanding, all three refused with a clear error rather than
-mis-decoded: several tiles in one slice segment (needs the per-tile CABAC reset
-and per-tile `qPY_PREV` reset), dependent slice segments, and WPP combined with
-several segments.
+Still outstanding, all refused with a clear error rather than mis-decoded:
+dependent slice segments, WPP combined with several slice segments, and tiles
+combined with WPP — the last of which no HEVC profile permits, so it is
+deliberate rather than pending.
 
-Five golden vectors — three unfiltered, one per loop filter — plus unit tests
-for the scan tables and the boundary rules came with it;
-`tools/gen_tiles_bitstreams.sh` regenerates the vectors.
+Eight golden vectors — five with one slice segment per tile, three with every
+tile in one segment — plus unit tests for the scan tables and the boundary
+rules; `tools/gen_tiles_bitstreams.sh` regenerates them all.
 
 ### 0.10 Real-world content decoding (L) — **fixed**
 
@@ -700,9 +710,9 @@ Everything through Phase 3 is done, plus 4.1 and 4.3. Remaining, smallest first:
   gridimg directive, so the helpers exist.
 - **`hi265gen -cra-interval`** (in 1.3) — CRA keyframes instead of IDR, with POC
   running continuously. The slice encoding it needs is already there.
-- **Tiles: several tiles in one slice segment** (in 0.13, T6) — needs the
-  per-tile CABAC context reset and the per-tile `qPY_PREV` reset; dependent slice
-  segments are the other refused shape. Everything else about tiles is bit-exact,
+- **Dependent slice segments** (in 0.13) — the last refused slice shape that a
+  real encoder emits: x265 `--slices N` and kvazaar `--slices wpp` both pair them
+  with WPP. Everything else about tiles is bit-exact, both tiling shapes and both
   loop filters included.
 - **Refusing inter CUs the decoder cannot reconstruct** (tiles document, T8) — a
   P slice that is not all zero-motion skip decodes to garbage with no error,
