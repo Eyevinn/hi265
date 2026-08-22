@@ -38,6 +38,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or another tile is unavailable, replacing a comparison of raster CTB addresses
   that granted availability across both.
 
+#### Refusing what cannot be decoded
+- A P or B picture with real motion is refused, naming the CU that stopped it,
+  instead of decoding to a plausible-looking wrong picture: `pred_mode_flag` is
+  parsed, and an inter CU that is not a zero-motion skip errors. Only zero-motion
+  skip CUs are reconstructed, and previously such a stream produced no error at
+  all.
+- `cu_skip_flag`'s context counts how many of the left and above neighbours were
+  themselves skipped (spec 9.3.4.2.2) rather than whether those positions are
+  inside the picture — the old form agrees with the spec only for all-skip content
+  in a single slice without tiles.
+- `pred_weight_table` is parsed rather than skipped. x265 enables weighted
+  prediction by default, so a default-settings P slice carries the table, and
+  skipping it left the reader mid-header with the entry point offsets that follow
+  reading as garbage. A slice that signals an actual weight is refused; one with
+  default weights decodes on. `ref_pic_lists_modification` is likewise refused
+  when `NumPocTotalCurr` says it is present.
+
 #### Slice segments
 - Dependent slice segments: a slice is one independent segment plus any number of
   dependent ones, and the dependent kind carries only its address. The CABAC

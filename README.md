@@ -41,8 +41,10 @@ substreams, and dependent segments that continue the slice before them. Tiles
 combined with wavefront parallel processing is refused with a clear error rather
 than mis-decoded — no HEVC profile permits it.
 
-Not supported: P/B frames with real motion (only zero-motion skip, so inter
-pictures beyond a freeze are out of scope).
+Not supported: P/B frames with real motion. Only zero-motion skip CUs are
+reconstructed, so inter pictures beyond a freeze are out of scope — and such a
+stream is refused with a message naming the CU that stopped it, rather than
+decoded into a plausible-looking wrong picture.
 
 ## Build & Test
 
@@ -109,7 +111,7 @@ go run ./cmd/hi265dec -colorspace bt709 input.265 out.png
 > x265 configurations. Tiles decode exactly as well, in both slice shapes and
 > with both loop filters. Not supported: P/B frames with real
 > motion — only zero-motion skip is implemented, so inter pictures beyond a
-> freeze are out of scope.
+> freeze are out of scope and are refused rather than mis-decoded.
 
 ### hi265-mp4-extend — Extend a CMAF segment with empty frames
 

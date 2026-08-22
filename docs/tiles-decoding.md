@@ -1,6 +1,6 @@
 # Tiles decoding in `pkg/decoder`
 
-**Status:** T1–T6 implemented; T7's remaining fixtures and T8 outstanding.
+**Status:** T1–T6 and T8 implemented; T7's remaining fixtures outstanding.
 Both tiling shapes — one slice segment per tile, and every tile in one segment —
 decode bit-exactly, loop filters included. Sizes use the roadmap's scale —
 **S** ≈ half a day, **M** ≈ 1–2 days, **L** ≈ 3+ days.
@@ -63,7 +63,7 @@ The last row is the reason T8 exists.
 | kvazaar tiled, deblocking on | **bit-exact** (was 1 972) |
 | retiler `merged` (2x1), `grid` (2x2), `h` (1024x256), `nu` (non-uniform) | **bit-exact**, all 5 frames each (was 2 871 – 14 651) |
 | retiler all-intra inputs; kvazaar non-tiled controls | **bit-exact** — no regression |
-| `pa`, `p0` | unchanged: still no error, still wrong (T8) |
+| `pa`, `p0` | **refused** as of T8, naming the first inter CU; they used to decode wrong in silence |
 
 T6 added the other tiling shape, every tile in a single slice segment, and it is
 bit-exact across the same range: filters off, deblocking on, SAO on, both on, a
@@ -132,7 +132,7 @@ picture edge, which is the whole basis of the stitching being valid.
 | neighbour availability | **done (T4, T6)** — `buildRefSamples` asks the reconstruction map, which is cleared at every slice segment *and* every tile boundary; the intra mode and CU depth maps reset with it. |
 | SAO merge flag gating | **done (T4b)** — gated on same segment and same tile. |
 | loop filters | **done (T5)** — `deblock.Apply` and `sao.Apply` run once per picture in `finishPicture` and take an `internal/loopfilter.Boundaries`, which knows each CTB's tile and slice and each slice's filter parameters. |
-| inter CUs beyond zero-motion skip | **silently wrong (T8)** — no error, no motion compensation. |
+| inter CUs beyond zero-motion skip | **refused (T8)** — `pred_mode_flag` is parsed and an inter CU that is not a zero-motion skip errors with its position. |
 
 ## Work items
 
@@ -416,12 +416,29 @@ and returns a picture with **no error at all**: `pa.265` above is bit-exact on
 its IDR and then 62 %, 82 %, 87 %, 90 % of bytes wrong on frames 1–4. A caller
 cannot tell that apart from a successful decode.
 
-Two things to add:
+**Status: done**, and it found more than expected. Three things landed:
 
-- `pred_mode_flag` — parse it, and error on any inter CU that is not a
-  zero-motion skip, naming the CU position.
-- The same for the header fields the parser currently assumes away
-  (`ref_pic_lists_modification`, `pred_weight_table`).
+- `pred_mode_flag` is parsed, and an inter CU that is not a zero-motion skip is
+  refused with its position. `cu_skip_flag`'s context came with it: it now counts
+  how many of the left and above neighbours were themselves skipped
+  (spec 9.3.4.2.2) instead of asking whether those positions are inside the
+  picture. The old approximation agreed with the spec only for all-skip content
+  in a single slice, which is exactly what the tests contained.
+- `pred_weight_table` is parsed rather than skipped. x265 turns weighted
+  prediction **on by default**, so every default-settings P slice carries the
+  table, and skipping it left the reader mid-header: the entry point offsets that
+  follow read as garbage. A stream that signals no actual weight decodes on,
+  since default weights predict the plain reference sample; one that signals a
+  weight is refused.
+- `ref_pic_lists_modification` is refused when `NumPocTotalCurr` says the syntax
+  is present, which meant counting `NumPocTotalCurr` from the reference picture
+  set — for the inline set and for one taken from the SPS.
+
+What this bought, on `testdata/hevc_1idr_1p.mp4` — a real 720p x265 encode
+committed to this repo: its IDR now decodes bit-exactly, and its P picture is
+refused at the inter CU at (304,120) rather than at the first CTU of a
+misparsed header. That file is in the roadmap's 0.10 table as decoding
+"exact"; that claim was only ever true of its first picture.
 
 This matters more than it looks for `retile -verify`. Zero-motion copy is
 translation-invariant within a tile, so a hi265 that ignores motion vectors
@@ -463,9 +480,11 @@ tile — only arises for P/B inputs, and `hevc-retiler`'s `demo.sh` deliberately
 includes a negative scenario built from a non-motion-constrained encode that
 `verify` must reject. `pkg/decoder` reconstructs only zero-motion skip CUs, so
 kvazaar P-frames with real vectors are out of reach — measurably so, and
-silently, which is what T8 is for. A decoder that ignores motion vectors could
-compare *equal* on a genuinely non-MCTS stream and pass the negative test for
-the wrong reason.
+and it says so as of T8 rather than returning a wrong picture. That matters for
+the caller: a decoder that ignored motion vectors could compare *equal* on a
+genuinely non-MCTS stream and pass `retile -verify`'s negative test for the
+wrong reason. It now refuses instead, which is the only safe answer until real
+motion compensation exists.
 
 So the honest recommendation for the caller is a decoder selector rather than a
 replacement: use hi265 for all-intra scenarios, keep ffmpeg for P/B ones, and
@@ -490,10 +509,8 @@ What is left, in the order that makes each step verifiable:
    *slice* rather than per segment, and the loop filters see a dependent boundary
    as interior. Both `kvazaar --slices wpp` and `x265 --wpp --slices N` decode
    bit-exactly.
-2. **T8.** Half a day, independent of everything else, and it is where
-   `cu_skip_flag`'s context finally derives its increments from real availability
-   and the neighbours' skip flags rather than from `x0 > 0` / `y0 > 0` — which is
-   a P-slice change, so it belongs with T8 rather than with the tile work.
+2. ~~**T8.**~~ **Done** — see roadmap 0.15, including the `cu_skip_flag` context
+   and two header fields the parser used to assume away.
 3. **Encoder-side tiles.** `pkg/encode` refuses `TilesEnabledFlag` outright, so
    there is no gray CRA splice into a tiled stream, no `hi265-mp4-extend` on
    tiled content, and no in-repo tiled vectors. One slice segment per tile is
