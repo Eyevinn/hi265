@@ -175,6 +175,10 @@ type codingOptions struct {
 	// the lowest-frequency one is not coded and the parity of the absolute levels
 	// carries it instead.
 	signDataHiding bool
+	// chromaQPOffsets is what spec 8.6.1 adds to the luma QP before Table 8-10
+	// maps it to a chroma QP. Only pps_cb_qp_offset and pps_cr_qp_offset appear
+	// here: this encoder writes slice_cb_qp_offset and slice_cr_qp_offset as zero.
+	chromaQPOffsets transform.ChromaQPOffsets
 }
 
 // quantGroups tracks where cu_qp_delta_abs has to be written. A quantization
@@ -418,7 +422,13 @@ func idrSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS) idrSliceParams {
 	// The quantization group, when the PPS asks for one. diff_cu_qp_delta_depth
 	// is bounded by log2_diff_max_min_luma_coding_block_size, so the group is
 	// never smaller than a minimum-size CU nor larger than a CTB.
-	opts := codingOptions{signDataHiding: pps.SignDataHidingEnabledFlag}
+	opts := codingOptions{
+		signDataHiding: pps.SignDataHidingEnabledFlag,
+		chromaQPOffsets: transform.ChromaQPOffsets{
+			Cb: int(pps.CbQpOffset),
+			Cr: int(pps.CrQpOffset),
+		},
+	}
 	if pps.CuQpDeltaEnabledFlag {
 		opts.minCuQpDeltaSize = 1 << (log2CtbSize - int(pps.DiffCuQpDeltaDepth))
 	}
@@ -564,7 +574,7 @@ func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool,
 				width, height, depths, qg,
 				func(x0, y0, cuSize int) {
 					encodeIDRCU(enc, models, x0, y0, cuSize, ctuSize, lay.minCbSize,
-						width, height, qp, y, cb, cr, reconFrame, modes, qg, opts.signDataHiding)
+						width, height, qp, y, cb, cr, reconFrame, modes, qg, opts)
 				})
 		})
 }
@@ -576,7 +586,7 @@ func encodeIDRSliceData(seg segment, width, height, qp int, use8x8CU bool,
 func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 	cuX, cuY, cuSize, ctuSize, minCbSize, width, height, qp int,
 	y, cb, cr []uint8, reconFrame *frame.Frame, modes *intraModes, qg *quantGroups,
-	signDataHiding bool) {
+	opts codingOptions) {
 
 	// split_cu_flag is written by the caller.
 	// No pred_mode_flag (I-slice, implicitly intra)
@@ -640,12 +650,15 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 	log2TrSize := ceilLog2(cuSize)
 	log2ChromaTrSize := log2TrSize - 1
 
-	// cbf_cb at depth 0
-	cbfCb := hasNonZeroChroma(cuX, cuY, cuSize, width, cb, qp, lumaMode, reconFrame, 0)
+	// cbf_cb at depth 0. Cb and Cr are quantized at their own QPs, since the PPS
+	// carries an offset per component (spec 8.6.1).
+	cbfCb := hasNonZeroChroma(cuX, cuY, cuSize, width, cb, qp, lumaMode, reconFrame,
+		0, opts.chromaQPOffsets.For(0))
 	encBool(enc, &models[context.CtxCbfCb], cbfCb)
 
 	// cbf_cr at depth 0
-	cbfCr := hasNonZeroChroma(cuX, cuY, cuSize, width, cr, qp, lumaMode, reconFrame, 1)
+	cbfCr := hasNonZeroChroma(cuX, cuY, cuSize, width, cr, qp, lumaMode, reconFrame,
+		1, opts.chromaQPOffsets.For(1))
 	encBool(enc, &models[context.CtxCbfCr], cbfCr)
 
 	// Compute luma residual
@@ -664,7 +677,8 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 	// Encode residual if any cbf is set
 	if cbfLuma {
 		scanIdx := slice.ScanIdxForIntraMode(lumaMode, log2TrSize, true)
-		encodeResidualCoding(enc, models, lumaLevels, log2TrSize, true, scanIdx, signDataHiding)
+		encodeResidualCoding(enc, models, lumaLevels, log2TrSize, true, scanIdx,
+			opts.signDataHiding)
 	}
 
 	// Reconstruct luma
@@ -685,16 +699,17 @@ func encodeIDRCU(enc *cabac.Encoder, models []cabac.CtxState,
 		}
 		hasCbf := (comp == 0 && cbfCb) || (comp == 1 && cbfCr)
 
+		chromaQPOffset := opts.chromaQPOffsets.For(comp)
 		if hasCbf {
 			chromaLevels := computeChromaLevels(cuX, cuY, cuSize, width,
-				chromaSrc, qp, chromaMode, reconFrame, comp)
+				chromaSrc, qp, chromaMode, reconFrame, comp, chromaQPOffset)
 			encodeResidualCoding(enc, models, chromaLevels, log2ChromaTrSize, false,
-				chromaScanIdx, signDataHiding)
+				chromaScanIdx, opts.signDataHiding)
 			reconstructChroma(reconFrame, comp, cuX/2, cuY/2, chromaTrSize,
-				width/2, height/2, chromaMode, chromaLevels, qp)
+				width/2, height/2, chromaMode, chromaLevels, qp, chromaQPOffset)
 		} else {
 			reconstructChroma(reconFrame, comp, cuX/2, cuY/2, chromaTrSize,
-				width/2, height/2, chromaMode, nil, qp)
+				width/2, height/2, chromaMode, nil, qp, chromaQPOffset)
 		}
 	}
 }
@@ -783,10 +798,10 @@ func sortMPM(mpm [3]int) [3]int {
 
 // hasNonZeroChroma checks if the chroma residual has non-zero quantized coefficients.
 func hasNonZeroChroma(ctuX, ctuY, ctuSize, picWidth int, chromaSrc []uint8,
-	qp, lumaMode int, recon *frame.Frame, comp int) bool {
+	qp, lumaMode int, recon *frame.Frame, comp, chromaQPOffset int) bool {
 
 	chromaTrSize := ctuSize / 2
-	chromaQP := transform.ChromaQPFromLumaQP(qp)
+	chromaQP := transform.ChromaQP(qp, chromaQPOffset)
 	cx := ctuX / 2
 	cy := ctuY / 2
 
@@ -855,10 +870,10 @@ func computeLumaResidual(ctuX, ctuY, ctuSize, picWidth int, lumaSrc []uint8,
 
 // computeChromaLevels computes quantized chroma levels for encoding.
 func computeChromaLevels(ctuX, ctuY, ctuSize, picWidth int, chromaSrc []uint8,
-	qp, chromaMode int, recon *frame.Frame, comp int) []int32 {
+	qp, chromaMode int, recon *frame.Frame, comp, chromaQPOffset int) []int32 {
 
 	chromaTrSize := ctuSize / 2
-	chromaQP := transform.ChromaQPFromLumaQP(qp)
+	chromaQP := transform.ChromaQP(qp, chromaQPOffset)
 	cx := ctuX / 2
 	cy := ctuY / 2
 
@@ -971,9 +986,9 @@ func reconstructLuma(f *frame.Frame, x0, y0, size, picW, picH, mode int,
 
 // reconstructChroma reconstructs chroma pixels after encoding.
 func reconstructChroma(f *frame.Frame, comp, cx, cy, chromaTrSize, chromaW, chromaH,
-	mode int, levels []int32, qp int) {
+	mode int, levels []int32, qp, chromaQPOffset int) {
 
-	chromaQP := transform.ChromaQPFromLumaQP(qp)
+	chromaQP := transform.ChromaQP(qp, chromaQPOffset)
 	chromaPred := predictChromaBlock(f, comp, cx, cy, chromaTrSize, mode)
 
 	var residual []int32

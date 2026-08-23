@@ -40,7 +40,12 @@ func clip3(lo, hi, val int) int {
 // bounds carries the picture's tile and slice structure: which edges may not be
 // filtered at all, which slices have deblocking disabled, and each slice's beta
 // and tC offsets. It must not be nil.
-func Apply(f *frame.Frame, cus []slice.CodingUnit, sliceQPY int, bounds *loopfilter.Boundaries) {
+//
+// chromaQPOffsets are the picture-level chroma QP offsets, which spec 8.7.2.5.5
+// folds into the chroma edge's QP. The slice-level ones are deliberately excluded
+// there, so that the filter strength does not vary within a picture.
+func Apply(f *frame.Frame, cus []slice.CodingUnit, sliceQPY int,
+	chromaQPOffsets transform.ChromaQPOffsets, bounds *loopfilter.Boundaries) {
 	picW := f.Width
 	picH := f.Height
 
@@ -85,10 +90,10 @@ func Apply(f *frame.Frame, cus []slice.CodingUnit, sliceQPY int, bounds *loopfil
 	clearBoundaryEdges(edgeFlags, gridW, gridH, bounds)
 
 	// Pass 1: Filter vertical edges (left-to-right, top-to-bottom)
-	filterEdges(f, edgeFlags, gridW, gridH, qpMap, bounds, true)
+	filterEdges(f, edgeFlags, gridW, gridH, qpMap, chromaQPOffsets, bounds, true)
 
 	// Pass 2: Filter horizontal edges (top-to-bottom, left-to-right)
-	filterEdges(f, edgeFlags, gridW, gridH, qpMap, bounds, false)
+	filterEdges(f, edgeFlags, gridW, gridH, qpMap, chromaQPOffsets, bounds, false)
 }
 
 // clearBoundaryEdges removes the edges no filter may reach across: spec 8.7.2
@@ -138,7 +143,8 @@ func markEdges(edgeFlags []byte, gridW, gridH, x0, y0, w, h, _, _ int) {
 // filterEdges filters all edges in one direction.
 func filterEdges(
 	f *frame.Frame, edgeFlags []byte, gridW, gridH int,
-	qpMap []int, bounds *loopfilter.Boundaries, vertical bool,
+	qpMap []int, chromaQPOffsets transform.ChromaQPOffsets,
+	bounds *loopfilter.Boundaries, vertical bool,
 ) {
 	picW := f.Width
 	picH := f.Height
@@ -235,34 +241,28 @@ func filterEdges(
 				qpP = qpMap[(gy-1)*gridW+gx]
 			}
 			qPL := (qpP + qpQ + 1) >> 1
-			qPC := chromaQPFromLuma(qPL)
-			tcIdx := clip3(0, 53, qPC+2*(bs-1)+bounds.SliceAtLuma(px, py).TcOffset)
-			tC := tcTable[tcIdx]
-			if tC == 0 {
-				continue
-			}
-
 			cx := px / 2
 			cy := py / 2
 			if cx >= chromaW || cy >= chromaH {
 				continue
 			}
 
+			// tC is derived per component, since the picture-level offset the
+			// chroma QP carries is the Cb one for Cb and the Cr one for Cr
+			// (spec 8.7.2.5.5). They are equal in most streams, which is why one
+			// tC for both used to pass everything.
+			tcOffset := bounds.SliceAtLuma(px, py).TcOffset
 			for comp := range 2 {
+				qPC := transform.ChromaQP(qPL, chromaQPOffsets.For(comp))
+				tcIdx := clip3(0, 53, qPC+2*(bs-1)+tcOffset)
+				tC := tcTable[tcIdx]
+				if tC == 0 {
+					continue
+				}
 				filterChromaEdge(f, comp, cx, cy, vertical, tC)
 			}
 		}
 	}
-}
-
-// chromaQPFromLuma maps a luma QP to the chroma QP for the deblocking filter.
-// It delegates to the shared table: this file used to carry a third copy, which
-// repeated the off-by-one at qPi 34 that the other two had.
-func chromaQPFromLuma(qpY int) int {
-	if qpY < 0 {
-		return qpY
-	}
-	return transform.ChromaQPFromLumaQP(qpY)
 }
 
 // filterLumaEdge filters one 4-sample luma edge.

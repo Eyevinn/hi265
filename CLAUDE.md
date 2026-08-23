@@ -61,9 +61,9 @@ Grid-based functions that produce Annex-B HEVC NALUs from flat-color CTU pattern
 - `GeneratePSkip(p, poc)` — P-skip slice NALU
 
 External SPS/PPS support (for injecting frames into existing streams). Tiles,
-wavefront parallel processing, `cu_qp_delta` and `sign_data_hiding` in the PPS are
-honoured; the PPS chroma QP offsets are not (ignored, not refused), and
-`weighted_pred_flag` is refused:
+wavefront parallel processing, `cu_qp_delta`, `sign_data_hiding` and the chroma QP
+offsets in the PPS are all honoured; `weighted_pred_flag` and
+`chroma_qp_offset_list_enabled_flag` are refused with a clear error:
 
 - `EncodeIDRSliceFromSPSPPS(sps, pps, grid, colors)` — IDR slice compatible with external parameter sets
 - `EncodePSkipSliceFromSPSPPS(sps, pps, poc)` — P-skip slice compatible with external parameter sets

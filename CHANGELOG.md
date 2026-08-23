@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Chroma QP offsets were ignored throughout, in the **decoder** as well as the
+  encoder. Spec 8.6.1 adds `pps_cb_qp_offset`/`pps_cr_qp_offset` and the slice-level
+  pair to the luma QP before Table 8-10 maps it to a chroma QP, and spec 8.7.2.5.5
+  folds the picture-level pair into the chroma deblocking edge; every chroma QP came
+  from the luma QP alone, and the slice-level offsets were parsed and discarded.
+  Both sides agreed with each other, so only a stream carrying a non-zero offset
+  showed it: on an x265 vector with `--cbqpoffs 6 --crqpoffs -6` the luma plane was
+  perfect and every chroma sample was wrong, by up to 71. `transform.ChromaQP` is
+  now the single derivation, including the clip that the ±24 an offset pair can
+  reach makes necessary. Chroma deblocking derives `tC` per component, since the two
+  offsets need not be equal. `chroma_qp_offset_list_enabled_flag`, the per-CU
+  variant, needs transform-unit syntax neither side handles and is refused rather
+  than decoded past.
+
 - A picture width that is not a multiple of the 16x16 CTU coded the wrong
   samples. A grid cell is one CTU, so `yuv.BuildFrame` lays a grid out wider than
   such a picture; the grid entry points handed those planes to the slice writers,

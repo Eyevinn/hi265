@@ -16,7 +16,7 @@ Phases are ordered by dependency. Sizes are rough: **S** ≈ half a day,
 Nothing else was worth building until generated bitstreams decoded identically in
 a conforming decoder, and until real streams decoded at all.
 
-All twenty items are closed. The phase started with two known defects and
+All twenty-one items are closed. The phase started with two known defects and
 grew: each fix made the next one visible, and the conformance harness (0.2) is
 what turned "FFmpeg disagrees" into a specific spec clause every time. Generated
 content, real x265 output and tiled streams are all bit-exact against FFmpeg now.
@@ -29,7 +29,7 @@ One thing remains, narrowed to something specific rather than left vague:
 
 Ordered by dependency, the fixes were: 0.1 → 0.5 → 0.2 (the harness) → 0.6, 0.7
 (which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11 → 0.13 → 0.14 →
-0.15 → 0.16 → 0.17 → 0.18 → 0.19 → 0.20. The three
+0.15 → 0.16 → 0.17 → 0.18 → 0.19 → 0.20 → 0.21. The three
 small items 0.3, 0.4 and 0.11 were housekeeping alongside.
 
 ### 0.1 MPM candidate-B CTB boundary rule (S) — **fixed**
@@ -741,6 +741,58 @@ Verified by breaking exactly that. This is the third time in this stretch of wor
 that agreement between two decoders was not enough — the WPP byte alignment
 (0.17) and the ragged-width shear (0.19) were the others.
 
+### 0.21 Chroma QP offsets (S) — **fixed**
+
+`pps_cb_qp_offset` and `pps_cr_qp_offset` were ignored, and this turned out to be
+a **decoder** defect as much as the encoder gap 0.18 recorded. Spec 8.6.1 adds
+those offsets, plus the slice-level pair, to the luma QP before Table 8-10 maps it
+to a chroma QP; spec 8.7.2.5.5 folds the picture-level pair into the chroma
+deblocking edge as well. Every chroma QP in the codebase came from the luma QP
+alone, and the slice-level offsets were read out of the header and thrown away.
+
+Both sides agreed with each other, so nothing looked wrong until a stream with a
+non-zero offset was decoded against FFmpeg. On an x265 vector with
+`--cbqpoffs 6 --crqpoffs -6` the luma plane was perfect and **every single chroma
+sample was wrong**, by up to 71. With `--cbqpoffs 12 --crqpoffs 12`, up to 56.
+
+`transform.ChromaQP(qpY, offset)` is now the one derivation: add, clip to the
+range Table 8-10 is indexed over, map. The clip matters — the picture and slice
+offsets together reach ±24, which without it indexes past the table and, at the
+bottom, goes negative. `ChromaQPOffsets` carries the pair, with `For(comp)`
+picking a component's, since getting that backwards is invisible whenever the two
+are equal, which is most streams. The decoder applies the combined offsets when
+scaling a residual and the picture-level pair when deblocking; the encoder applies
+the picture-level pair, writing the slice-level ones as zero.
+
+**Deblocking needed restructuring, not just an offset.** It computed one `tC` and
+filtered both components with it. That is only right while the two offsets are
+equal: spec 8.7.2.5.5 puts `pps_cb_qp_offset` in the Cb edge's QP and
+`pps_cr_qp_offset` in the Cr edge's, so `tC` is now derived inside the per-
+component loop.
+
+Also refused rather than ignored, on both sides:
+`chroma_qp_offset_list_enabled_flag`. A per-CU offset needs
+`cu_chroma_qp_offset_flag` and `cu_chroma_qp_offset_idx` in the transform unit
+(spec 7.3.8.10), which neither side reads or writes, so decoding past them would
+produce exactly the plausible-looking wrong picture this entry is about.
+
+Measured after: four x265 vectors with offsets of 6/−6, −5/4 and 12/12, with
+deblocking on, decode bit-exactly against FFmpeg; the grid encoder writing against
+those same parameter sets is bit-exact too, and lands within 4 of its source
+pattern where ignoring the offsets put it 39 to 115 away.
+
+**Two tests, two blind spots, and they are opposite.** An encoder-only error —
+quantizing chroma at a QP the decoder will not use — leaves a syntactically
+perfect bitstream, so FFmpeg and `pkg/decoder` agree bit for bit on the wrong
+picture and only the comparison against the source catches it. Break the shared
+derivation instead and both our sides go wrong together, the round trip through
+our own decoder reproduces the source exactly, and only FFmpeg notices. Both
+directions were verified by breaking them. That makes four items in this stretch
+where agreement between two decoders was not sufficient — after the WPP byte
+alignment (0.17), the ragged-width shear (0.19) and the sign-hiding parity (0.20)
+— and it is the first where the *source* comparison is the one with the blind
+spot.
+
 ### 0.10 Real-world content decoding (L) — **fixed**
 
 x265 output was not bit-exact, and got worse with detail and scale: a 720p
@@ -1096,10 +1148,6 @@ Everything through Phase 3 is done, plus 4.1 and 4.3. Remaining, smallest first:
   an intra-plus-freeze one.
 - **Encoder-side conformance window** (in 0.8) — the decoder applies one; the
   generator still rejects dimensions finer than a multiple of 8.
-- **The PPS chroma QP offsets from an external PPS** (found in 0.18) — a non-zero
-  `pps_cb_qp_offset` or `pps_cr_qp_offset` is ignored rather than refused: the
-  chroma path derives its QP from the luma QP alone. Sign data hiding, the other
-  half of that entry, is done in 0.20.
 - **5.1 high bit depth decoding** (L) — the real differentiator, and the one item
   that makes hi265 clearly ahead of hi264 rather than level with it. `hi265gray`
   already generates 4:2:0/4:2:2/4:4:4 at 8/10/12-bit, but the decoder is 8-bit

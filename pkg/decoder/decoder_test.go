@@ -5,6 +5,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Eyevinn/mp4ff/avc"
+	"github.com/Eyevinn/mp4ff/hevc"
+
 	"github.com/Eyevinn/hi265/pkg/frame"
 )
 
@@ -267,6 +270,66 @@ func TestDecodeDependentSegmentsDeblock128x128(t *testing.T) {
 func TestDecodeTwoSlicesWpp256x128(t *testing.T) {
 	testGolden(t, "../../testdata/slices_wpp_2slices_256x128.265",
 		"../../testdata/golden/slices_wpp_2slices_256x128.yuv", 256, 128)
+}
+
+// A stream whose PPS carries non-zero pps_cb_qp_offset and pps_cr_qp_offset, with
+// opposite signs so the two components genuinely scale at different QPs and one
+// wrong offset cannot pass as the other.
+//
+// Spec 8.6.1 adds these to the luma QP before Table 8-10 maps it, and spec
+// 8.7.2.5.5 folds the picture-level pair into the chroma deblocking edge as well.
+// Both were ignored: the luma plane was untouched but every chroma sample was
+// wrong, by up to 71 on this vector. Nothing caught it because no fixture had a
+// non-zero offset — x265 only writes one when asked.
+func TestDecodeChromaQPOffsets192x96(t *testing.T) {
+	testGolden(t, "../../testdata/chromaqpoffs_192x96.265",
+		"../../testdata/golden/chromaqpoffs_192x96.yuv", 192, 96)
+}
+
+// A per-CU chroma QP offset is a different feature, and one that puts syntax in
+// the transform unit this decoder does not read. It must be refused rather than
+// decoded past.
+func TestDecodeChromaQPOffsetListIsRefused(t *testing.T) {
+	data, err := os.ReadFile("../../testdata/chromaqpoffs_192x96.265")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The committed vector does not enable it — no encoder to hand does — so the
+	// refusal is checked by turning the flag on in the parsed PPS. Feeding the
+	// decoder the stream then exercises the same guard a real such stream would.
+	dec := New()
+	var patched bool
+	for _, nalu := range avc.ExtractNalusFromByteStream(data) {
+		if len(nalu) < 2 {
+			continue
+		}
+		if hevc.GetNaluType(nalu[0]) < 32 { // a coded slice segment
+			if !patched {
+				t.Fatal("no PPS in the fixture to turn the flag on in")
+			}
+			_, err := dec.DecodeNALUs([][]byte{nalu})
+			if err == nil {
+				t.Fatal("expected chroma_qp_offset_list_enabled_flag to be refused")
+			}
+			if !strings.Contains(err.Error(), "chroma_qp_offset_list_enabled_flag") {
+				t.Errorf("the error should name the flag, got: %v", err)
+			}
+			return
+		}
+		// A parameter set on its own decodes no frame, which DecodeNALUs reports as
+		// an error; what matters is that it registered the set.
+		_, _ = dec.DecodeNALUs([][]byte{nalu})
+		if hevc.GetNaluType(nalu[0]) == hevc.NALU_PPS {
+			for _, pps := range dec.ppsMap {
+				if pps.RangeExtension == nil {
+					pps.RangeExtension = &hevc.RangeExtension{}
+				}
+				pps.RangeExtension.ChromaQpOffsetListEnabledFlag = true
+				patched = true
+			}
+		}
+	}
+	t.Fatal("the IDR slice was never reached")
 }
 
 // A P picture with real motion vectors must be refused rather than
