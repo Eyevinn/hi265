@@ -73,6 +73,7 @@ Most tests are self-contained. Two groups compare against external tools and
 | `TestGeneratedWppAgainstFFmpeg` | ffmpeg | generated wavefront streams are byte-exactly right, which a round trip through `pkg/decoder` cannot show: it navigates by the entry point offsets and so cannot see a wrong byte alignment |
 | `TestEncodeIDRWithCuQpDeltaAgainstFFmpeg` | ffmpeg | `cu_qp_delta_abs` is written in the right place with the right binarisation, at both quantization group sizes |
 | `TestEncodeIDRWithSignHidingAgainstFFmpeg` | ffmpeg | the hidden `coeff_sign_flag` is omitted in the right place — the half that changes the bin count; the parity itself is pinned by `TestEncodeIDRWithSignHiding` |
+| `TestEncodeIDRWithChromaQPOffsetsAgainstFFmpeg` | ffmpeg | chroma scales at the QP `pps_cb_qp_offset`/`pps_cr_qp_offset` imply; the encoder-only half is pinned by `TestEncodeIDRWithChromaQPOffsets`, which has the opposite blind spot |
 | `TestDeblockExactness` | ffmpeg + x265 | the loop filter is bit-exact, isolated on content that is exact without it |
 
 Point them at specific binaries with `HI265_FFMPEG` and `HI265_X265` if the ones
@@ -485,9 +486,10 @@ extended, err := encode.AppendEmptyFrames(annexB, 25)
 > `sign_data_hiding_enabled_flag` (x265's default: the sign of a sub-block's
 > lowest-frequency significant coefficient carried by the parity of its levels) is
 > written correctly as well, and `weighted_pred_flag` is refused. Still **ignored
-> rather than refused** by the grid IDR/CRA writer: `pps_cb_qp_offset` and
-> `pps_cr_qp_offset`, which the chroma path does not add to the luma QP. The gray
-> and P-skip writers are unaffected, since they code no coefficients.
+> rather than refused** by the grid IDR/CRA writer: nothing, as of the chroma QP
+> offset work — `pps_cb_qp_offset` and `pps_cr_qp_offset` are applied, and
+> `chroma_qp_offset_list_enabled_flag`, the per-CU variant, is refused because it
+> needs transform-unit syntax this encoder does not write.
 
 ```go
 // Time Code SEI (payload type 136). HEVC carries the SMPTE timecode here rather

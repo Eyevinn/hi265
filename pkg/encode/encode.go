@@ -265,6 +265,12 @@ func validateSPSPPS(_ *hevc.SPS, pps *hevc.PPS) error {
 	if pps.WeightedPredFlag {
 		return fmt.Errorf("weighted prediction not supported")
 	}
+	// pps_cb_qp_offset and pps_cr_qp_offset are honoured, but a per-CU offset also
+	// needs cu_chroma_qp_offset_flag and cu_chroma_qp_offset_idx written into the
+	// transform unit (spec 7.3.8.10), which nothing here does.
+	if ext := pps.RangeExtension; ext != nil && ext.ChromaQpOffsetListEnabledFlag {
+		return fmt.Errorf("chroma_qp_offset_list_enabled_flag is not supported")
+	}
 	return nil
 }
 

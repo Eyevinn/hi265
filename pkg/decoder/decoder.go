@@ -54,6 +54,12 @@ type sliceSegment struct {
 	betaOffset, tcOffset int
 	saoEnabled           bool
 	acrossSlices         bool // slice_loop_filter_across_slices_enabled_flag
+
+	// chromaQPOffsets is pps_cb_qp_offset + slice_cb_qp_offset and the Cr pair,
+	// which spec 8.6.1 adds to the luma QP before mapping it to a chroma QP.
+	// Scaling a residual uses these; deblocking uses the picture-level pair on its
+	// own (8.7.2.5.5), which picture keeps.
+	chromaQPOffsets transform.ChromaQPOffsets
 }
 
 // DecodeAnnexB decodes all frames from an Annex-B byte stream.
@@ -144,6 +150,14 @@ func (d *Decoder) DecodeNALUs(nalus [][]byte) ([]*frame.Frame, error) {
 // starting a new picture when the segment says it is the first of one and
 // publishing the previous picture at that point.
 func (d *Decoder) decodeSegment(seg *sliceSegment, frames *[]*frame.Frame) error {
+	// A per-CU chroma QP offset puts cu_chroma_qp_offset_flag and
+	// cu_chroma_qp_offset_idx in the transform unit (spec 7.3.8.10). Nothing here
+	// reads them, so the arithmetic decoder would run past bins that were coded
+	// and produce a plausible-looking wrong picture. The picture and slice level
+	// offsets, which need no extra syntax, are applied.
+	if ext := seg.pps.RangeExtension; ext != nil && ext.ChromaQpOffsetListEnabledFlag {
+		return fmt.Errorf("chroma_qp_offset_list_enabled_flag is not supported")
+	}
 	if seg.first {
 		if err := d.finishPicture(frames); err != nil {
 			return err
@@ -209,7 +223,8 @@ func (d *Decoder) decodeSegment(seg *sliceSegment, frames *[]*frame.Frame) error
 	if !seg.intra {
 		refFrame = d.refFrame
 	}
-	if err := reconstructSegment(pic.f, sd, seg.sps, refFrame, pic.grid); err != nil {
+	if err := reconstructSegment(pic.f, sd, seg.sps, refFrame, pic.grid,
+		seg.chromaQPOffsets); err != nil {
 		return err
 	}
 
@@ -528,9 +543,13 @@ func (d *Decoder) parseIRAPSegment(nalu []byte, isCRA bool) (*sliceSegment, erro
 	qpDelta := r.ReadSignedGolomb()
 
 	// slice_cb_qp_offset, slice_cr_qp_offset
+	chromaQPOffsets := transform.ChromaQPOffsets{
+		Cb: int(pps.CbQpOffset),
+		Cr: int(pps.CrQpOffset),
+	}
 	if pps.SliceChromaQpOffsetsPresentFlag {
-		r.ReadSignedGolomb() // slice_cb_qp_offset
-		r.ReadSignedGolomb() // slice_cr_qp_offset
+		chromaQPOffsets.Cb += int(r.ReadSignedGolomb())
+		chromaQPOffsets.Cr += int(r.ReadSignedGolomb())
 	}
 
 	// Deblocking filter parameters: start with PPS defaults
@@ -591,6 +610,7 @@ func (d *Decoder) parseIRAPSegment(nalu []byte, isCRA bool) (*sliceSegment, erro
 		tcOffset:           tcOffsetDiv2 * 2,
 		saoEnabled:         sliceSaoLuma || sliceSaoChroma,
 		acrossSlices:       sliceAcrossSlices,
+		chromaQPOffsets:    chromaQPOffsets,
 		params: slice.Params{
 			SliceType:                       context.SliceTypeI,
 			SliceQPY:                        26 + int(pps.InitQpMinus26) + qpDelta,
@@ -738,9 +758,13 @@ func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
 	qpDelta := r.ReadSignedGolomb()
 
 	// slice_cb_qp_offset, slice_cr_qp_offset
+	chromaQPOffsets := transform.ChromaQPOffsets{
+		Cb: int(pps.CbQpOffset),
+		Cr: int(pps.CrQpOffset),
+	}
 	if pps.SliceChromaQpOffsetsPresentFlag {
-		r.ReadSignedGolomb()
-		r.ReadSignedGolomb()
+		chromaQPOffsets.Cb += int(r.ReadSignedGolomb())
+		chromaQPOffsets.Cr += int(r.ReadSignedGolomb())
 	}
 
 	// Deblocking filter parameters
@@ -797,6 +821,7 @@ func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
 		tcOffset:           tcOffsetDiv2 * 2,
 		saoEnabled:         sliceSaoLuma || sliceSaoChroma,
 		acrossSlices:       sliceAcrossSlices,
+		chromaQPOffsets:    chromaQPOffsets,
 		params: slice.Params{
 			SliceType:                       sliceType,
 			SliceQPY:                        26 + int(pps.InitQpMinus26) + qpDelta,
@@ -824,7 +849,8 @@ func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
 // buffer. The loop filters are not applied here: they belong to the finished
 // picture, which may be made of several segments.
 func reconstructSegment(f *frame.Frame, sd *slice.SliceData, sps *hevc.SPS,
-	refFrame *frame.Frame, grid *tiles.Grid) error {
+	refFrame *frame.Frame, grid *tiles.Grid,
+	chromaQPOffsets transform.ChromaQPOffsets) error {
 
 	bitDepth := 8
 	picWidth, picHeight := f.Width, f.Height
@@ -940,9 +966,12 @@ func reconstructSegment(f *frame.Frame, sd *slice.SliceData, sps *hevc.SPS,
 				chromaMode = 34
 			}
 
-			chromaQP := transform.ChromaQPFromLumaQP(cu.QpY)
-
 			for comp := range 2 {
+				// Spec 8.6.1 adds the picture and slice offsets for this component
+				// to the luma QP before Table 8-10 maps it, so Cb and Cr can scale
+				// at different QPs within one transform unit.
+				chromaQP := transform.ChromaQP(cu.QpY, chromaQPOffsets.For(comp))
+
 				var chromaCoeffs []int32
 				if comp == 0 {
 					chromaCoeffs = tu.CbCoeffs

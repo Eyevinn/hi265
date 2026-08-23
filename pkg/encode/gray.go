@@ -154,6 +154,8 @@ func validateGraySPSPPS(_ *hevc.SPS, pps *hevc.PPS) error {
 	if pps.EntropyCodingSyncEnabledFlag && pps.TilesEnabledFlag {
 		return fmt.Errorf("tiles combined with wavefront parallel processing is not supported")
 	}
+	// A gray picture codes no coefficients, so no chroma QP of any kind is used and
+	// the chroma QP offsets — picture, slice or per-CU — cannot affect it.
 	return nil
 }
 

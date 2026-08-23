@@ -70,6 +70,39 @@ func Dequantize(coeffs []int32, size, qp int) []int32 {
 	return out
 }
 
+// ChromaQPOffsets are the offsets spec 8.6.1 adds to the luma QP before it is
+// mapped to a chroma QP, one per component. They travel together because every
+// step that needs one needs both.
+//
+// For scaling a residual they are pps_cb_qp_offset + slice_cb_qp_offset and the
+// Cr pair. For deblocking they are the picture-level offsets alone: spec
+// 8.7.2.5.5 deliberately leaves the slice-level ones out, so the filter strength
+// does not vary within a picture.
+type ChromaQPOffsets struct {
+	Cb int
+	Cr int
+}
+
+// For returns the offset that applies to a component, 0 for Cb and 1 for Cr.
+func (o ChromaQPOffsets) For(comp int) int {
+	if comp == 0 {
+		return o.Cb
+	}
+	return o.Cr
+}
+
+// ChromaQP derives a chroma quantization parameter per spec 8.6.1: the luma QP
+// plus the offset that applies to the component, clipped to the range Table 8-10
+// is indexed over, then mapped through that table.
+//
+// The clip is Clip3(−QpBdOffsetC, 57, qPi) with QpBdOffsetC zero, this codec
+// being 8-bit. Without it an offset — which may be anywhere in [−12, 12] — can
+// take the index outside the table and, at the bottom end, negative.
+func ChromaQP(qpY, offset int) int {
+	qPi := min(max(qpY+offset, 0), 57)
+	return ChromaQPFromLumaQP(qPi)
+}
+
 // ChromaQPFromLumaQP maps a luma QP to the chroma QP for ChromaArrayType 1
 // (4:2:0) per spec Table 8-10. Below 30 the mapping is the identity, above 43
 // it is qPi-6, and in between it follows the table.

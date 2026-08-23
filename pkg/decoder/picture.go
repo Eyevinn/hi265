@@ -10,6 +10,7 @@ import (
 	"github.com/Eyevinn/hi265/internal/sao"
 	"github.com/Eyevinn/hi265/internal/slice"
 	"github.com/Eyevinn/hi265/internal/tiles"
+	"github.com/Eyevinn/hi265/internal/transform"
 	"github.com/Eyevinn/hi265/pkg/frame"
 )
 
@@ -49,6 +50,11 @@ type picture struct {
 	// filter prefills its QP map with; every block a CU covers overrides it
 	// with that CU's own QP.
 	sliceQPY int
+	// chromaQPOffsets is the picture-level pair, pps_cb_qp_offset and
+	// pps_cr_qp_offset, which is what the chroma deblocking edge folds into its QP
+	// (spec 8.7.2.5.5). The slice-level offsets are deliberately not part of it, so
+	// the filter strength cannot vary within a picture.
+	chromaQPOffsets transform.ChromaQPOffsets
 	// saoEnabled is set when any slice of the picture enabled SAO.
 	saoEnabled bool
 }
@@ -73,6 +79,12 @@ func (d *Decoder) startPicture(seg *sliceSegment) error {
 		bounds:      loopfilter.New(grid, log2CtbSize(sps), acrossTiles),
 		saoParams:   make([]slice.SaoParams, grid.NumCtbs()),
 		sliceQPY:    seg.params.SliceQPY,
+		// The picture-level pair, so it comes from the PPS rather than from this
+		// segment's combined offsets.
+		chromaQPOffsets: transform.ChromaQPOffsets{
+			Cb: int(seg.pps.CbQpOffset),
+			Cr: int(seg.pps.CrQpOffset),
+		},
 	}
 	return nil
 }
@@ -113,7 +125,7 @@ func (d *Decoder) finishPicture(frames *[]*frame.Frame) error {
 	}
 
 	if pic.bounds.AnyDeblocking() {
-		deblock.Apply(pic.f, pic.cus, pic.sliceQPY, pic.bounds)
+		deblock.Apply(pic.f, pic.cus, pic.sliceQPY, pic.chromaQPOffsets, pic.bounds)
 	}
 	if pic.saoEnabled {
 		sao.Apply(pic.f, pic.saoParams, pic.log2CtbSize, pic.bounds)
