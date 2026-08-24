@@ -7,7 +7,7 @@
 # Two families, and the difference is the whole point of having both:
 #
 #   --tiles WxH --slices tiles : one independent slice segment per tile, no
-#                                entry point offsets. What `hevc-retiler` emits.
+#                                entry point offsets. What `hi265retile` emits.
 #   --tiles WxH                : one slice segment covering every tile, reached
 #                                through entry point offsets, with the CABAC
 #                                contexts, QP prediction and neighbour

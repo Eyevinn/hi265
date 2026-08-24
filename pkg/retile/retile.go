@@ -286,16 +286,16 @@ type SliceParams struct {
 //
 // The input slice must have no entry-point offsets (tiles & WPP off) and no
 // slice_segment_header_extension.
-func BuildSliceNAL(origNAL []byte, sh *hevc.SliceHeader, mergedSPS *hevc.SPS,
+func BuildSliceNAL(srcNAL []byte, sh *hevc.SliceHeader, mergedSPS *hevc.SPS,
 	mergedPPS *hevc.PPS, p SliceParams) ([]byte, error) {
-	naluType := hevc.GetNaluType(origNAL[0])
+	naluType := hevc.GetNaluType(srcNAL[0])
 	isIRAP := naluType >= hevc.NALU_BLA_W_LP && naluType <= hevc.NALU_IRAP_VCL23
 
-	rbsp := encode.RemoveEmulationPrevention(origNAL[2:])
+	rbsp := encode.RemoveEmulationPrevention(srcNAL[2:])
 	// sh.Size is the byte-aligned header size *including* the 2-byte NAL header.
 	// De-escape just the header region so the payload boundary stays correct
 	// even when an emulation-prevention byte sits inside the header.
-	headerLen := len(encode.RemoveEmulationPrevention(origNAL[2:int(sh.Size)]))
+	headerLen := len(encode.RemoveEmulationPrevention(srcNAL[2:int(sh.Size)]))
 	hdr := rbsp[:headerLen]
 	payload := rbsp[headerLen:]
 
@@ -332,5 +332,5 @@ func BuildSliceNAL(origNAL []byte, sh *hevc.SliceHeader, mergedSPS *hevc.SPS,
 	writeTrailing(w)
 
 	newRBSP := append(w.Bytes(), payload...)
-	return assemble(origNAL, newRBSP), nil
+	return assemble(srcNAL, newRBSP), nil
 }

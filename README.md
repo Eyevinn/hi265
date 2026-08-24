@@ -432,6 +432,131 @@ Test parameter sets are included in `cmd/hi265gray/testdata/`:
 | `vps_sps_pps_422_10bit.json` | 4:2:2 10-bit | 1920x1080, CTU=64 |
 | `vps_sps_pps_420_8bit_wpp.json` | 4:2:0 8-bit | 1280x720, CTU=64, x265 defaults so wavefront parallel processing is on |
 
+### hi265retile — Stitch HEVC streams as tiles
+
+Combines several HEVC videos into one picture by treating each as a **tile**,
+editing only the bitstream. The CABAC slice payloads are copied **verbatim**,
+never re-encoded, so the merged picture carries exactly the samples the inputs
+carried, at exactly their bitrate. Works for all-intra streams and for
+motion-constrained (MCTS) P/B-frame streams, in arbitrary tile grids.
+
+```
+vertical 2x1            2x2 grid              horizontal 1x3
+┌──────────┐         ┌─────┬─────┐         ┌────┬────┬────┐
+│  tile 0  │         │  0  │  1  │         │ 0  │ 1  │ 2  │
+├──────────┤         ├─────┼─────┤         └────┴────┴────┘
+│  tile 1  │         │  2  │  3  │
+└──────────┘         └─────┴─────┘
+```
+
+```bash
+# Vertical Nx1 stack (the default), and an explicit row-major grid
+go run ./cmd/hi265retile -o merged.265 top.265 bottom.265
+go run ./cmd/hi265retile -grid 2x2 -o merged.265 a.265 b.265 c.265 d.265
+
+# Also check the result: decode it and compare every tile to its own decode
+go run ./cmd/hi265retile -verify -o merged.265 top.265 bottom.265
+
+# Pick the verification decoder explicitly (default: auto)
+go run ./cmd/hi265retile -verify -decoder ffmpeg -o merged.265 top.265 bottom.265
+
+# Generate a tile-ready input, and see what a stream actually contains
+tools/gen_retile_inputs.sh /tmp/tiles a 512x256 intra "testsrc2=size=512x256:rate=5"
+go run ./cmd/hi265inspect merged.265
+```
+
+`-grid RxC` arranges the inputs in `R` tile rows by `C` tile columns in
+row-major order. Tiles in a column must share a width and tiles in a row a
+height, but the grid need not be uniform — unequal column widths and row
+heights are emitted as explicit `column_width_minus1` / `row_height_minus1`.
+
+Only geometry and tiling are rewritten. The SPS gets the merged
+`pic_width/height_in_luma_samples` and a `general_level_idc` raised to cover the
+larger picture; the PPS gets `tiles_enabled_flag = 1`, the tile grid, and
+`loop_filter_across_tiles_enabled_flag = 0`; each input slice becomes one tile's
+slice, with a re-emitted `first_slice_segment_in_pic_flag`, a
+`slice_segment_address` pointing at the tile's first CTB, and a trailing
+`num_entry_point_offsets = 0`. Everything else in the slice header — slice_type,
+POC, reference picture sets, reference lists, QP — is copied verbatim, which is
+why I, P and B slices all work without reimplementing any of it.
+
+The payloads stay valid because with tiles enabled and filtering disabled across
+tile boundaries a tile's edges behave like picture edges, which is exactly how
+each standalone video already treated its own edges.
+
+#### Verifying a stitch
+
+`-verify` decodes the merged stream and each input, then compares every tile's
+sub-rectangle against its standalone decode across all frames. This is the
+empirical proof that the inputs really were tileable — in particular of the MCTS
+property, which is not visible anywhere in the bitstream.
+
+```
+verify OK  tile @0,0 512x256 == top.265 (5 frames, hi265)
+verify OK  tile @0,256 512x256 == bottom.265 (5 frames, hi265)
+verify: all tiles pixel-perfect
+```
+
+`-decoder` chooses what does the decoding:
+
+| value | behaviour |
+|---|---|
+| `auto` (default) | `pkg/decoder` in-process, falling back to ffmpeg for a stream it cannot decode |
+| `hi265` | `pkg/decoder` in-process only. No external binary, so this runs anywhere |
+| `ffmpeg` | ffmpeg only. The cross-check that would catch a bug shared by the stitcher and `pkg/decoder` |
+
+A stitch of inter pictures is the one case `pkg/decoder` cannot check, since it
+reconstructs only zero-motion skip CUs; `auto` uses ffmpeg for it, and `hi265`
+fails with a message naming the limitation rather than reporting a pass nobody
+made. Feeding P-frames that are *not* motion-constrained fails where motion
+crosses a tile seam:
+
+```
+error: MISMATCH tile @0,0 512x256 (na.265) at frame 3
+```
+
+`tools/retile_demo.sh` runs the whole thing end to end: it generates inputs with
+ffmpeg, x265 and kvazaar, stitches them under four geometries, verifies each,
+and finishes with a non-MCTS stitch that verification must reject.
+
+#### What the inputs must satisfy
+
+All tiles share one SPS and one PPS, so the inputs must agree on everything that
+affects how `slice_segment_data` is parsed and reconstructed. Each of these is
+checked and refused with a message naming the offending property:
+
+- **Same coding tools** — chroma format, bit depth, CTB/CB/TB sizes, max
+  transform depth, scaling lists, SAO, AMP, PCM, `sps_temporal_mvp`,
+  `sign_data_hiding`, `cu_qp_delta`, transform skip, the chroma QP offsets, the
+  range and SCC extensions. Only the picture size and the level may differ.
+  `init_qp_minus26` is on this list because a slice QP is coded as a delta from
+  it and those bits are copied verbatim — but the per-slice QP itself may
+  differ, so tiles can be at different quality.
+- **CTB-aligned** — each input's width and height a multiple of the shared CTB
+  size, tiles in a column sharing a width and tiles in a row a height.
+- **One picture per slice segment**, tiles and WPP off, no
+  slice-segment-header extension, so no slice carries entry point offsets and
+  the bit-splice is exact.
+- **No conformance window** — the merged SPS applies one window to the whole
+  picture rather than one per tile. Crop before stitching.
+- **Aligned GOP** — the same picture index in every input shares its POC and its
+  NAL type.
+
+The one condition that cannot be checked from the bitstream is that inter inputs
+are **motion-constrained**, so that motion vectors and their interpolation
+footprint never reference samples outside the tile. That is what `-verify` is
+for. SEI, AUD and filler NAL units are not carried into the merged stream, since
+the merged picture is not the picture they describe.
+
+### hi265inspect — Dump the NAL structure of a stream
+
+Prints every NAL unit of an Annex-B file with the SPS, PPS and slice-header
+fields that decide whether streams can be stitched or how a picture is coded.
+
+```bash
+go run ./cmd/hi265inspect input.265
+```
+
 ## Library Usage
 
 The `pkg/` packages provide a public API for use as a Go library. Implementation
@@ -567,6 +692,7 @@ pkg/decoder/          — Public: top-level decoder API (DecodeAnnexB, DecodeNAL
 pkg/encode/           — Public: bitstream generator API (GenerateIDR, GeneratePSkip,
                         CRA and gray slices from external SPS/PPS, Time Code SEI,
                         stream extension, FrameEncoder)
+pkg/retile/           — Public: stitch N streams into one tiled picture, and verify the result
 pkg/frame/            — Public: Frame type (decoded output)
 pkg/timecode/         — Public: SMPTE timecode arithmetic and text formatting
 internal/cabac/       — Internal: CABAC arithmetic decoder and encoder engines
@@ -580,6 +706,8 @@ cmd/hi265dec/         — CLI: decode HEVC from Annex-B or MP4 to YUV/Y4M/PNG/JP
 cmd/hi265gen/         — CLI: generate HEVC bitstreams or raw images from grid patterns
 cmd/hi265gray/        — CLI: generate gray IDR/CRA frames from external VPS/SPS/PPS
 cmd/hi265-mp4-extend/ — CLI: extend a CMAF media segment with empty frames
+cmd/hi265retile/      — CLI: stitch several Annex-B streams into one tiled stream
+cmd/hi265inspect/     — CLI: dump VPS/SPS/PPS/slice-header fields of an Annex-B file
 examples/             — Example grid image files
 tools/                — Test generation scripts
 testdata/             — Golden HEVC bitstreams for regression testing

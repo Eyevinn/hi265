@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Tile stitching (`hi265retile`, `pkg/retile`)
+- `hevc-retiler` moves in-repo. It combines several HEVC videos into one tiled
+  picture by bitstream editing: a merged SPS/PPS, one rewritten slice header per
+  tile, and the CABAC payloads copied verbatim. Nothing is re-encoded, so the
+  merged picture carries exactly the samples and exactly the bits the inputs
+  carried. All-intra and motion-constrained (MCTS) P/B inputs both work, in
+  uniform and non-uniform grids. The output is byte-identical to the standalone
+  tool's across a 2x1 intra, a 2x1 P-frame, a 1x2 non-uniform and a 2x2 stitch.
+- `retile.Stitch` is the API; `hi265retile` is a flag-parsing shell over it. It
+  lived in the old tool's `main()` and could only be tested by running the
+  binary.
+- `hi265retile -verify` decodes the stitch and compares every tile against its
+  standalone decode. It is the only proof that inter inputs really were
+  motion-constrained, since MCTS is not visible in the bitstream. `-decoder`
+  selects: `hi265` runs `pkg/decoder` in-process and needs no external binary,
+  `ffmpeg` is the cross-check that would catch a bug shared by the stitcher and
+  `pkg/decoder`, and `auto` uses the first and falls back to the second. A
+  stitch of inter pictures is what `pkg/decoder` cannot check — it reconstructs
+  only zero-motion skip CUs — so `auto` reaches for ffmpeg there and `hi265`
+  fails naming the limitation, rather than reporting a pass nobody made.
+- Inputs that cannot tile are refused with a message naming the property:
+  coding tools that differ between inputs (only the picture size and the level
+  may differ, so a differing `init_qp_minus26` is refused — a slice QP is a
+  delta from it and those bits are copied verbatim), more than one slice segment
+  per picture, a conformance window, tiles or WPP already enabled, a
+  slice-segment-header extension, two distinct SPSs or PPSs in one input, and
+  `separate_colour_plane_flag`. A differing VUI is reported instead of refused,
+  since it changes how the picture is displayed and not how it decodes.
+- `hi265inspect` prints the NAL structure and the SPS/PPS/slice-header fields of
+  any Annex-B file. `spsdump` does something similar but only for a hardcoded
+  `testdata` path; it is left in place.
+- `pkg/encode` gained `BitReader`, the counterpart of `BitWriter`, and
+  `RemoveEmulationPrevention`, the exact inverse of `InsertEBSP`. Splitting
+  those across a repository boundary is half of why the tool moved here.
+
 #### Scaling lists (decoder)
 - `scaling_list_enabled_flag` is honoured for the default matrices of spec
   Tables 7-5 and 7-6, so a stream that simply switches scaling lists on decodes
@@ -98,7 +133,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profile permits that.
 
 #### Tiles
-- Tiled pictures with one slice segment per tile, the shape `hevc-retiler` emits
+- Tiled pictures with one slice segment per tile, the shape `hi265retile` emits
   and kvazaar's `--tiles WxH --slices tiles` produces: the spec 6.5.1 tile scan
   tables (`internal/tiles`), `slice_segment_address` and
   `dependent_slice_segment_flag` parsing, CTB iteration in tile scan bounded by
