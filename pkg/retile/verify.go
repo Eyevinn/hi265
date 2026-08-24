@@ -1,47 +1,50 @@
 // Verification of a stitched stream: decode it (and each input) and compare
 // every tile region pixel-for-pixel. A pass proves the CABAC payloads decode
 // identically in their tile positions — i.e. that the inputs were genuinely
-// tileable (CTB-aligned, and motion-constrained for inter frames).
+// tileable (CTB-aligned, and motion-constrained for inter frames). MCTS is not
+// visible in the bitstream, so this comparison is the only way to establish it.
 
 package retile
 
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os/exec"
 )
 
 // Tile is one input placed at pixel (X,Y) with size W x H in the merged picture.
 type Tile struct {
-	Path       string
+	Name       string // label used in messages, typically the input's file path
+	Data       []byte // the standalone stream, decoded again for the comparison
 	X, Y, W, H int
 }
 
-// Verify decodes mergedPath and each tile's source to yuv420p and compares the
+// Verify decodes the stitched stream and each tile's source, then compares the
 // tile sub-rectangles across all frames. It returns nil only if every tile of
-// every frame matches its standalone decode.
-func Verify(mergedPath string, mergedW, mergedH, frames int, tiles []Tile) error {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		return fmt.Errorf("verify needs ffmpeg in PATH: %w", err)
-	}
-	merged, err := decodeYUV420(mergedPath, mergedW, mergedH, frames)
+// every frame matches its standalone decode. Progress is written to w, which
+// may be nil.
+func Verify(res *Result, w io.Writer) error {
+	merged, err := decodeYUV420(res.Data, "merged stream", res.Width, res.Height, res.Frames)
 	if err != nil {
 		return err
 	}
-	for i, t := range tiles {
+	for i, t := range res.Tiles {
 		if t.X%2 != 0 || t.Y%2 != 0 || t.W%2 != 0 || t.H%2 != 0 {
 			return fmt.Errorf("tile %d: position/size must be even for 4:2:0", i)
 		}
-		src, err := decodeYUV420(t.Path, t.W, t.H, frames)
+		src, err := decodeYUV420(t.Data, t.Name, t.W, t.H, res.Frames)
 		if err != nil {
 			return err
 		}
-		if f, ok := firstFrameMismatch(merged, mergedW, mergedH, src, t, frames); !ok {
+		if f, ok := firstFrameMismatch(merged, res.Width, res.Height, src, t, res.Frames); !ok {
 			return fmt.Errorf("MISMATCH tile @%d,%d %dx%d (%s) at frame %d",
-				t.X, t.Y, t.W, t.H, t.Path, f)
+				t.X, t.Y, t.W, t.H, t.Name, f)
 		}
-		fmt.Printf("  verify OK  tile @%d,%d %dx%d == %s (%d frames)\n",
-			t.X, t.Y, t.W, t.H, t.Path, frames)
+		if w != nil {
+			fmt.Fprintf(w, "  verify OK  tile @%d,%d %dx%d == %s (%d frames)\n",
+				t.X, t.Y, t.W, t.H, t.Name, res.Frames)
+		}
 	}
 	return nil
 }
@@ -92,19 +95,25 @@ func rectEqual(m []byte, mOff, mStride int, s []byte, sOff, sStride int, x, y, w
 	return true
 }
 
-func decodeYUV420(path string, w, h, frames int) ([]byte, error) {
+// decodeYUV420 decodes an Annex-B stream with ffmpeg, which reads it from
+// stdin so nothing has to be written to disk first.
+func decodeYUV420(annexB []byte, label string, w, h, frames int) ([]byte, error) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return nil, fmt.Errorf("verify needs ffmpeg in PATH: %w", err)
+	}
 	var out, errb bytes.Buffer
 	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
-		"-i", path, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-")
+		"-f", "hevc", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-")
+	cmd.Stdin = bytes.NewReader(annexB)
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("ffmpeg decode %s: %v: %s", path, err, errb.String())
+		return nil, fmt.Errorf("ffmpeg decode %s: %v: %s", label, err, errb.String())
 	}
 	want := w * h * 3 / 2 * frames
 	if out.Len() != want {
 		return nil, fmt.Errorf("decode %s: got %d bytes, want %d (%dx%d, %d frames)",
-			path, out.Len(), want, w, h, frames)
+			label, out.Len(), want, w, h, frames)
 	}
 	return out.Bytes(), nil
 }
