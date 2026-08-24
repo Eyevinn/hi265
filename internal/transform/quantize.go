@@ -35,7 +35,13 @@ func TransformSkipShift(coeffs []int32, log2TrafoSize, bitDepth int) []int32 {
 //	bdShift = bitDepth + log2TrafoSize - 5
 //	d[x][y] = Clip3(coeffMin, coeffMax,
 //	    (TransCoeffLevel * m * LevelScale[qp%6] << (qp/6) + (1 << (bdShift-1))) >> bdShift)
-func Dequantize(coeffs []int32, size, qp int) []int32 {
+//
+// Dequantize applies the scaling process of spec 8.6.3 to one transform block.
+//
+// m is the quantization matrix in raster order, or nil for the flat matrix of 16
+// that a stream with scaling_list_enabled_flag clear uses — which is the common
+// case, and the one that costs no per-coefficient lookup.
+func Dequantize(coeffs []int32, size, qp int, m []int32) []int32 {
 	out := make([]int32, len(coeffs))
 
 	log2Size := 0
@@ -48,15 +54,17 @@ func Dequantize(coeffs []int32, size, qp int) []int32 {
 	scale := LevelScale[qp%6]
 	qpPer := qp / 6 // qp/6, the per-6 QP component
 
-	// m = 16 for flat scaling matrix
-	// Full multiply: coeff * 16 * LevelScale[qp%6] * (1 << qpPer)
-	// Then add rounding offset and right-shift by bdShift.
-
+	// Full multiply: coeff * m[x][y] * LevelScale[qp%6] * (1 << qpPer), then the
+	// rounding offset and the right shift.
 	for i, c := range coeffs {
 		if c == 0 {
 			continue
 		}
-		val := int64(c) * 16 * int64(scale) * (int64(1) << uint(qpPer))
+		weight := int64(16)
+		if m != nil {
+			weight = int64(m[i])
+		}
+		val := int64(c) * weight * int64(scale) * (int64(1) << uint(qpPer))
 		add := int64(1) << uint(bdShift-1)
 		val = (val + add) >> uint(bdShift)
 		// Clip to 16-bit range

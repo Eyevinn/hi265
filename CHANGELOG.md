@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Scaling lists (decoder)
+- `scaling_list_enabled_flag` is honoured for the default matrices of spec
+  Tables 7-5 and 7-6, so a stream that simply switches scaling lists on decodes
+  correctly. They were ignored before, which dequantized every transform block
+  larger than 4x4 with flat weights: 2870 of 49152 samples wrong at QP 12, 102 at
+  QP 22, and none at QP 32 — the default 4x4 matrix is itself flat, so a coarsely
+  quantized picture hides the whole feature. Explicit `scaling_list_data` is
+  refused rather than ignored.
+
+### Changed
+
+- The decoder refuses the coding tools it does not implement instead of decoding
+  past them: bit depth other than 8, chroma formats other than 4:2:0,
+  `separate_colour_plane_flag`, PCM, transquant bypass, explicit scaling lists,
+  and the range extension tools that change residual parsing. Each produced a
+  picture before — `--lossless` came out as noise (12254 of 12288 samples wrong),
+  and a 10-bit stream came out three values off, which looks like a correct decode.
+  The encoder gained the matching refusals, per writer: the gray writer codes no
+  residual so bit depth, chroma format and scaling lists cannot affect it, while
+  `cu_transquant_bypass_flag` and `pcm_flag` are coding unit syntax and are refused
+  everywhere.
+
 ### Fixed
 
 - Chroma QP offsets were ignored throughout, in the **decoder** as well as the

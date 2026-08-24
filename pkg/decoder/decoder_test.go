@@ -286,6 +286,17 @@ func TestDecodeChromaQPOffsets192x96(t *testing.T) {
 		"../../testdata/golden/chromaqpoffs_192x96.yuv", 192, 96)
 }
 
+// A stream with scaling_list_enabled_flag set and no explicit scaling_list_data,
+// so the default non-flat matrices of Table 7-6 apply. Coded at QP 12 on purpose:
+// the weights only bite where a transform block larger than 4x4 carries
+// coefficients, and the 4x4 default matrix is flat, so a coarse quantizer hides
+// the whole feature. Ignoring the lists put 2870 of 49152 samples wrong here, at
+// a max delta of 2 — small enough to read as rounding, which is why it survived.
+func TestDecodeScalingListQ12(t *testing.T) {
+	testGolden(t, "../../testdata/scalinglist_q12_256x128.265",
+		"../../testdata/golden/scalinglist_q12_256x128.yuv", 256, 128)
+}
+
 // A per-CU chroma QP offset is a different feature, and one that puts syntax in
 // the transform unit this decoder does not read. It must be refused rather than
 // decoded past.
@@ -348,5 +359,102 @@ func TestDecodeInterMotionIsRefused(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "motion compensation is not implemented") {
 		t.Errorf("the error should name the limitation, got: %v", err)
+	}
+}
+
+// The coding tools this decoder does not implement have to be refused rather than
+// decoded past. Each one below either desynchronises the arithmetic decoder at the
+// first coding unit that uses it, or makes the samples mean something other than
+// what is reconstructed — and in both cases a picture would still be returned.
+//
+// A subtly wrong thumbnail is worse than an error, so this pins that each is
+// named rather than ignored. The flags are set on the parsed parameter sets,
+// since no encoder to hand emits most of them.
+func TestUnsupportedToolsAreRefused(t *testing.T) {
+	data, err := os.ReadFile("../../testdata/sincos_128x64.265")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		want   string
+		break_ func(sps *hevc.SPS, pps *hevc.PPS)
+	}{
+		{"bit_depth_luma", "bit depth 10", func(s *hevc.SPS, _ *hevc.PPS) { s.BitDepthLumaMinus8 = 2 }},
+		{"bit_depth_chroma", "chroma bit depth 10", func(s *hevc.SPS, _ *hevc.PPS) { s.BitDepthChromaMinus8 = 2 }},
+		{"chroma_format", "chroma_format_idc 2", func(s *hevc.SPS, _ *hevc.PPS) { s.ChromaFormatIDC = 2 }},
+		{"separate_colour_plane", "separate_colour_plane_flag", func(s *hevc.SPS, _ *hevc.PPS) {
+			s.ChromaFormatIDC = 1
+			s.SeparateColourPlaneFlag = true
+		}},
+		{"pcm", "pcm_enabled_flag", func(s *hevc.SPS, _ *hevc.PPS) { s.PCMEnabledFlag = true }},
+		{"transquant_bypass", "transquant_bypass_enabled_flag", func(_ *hevc.SPS, p *hevc.PPS) {
+			p.TransquantBypassEnabledFlag = true
+		}},
+		{"explicit_scaling_lists", "scaling_list_data", func(s *hevc.SPS, _ *hevc.PPS) {
+			s.ScalingListEnabledFlag = true
+			s.ScalingListDataPresentFlag = true
+		}},
+		{"cross_component_prediction", "cross_component_prediction", func(_ *hevc.SPS, p *hevc.PPS) {
+			p.RangeExtension = &hevc.RangeExtension{CrossComponentPredictionEnabledFlag: true}
+		}},
+		{"persistent_rice", "persistent_rice_adaptation", func(s *hevc.SPS, _ *hevc.PPS) {
+			s.RangeExtension = &hevc.SPSRangeExtension{PersistentRiceAdaptationEnabledFlag: true}
+		}},
+		{"cabac_bypass_alignment", "cabac_bypass_alignment", func(s *hevc.SPS, _ *hevc.PPS) {
+			s.RangeExtension = &hevc.SPSRangeExtension{CabacBypassAlignmentEnabledFlag: true}
+		}},
+		{"implicit_rdpcm", "implicit_rdpcm", func(s *hevc.SPS, _ *hevc.PPS) {
+			s.RangeExtension = &hevc.SPSRangeExtension{ImplicitRdpcmEnabledFlag: true}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dec := New()
+			for _, nalu := range avc.ExtractNalusFromByteStream(data) {
+				if len(nalu) < 2 {
+					continue
+				}
+				if hevc.GetNaluType(nalu[0]) < 32 { // a coded slice segment
+					_, err := dec.DecodeNALUs([][]byte{nalu})
+					if err == nil {
+						t.Fatalf("expected %s to be refused", tc.name)
+					}
+					if !strings.Contains(err.Error(), tc.want) {
+						t.Errorf("the error should mention %q, got: %v", tc.want, err)
+					}
+					return
+				}
+				// A parameter set alone decodes no frame, which is reported as an
+				// error; what matters is that it registered.
+				_, _ = dec.DecodeNALUs([][]byte{nalu})
+				if hevc.GetNaluType(nalu[0]) == hevc.NALU_PPS {
+					for _, pps := range dec.ppsMap {
+						for _, sps := range dec.spsMap {
+							tc.break_(sps, pps)
+						}
+					}
+				}
+			}
+			t.Fatal("the slice segment was never reached")
+		})
+	}
+}
+
+// And the streams that use none of them still decode, so the guard above cannot
+// be a blanket refusal.
+func TestSupportedStreamsStillDecode(t *testing.T) {
+	for _, path := range []string{
+		"../../testdata/sincos_128x64.265",
+		"../../testdata/scalinglist_q12_256x128.265",
+		"../../testdata/chromaqpoffs_192x96.265",
+	} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := New().DecodeAnnexB(data); err != nil {
+			t.Errorf("%s should decode: %v", path, err)
+		}
 	}
 }

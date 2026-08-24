@@ -117,6 +117,14 @@ go run ./cmd/hi265dec -colorspace bt709 input.265 out.png
 | `-colorspace` | Color space for RGB conversion (`bt601`/`bt709`/`bt2020`) | `bt601` |
 | `-full-range` | Treat input as full-range YCbCr | off |
 
+> **What is refused, not guessed at.** Bit depth other than 8, chroma formats
+> other than 4:2:0, PCM, transquant bypass (lossless), explicit
+> `scaling_list_data`, the range extension residual tools, and inter pictures with
+> real motion all produce a clear error naming the tool. Scaling lists themselves
+> are supported for the default matrices. The rule is that a stream either decodes
+> correctly or says why not — a subtly wrong picture is the one outcome worth
+> avoiding.
+>
 > Real encoder output decodes bit-exactly: wavefront parallel processing
 > (x265's default), SAO, deblocking, sign data hiding, every intra mode, NxN
 > partitions, transform trees down to 4x4, 32x32 transforms, per-quantization-

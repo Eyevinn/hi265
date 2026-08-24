@@ -27,7 +27,7 @@ func TestForwardInverseRoundTrip(t *testing.T) {
 	levels := quantize(coeffs, size, qp)
 
 	// Inverse (using decoder's functions)
-	dequant := transform.Dequantize(levels, size, qp)
+	dequant := transform.Dequantize(levels, size, qp, nil)
 	reconstructed := transform.InverseDCT(dequant, size)
 
 	// Check that all pixels are close
@@ -120,7 +120,7 @@ func TestReconstructionDebug(t *testing.T) {
 	}
 
 	// Verify reconstruction
-	dequant := transform.Dequantize(levels, 16, qp)
+	dequant := transform.Dequantize(levels, 16, qp, nil)
 	invDCT := transform.InverseDCT(dequant, 16)
 	recon := prediction[0] + invDCT[0]
 	if recon != 16 {
