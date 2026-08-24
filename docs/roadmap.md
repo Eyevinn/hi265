@@ -16,7 +16,7 @@ Phases are ordered by dependency. Sizes are rough: **S** ≈ half a day,
 Nothing else was worth building until generated bitstreams decoded identically in
 a conforming decoder, and until real streams decoded at all.
 
-All twenty-one items are closed. The phase started with two known defects and
+All twenty-two items are closed. The phase started with two known defects and
 grew: each fix made the next one visible, and the conformance harness (0.2) is
 what turned "FFmpeg disagrees" into a specific spec clause every time. Generated
 content, real x265 output and tiled streams are all bit-exact against FFmpeg now.
@@ -29,7 +29,7 @@ One thing remains, narrowed to something specific rather than left vague:
 
 Ordered by dependency, the fixes were: 0.1 → 0.5 → 0.2 (the harness) → 0.6, 0.7
 (which the harness localised) → 0.8 → 0.9, 0.12 → 0.10, 0.11 → 0.13 → 0.14 →
-0.15 → 0.16 → 0.17 → 0.18 → 0.19 → 0.20 → 0.21. The three
+0.15 → 0.16 → 0.17 → 0.18 → 0.19 → 0.20 → 0.21 → 0.22. The three
 small items 0.3, 0.4 and 0.11 were housekeeping alongside.
 
 ### 0.1 MPM candidate-B CTB boundary rule (S) — **fixed**
@@ -793,6 +793,59 @@ alignment (0.17), the ragged-width shear (0.19) and the sign-hiding parity (0.20
 — and it is the first where the *source* comparison is the one with the blind
 spot.
 
+### 0.22 Scaling lists, and refusing what is left (M) — **fixed**
+
+Prompted by a question — what is missing for decoding IDR and CRA pictures as
+thumbnails — which turned into an audit of what the decoder reads from the
+parameter sets at all. It never looked at `bit_depth_luma_minus8`,
+`chroma_format_idc`, `scaling_list_enabled_flag`, `pcm_enabled_flag` or
+`transquant_bypass_enabled_flag`. Measured, on x265 streams built to use each:
+
+| tool | before | after |
+|---|---|---|
+| scaling lists, QP 12 | 2870 of 49152 samples wrong, max delta 2 | bit-exact |
+| scaling lists, QP 22 | 102 wrong, max delta 2 | bit-exact |
+| `transquant_bypass` (`--lossless`) | 12254 of 12288 wrong, max delta 217 | refused |
+| 10-bit (Main 10) | 4682 wrong, max delta 3 | refused |
+
+The two extremes are both dangerous in their own way. Lossless produced obvious
+noise, but still returned a frame. A 10-bit stream came out **three values off** —
+a picture that looks entirely correct, which for a thumbnail is worse than an
+error, because nothing downstream would ever question it.
+
+**Scaling lists are now supported**, for the default matrices. `scaling_list_data`
+that carries explicit weights is refused instead: mp4ff skips past that syntax
+without keeping the values, so reading them means parsing the SPS or PPS a second
+time here, and switching the lists on and taking the defaults is what an encoder
+does when simply asked for them. `transform.DefaultScalingLists` builds Table 7-6
+once and shares it; `Dequantize` takes the matrix, or nil for the flat 16 that
+costs no lookup. Note why this hid so well: the default 4x4 matrix **is** flat, so
+a picture coded entirely in small transform blocks decodes identically either way,
+and the first stream tried had exactly that shape and passed.
+
+Everything else the decoder cannot do is now named rather than decoded past:
+bit depth, chroma format, `separate_colour_plane_flag`, PCM, transquant bypass,
+explicit scaling lists, and the range extension tools that change how
+`residual_coding` is parsed — `persistent_rice_adaptation`,
+`cabac_bypass_alignment`, `implicit_rdpcm`, `explicit_rdpcm`,
+`extended_precision_processing` and `cross_component_prediction`. Motion
+compensation was already refused as of 0.15. **The decoder now either decodes a
+stream correctly or says which tool stopped it.**
+
+The encoder gained the matching refusals, and they differ per writer, which is the
+interesting part. The gray writer codes no coefficients and no residual, so bit
+depth, chroma format, scaling lists and the chroma QP offsets cannot reach it —
+that is the whole point of it, and it still accepts any of them. What does reach
+it is syntax in the coding unit itself: `cu_transquant_bypass_flag` precedes
+`cu_skip_flag` for every CU (spec 7.3.8.5) and `pcm_flag` sits in the intra one, so
+both are refused for every writer including gray. Scaling lists, bit depth, chroma
+format and the residual-coding extensions are refused only where residuals are
+written, which is the grid IDR and CRA path.
+
+Fixtures: `testdata/scalinglist_q12_256x128.265` with its golden, coded at QP 12
+on purpose, since a coarse quantizer leaves too few large-block coefficients for
+the weights to matter — QP 32 passes with the lists ignored.
+
 ### 0.10 Real-world content decoding (L) — **fixed**
 
 x265 output was not bit-exact, and got worse with detail and scale: a 720p
@@ -1145,13 +1198,22 @@ Everything through Phase 3 is done, plus 4.1 and 4.3. Remaining, smallest first:
 - **Motion compensation** — P and B pictures with real motion are refused with a
   clear message as of 0.15, rather than decoded wrongly, but they are still out of
   reach. This is the one item that would make hi265 a general decoder rather than
-  an intra-plus-freeze one.
+  an intra-plus-freeze one. It is not needed for decoding IRAP pictures as
+  thumbnails, which is what 0.22 was done for.
+- **Coding tools that are refused rather than supported** (0.22) — PCM,
+  transquant bypass (lossless), explicit `scaling_list_data`, and the range
+  extension residual-coding tools. Each is a self-contained piece of work now that
+  the refusal marks exactly where it would go. Lossless is the most likely to be
+  wanted, being screen-content territory.
 - **Encoder-side conformance window** (in 0.8) — the decoder applies one; the
   generator still rejects dimensions finer than a multiple of 8.
 - **5.1 high bit depth decoding** (L) — the real differentiator, and the one item
   that makes hi265 clearly ahead of hi264 rather than level with it. `hi265gray`
   already generates 4:2:0/4:2:2/4:4:4 at 8/10/12-bit, but the decoder is 8-bit
-  4:2:0, so our own output cannot be verified without FFmpeg.
+  4:2:0, so our own output cannot be verified without FFmpeg. As of 0.22 such a
+  stream is refused rather than decoded three values off, which makes this the
+  largest remaining gap for real-world input: Main 10 is common in anything
+  HDR-adjacent, so a thumbnailer meets it early.
 - **5.2, 5.3, 5.4** — follow 5.1.
 
 ## Suggested order

@@ -971,7 +971,7 @@ func reconstructLuma(f *frame.Frame, x0, y0, size, picW, picH, mode int,
 
 	var residual []int32
 	if cbfLuma {
-		dequantCoeffs := transform.Dequantize(levels, size, qp)
+		dequantCoeffs := transform.Dequantize(levels, size, qp, nil)
 		residual = transform.InverseDCT(dequantCoeffs, size)
 	} else {
 		residual = make([]int32, size*size)
@@ -993,7 +993,7 @@ func reconstructChroma(f *frame.Frame, comp, cx, cy, chromaTrSize, chromaW, chro
 
 	var residual []int32
 	if levels != nil {
-		dequantCoeffs := transform.Dequantize(levels, chromaTrSize, chromaQP)
+		dequantCoeffs := transform.Dequantize(levels, chromaTrSize, chromaQP, nil)
 		residual = transform.InverseDCT(dequantCoeffs, chromaTrSize)
 	} else {
 		residual = make([]int32, chromaTrSize*chromaTrSize)

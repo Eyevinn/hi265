@@ -3,6 +3,7 @@ package encode
 import (
 	"bytes"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/Eyevinn/hi264/pkg/yuv"
@@ -179,5 +180,68 @@ func TestChromaQPOffsetListIsRefused(t *testing.T) {
 	// and it has nothing to refuse.
 	if _, err := EncodeGrayIDRSliceFromSPSPPS(sps, &p); err != nil {
 		t.Errorf("the gray writer uses no chroma QP and should not refuse: %v", err)
+	}
+}
+
+// The writers refuse the parameter sets they cannot honour, and only those. Each
+// flag below would otherwise put a bin in the coding unit that the writer never
+// emits — the decoder then reads one that is not there — or leave the residual
+// quantized with weights the decoder will not use.
+//
+// The gray writer is deliberately more permissive: it codes no coefficients and
+// no residual, so bit depth, chroma format, scaling lists and the chroma QP
+// offsets cannot reach it. Only syntax in the coding unit itself does.
+func TestWritersRefuseWhatTheyCannotHonour(t *testing.T) {
+	_, sps, pps := chromaQPOffsetParamSets(t, chromaQPOffsetFixtures[0].path,
+		chromaQPOffsetFixtures[0].cb, chromaQPOffsetFixtures[0].cr)
+	grid, colors, err := buildGrid(patSMPTE, 0, 12, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		want       string
+		grayToo    bool // whether the gray writer must refuse it as well
+		breakParam func(sps *hevc.SPS, pps *hevc.PPS)
+	}{
+		// In the coding unit, so every writer needs it.
+		{"transquant_bypass", "transquant_bypass_enabled_flag", true,
+			func(_ *hevc.SPS, p *hevc.PPS) { p.TransquantBypassEnabledFlag = true }},
+		{"pcm", "pcm_enabled_flag", true,
+			func(s *hevc.SPS, _ *hevc.PPS) { s.PCMEnabledFlag = true }},
+		// Only where residuals are written.
+		{"scaling_lists", "scaling_list_enabled_flag", false,
+			func(s *hevc.SPS, _ *hevc.PPS) { s.ScalingListEnabledFlag = true }},
+		{"bit_depth", "8-bit", false,
+			func(s *hevc.SPS, _ *hevc.PPS) { s.BitDepthLumaMinus8 = 2 }},
+		{"chroma_format", "chroma_format_idc", false,
+			func(s *hevc.SPS, _ *hevc.PPS) { s.ChromaFormatIDC = 3 }},
+		{"persistent_rice", "persistent_rice_adaptation", false,
+			func(s *hevc.SPS, _ *hevc.PPS) {
+				s.RangeExtension = &hevc.SPSRangeExtension{PersistentRiceAdaptationEnabledFlag: true}
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			brokenSPS, brokenPPS := *sps, *pps
+			tc.breakParam(&brokenSPS, &brokenPPS)
+
+			_, err := EncodeIDRSliceFromSPSPPS(&brokenSPS, &brokenPPS, grid, colors)
+			if err == nil {
+				t.Fatalf("the grid IDR writer should refuse %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the error should mention %q, got: %v", tc.want, err)
+			}
+
+			_, grayErr := EncodeGrayIDRSliceFromSPSPPS(&brokenSPS, &brokenPPS)
+			switch {
+			case tc.grayToo && grayErr == nil:
+				t.Errorf("the gray writer should refuse %s too: it is coding unit syntax", tc.name)
+			case !tc.grayToo && grayErr != nil:
+				t.Errorf("the gray writer codes no residual and should accept %s: %v",
+					tc.name, grayErr)
+			}
+		})
 	}
 }

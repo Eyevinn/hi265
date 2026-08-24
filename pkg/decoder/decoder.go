@@ -60,6 +60,9 @@ type sliceSegment struct {
 	// Scaling a residual uses these; deblocking uses the picture-level pair on its
 	// own (8.7.2.5.5), which picture keeps.
 	chromaQPOffsets transform.ChromaQPOffsets
+	// scaling is the quantization matrix set of spec 7.4.5, or nil when
+	// scaling_list_enabled_flag is clear and every weight is a flat 16.
+	scaling *transform.ScalingLists
 }
 
 // DecodeAnnexB decodes all frames from an Annex-B byte stream.
@@ -146,6 +149,90 @@ func (d *Decoder) DecodeNALUs(nalus [][]byte) ([]*frame.Frame, error) {
 	return frames, nil
 }
 
+// checkSupported refuses the coding tools this decoder does not implement, before
+// a picture is built from them.
+//
+// The point is that every one of these fails silently otherwise, and several fail
+// while still producing a picture that looks plausible. A per-CU flag nothing
+// reads — cu_transquant_bypass_flag, pcm_flag — desynchronises the arithmetic
+// decoder at the first CU that sets it, and the rest of the slice becomes noise
+// that is nonetheless returned as a frame. A bit depth or chroma format nothing
+// reads is worse: the samples are simply interpreted wrongly, and a 10-bit stream
+// decoded as 8-bit comes out a few values off, which reads as a successful decode.
+// A thumbnail that is subtly wrong is worse than no thumbnail.
+func checkSupported(sps *hevc.SPS, pps *hevc.PPS) error {
+	if d := 8 + int(sps.BitDepthLumaMinus8); d != 8 {
+		return fmt.Errorf("bit depth %d is not supported, only 8", d)
+	}
+	if d := 8 + int(sps.BitDepthChromaMinus8); d != 8 {
+		return fmt.Errorf("chroma bit depth %d is not supported, only 8", d)
+	}
+	if sps.ChromaFormatIDC != 1 {
+		return fmt.Errorf("chroma_format_idc %d is not supported, only 1 (4:2:0)",
+			sps.ChromaFormatIDC)
+	}
+	if sps.SeparateColourPlaneFlag {
+		return fmt.Errorf("separate_colour_plane_flag is not supported")
+	}
+	if sps.PCMEnabledFlag {
+		// pcm_flag is a per-CU bin, and a PCM CU carries raw samples after a byte
+		// alignment that also restarts the arithmetic decoder.
+		return fmt.Errorf("pcm_enabled_flag is not supported")
+	}
+	if pps.TransquantBypassEnabledFlag {
+		// cu_transquant_bypass_flag is a per-CU bin, and a bypassed CU skips
+		// scaling, the transform and both loop filters.
+		return fmt.Errorf("transquant_bypass_enabled_flag is not supported")
+	}
+	if ext := pps.RangeExtension; ext != nil {
+		if ext.ChromaQpOffsetListEnabledFlag {
+			// cu_chroma_qp_offset_flag and cu_chroma_qp_offset_idx sit in the
+			// transform unit (spec 7.3.8.10).
+			return fmt.Errorf("chroma_qp_offset_list_enabled_flag is not supported")
+		}
+		if ext.CrossComponentPredictionEnabledFlag {
+			return fmt.Errorf("cross_component_prediction_enabled_flag is not supported")
+		}
+	}
+	if ext := sps.RangeExtension; ext != nil {
+		// These four change how residual_coding is parsed or reconstructed, so a
+		// stream using them desynchronises rather than merely losing quality.
+		switch {
+		case ext.PersistentRiceAdaptationEnabledFlag:
+			return fmt.Errorf("persistent_rice_adaptation_enabled_flag is not supported")
+		case ext.CabacBypassAlignmentEnabledFlag:
+			return fmt.Errorf("cabac_bypass_alignment_enabled_flag is not supported")
+		case ext.ImplicitRdpcmEnabledFlag:
+			return fmt.Errorf("implicit_rdpcm_enabled_flag is not supported")
+		case ext.ExplicitRdpcmEnabledFlag:
+			return fmt.Errorf("explicit_rdpcm_enabled_flag is not supported")
+		case ext.ExtendedPrecisionProcessingFlag:
+			return fmt.Errorf("extended_precision_processing_flag is not supported")
+		}
+	}
+	return nil
+}
+
+// scalingListsFor returns the quantization matrices a stream's parameter sets ask
+// for (spec 7.4.5), or nil when scaling_list_enabled_flag is clear and every
+// weight is the flat 16 that needs no matrix at all.
+//
+// Only the default matrices are supported. An explicit scaling_list_data() can
+// carry any weights it likes, and reading them means parsing the SPS or PPS again
+// here — mp4ff skips past that syntax without keeping the values. Switching the
+// lists on and taking the defaults is what an encoder does when simply asked for
+// scaling lists, and it is the case that used to decode wrongly.
+func scalingListsFor(sps *hevc.SPS, pps *hevc.PPS) (*transform.ScalingLists, error) {
+	if !sps.ScalingListEnabledFlag {
+		return nil, nil
+	}
+	if sps.ScalingListDataPresentFlag || pps.ScalingListDataPresentFlag {
+		return nil, fmt.Errorf(
+			"explicit scaling_list_data is not supported, only the default scaling lists")
+	}
+	return transform.DefaultScalingLists(), nil
+}
+
 // decodeSegment decodes one slice segment into the picture it belongs to,
 // starting a new picture when the segment says it is the first of one and
 // publishing the previous picture at that point.
@@ -155,9 +242,14 @@ func (d *Decoder) decodeSegment(seg *sliceSegment, frames *[]*frame.Frame) error
 	// reads them, so the arithmetic decoder would run past bins that were coded
 	// and produce a plausible-looking wrong picture. The picture and slice level
 	// offsets, which need no extra syntax, are applied.
-	if ext := seg.pps.RangeExtension; ext != nil && ext.ChromaQpOffsetListEnabledFlag {
-		return fmt.Errorf("chroma_qp_offset_list_enabled_flag is not supported")
+	if err := checkSupported(seg.sps, seg.pps); err != nil {
+		return err
 	}
+	scaling, err := scalingListsFor(seg.sps, seg.pps)
+	if err != nil {
+		return err
+	}
+	seg.scaling = scaling
 	if seg.first {
 		if err := d.finishPicture(frames); err != nil {
 			return err
@@ -224,7 +316,7 @@ func (d *Decoder) decodeSegment(seg *sliceSegment, frames *[]*frame.Frame) error
 		refFrame = d.refFrame
 	}
 	if err := reconstructSegment(pic.f, sd, seg.sps, refFrame, pic.grid,
-		seg.chromaQPOffsets); err != nil {
+		seg.chromaQPOffsets, seg.scaling); err != nil {
 		return err
 	}
 
@@ -850,7 +942,7 @@ func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
 // picture, which may be made of several segments.
 func reconstructSegment(f *frame.Frame, sd *slice.SliceData, sps *hevc.SPS,
 	refFrame *frame.Frame, grid *tiles.Grid,
-	chromaQPOffsets transform.ChromaQPOffsets) error {
+	chromaQPOffsets transform.ChromaQPOffsets, scaling *transform.ScalingLists) error {
 
 	bitDepth := 8
 	picWidth, picHeight := f.Width, f.Height
@@ -920,7 +1012,10 @@ func reconstructSegment(f *frame.Frame, sd *slice.SliceData, sps *hevc.SPS,
 
 			var residual []int32
 			if tu.CbfLuma {
-				dequantCoeffs := transform.Dequantize(tu.LumaCoeffs, trSize, cu.QpY)
+				// Every CU reaching this path is intra, so the scaling matrix is
+				// the intra one for this component (spec Table 7-4).
+				lumaM := scaling.Matrix(tu.Log2TrSize, transform.MatrixID(true, 0))
+				dequantCoeffs := transform.Dequantize(tu.LumaCoeffs, trSize, cu.QpY, lumaM)
 				if tu.TransformSkipLuma {
 					residual = transform.TransformSkipShift(dequantCoeffs, tu.Log2TrSize, bitDepth)
 				} else if trSize == 4 {
@@ -986,7 +1081,12 @@ func reconstructSegment(f *frame.Frame, sd *slice.SliceData, sps *hevc.SPS,
 				var chromaResidual []int32
 				hasCbf := (comp == 0 && tu.CbfCb) || (comp == 1 && tu.CbfCr)
 				if hasCbf {
-					dequantCoeffs := transform.Dequantize(chromaCoeffs, chromaTrSize, chromaQP)
+					chromaLog2Size := tu.Log2TrSize - 1
+					if chromaLog2Size < 2 {
+						chromaLog2Size = 2
+					}
+					chromaM := scaling.Matrix(chromaLog2Size, transform.MatrixID(true, comp+1))
+					dequantCoeffs := transform.Dequantize(chromaCoeffs, chromaTrSize, chromaQP, chromaM)
 					tsChroma := (comp == 0 && tu.TransformSkipCb) || (comp == 1 && tu.TransformSkipCr)
 					if tsChroma {
 						chromaLog2 := tu.Log2TrSize - 1

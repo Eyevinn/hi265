@@ -146,7 +146,7 @@ func grayIDRSliceParams(sps *hevc.SPS, pps *hevc.PPS) graySliceParams {
 	}
 }
 
-func validateGraySPSPPS(_ *hevc.SPS, pps *hevc.PPS) error {
+func validateGraySPSPPS(sps *hevc.SPS, pps *hevc.PPS) error {
 	// Tiles are supported, as one independent slice segment per tile, and so is
 	// wavefront parallel processing, as one substream per CTB row of a single
 	// segment. The two together are not: no HEVC profile permits the combination,
@@ -154,8 +154,21 @@ func validateGraySPSPPS(_ *hevc.SPS, pps *hevc.PPS) error {
 	if pps.EntropyCodingSyncEnabledFlag && pps.TilesEnabledFlag {
 		return fmt.Errorf("tiles combined with wavefront parallel processing is not supported")
 	}
-	// A gray picture codes no coefficients, so no chroma QP of any kind is used and
-	// the chroma QP offsets — picture, slice or per-CU — cannot affect it.
+	// A gray picture codes no coefficients, so no chroma QP of any kind is used
+	// and the chroma QP offsets — picture, slice or per-CU — cannot affect it, nor
+	// can the scaling lists. Bit depth and chroma format cannot either: DC
+	// prediction with no residual is mid-grey at any depth, which is the whole
+	// point of this writer.
+	//
+	// What does reach it is syntax in the coding unit itself. Both of these are
+	// bins that would have to be written for every CU, or the decoder reads one
+	// that is not there (spec 7.3.8.5).
+	if pps.TransquantBypassEnabledFlag {
+		return fmt.Errorf("transquant_bypass_enabled_flag is not supported")
+	}
+	if sps.PCMEnabledFlag {
+		return fmt.Errorf("pcm_enabled_flag is not supported")
+	}
 	return nil
 }
 

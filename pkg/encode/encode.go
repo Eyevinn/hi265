@@ -271,12 +271,63 @@ func validateSPSPPS(_ *hevc.SPS, pps *hevc.PPS) error {
 	if ext := pps.RangeExtension; ext != nil && ext.ChromaQpOffsetListEnabledFlag {
 		return fmt.Errorf("chroma_qp_offset_list_enabled_flag is not supported")
 	}
+	// cu_transquant_bypass_flag precedes cu_skip_flag in every coding unit (spec
+	// 7.3.8.5), so a stream that enables it needs the bin written even where
+	// nothing is bypassed. Leaving it out desynchronises the decoder at the first
+	// CU.
+	if pps.TransquantBypassEnabledFlag {
+		return fmt.Errorf("transquant_bypass_enabled_flag is not supported")
+	}
+	return nil
+}
+
+// validateIntraSPSPPS adds the checks that only apply where coefficients and
+// intra coding units are written, which is every writer except P-skip.
+func validateIntraSPSPPS(sps *hevc.SPS, _ *hevc.PPS) error {
+	// pcm_flag sits in the intra coding unit whenever pcm_enabled_flag is set and
+	// the block size is in the PCM range (spec 7.3.8.5).
+	if sps.PCMEnabledFlag {
+		return fmt.Errorf("pcm_enabled_flag is not supported")
+	}
 	return nil
 }
 
 func validateSPSPPSForIDR(sps *hevc.SPS, pps *hevc.PPS) error {
 	if err := validateSPSPPS(sps, pps); err != nil {
 		return err
+	}
+	if err := validateIntraSPSPPS(sps, pps); err != nil {
+		return err
+	}
+	// Unlike the gray writer, this one codes real samples, and it does so in
+	// 8-bit 4:2:0.
+	if d := 8 + int(sps.BitDepthLumaMinus8); d != 8 {
+		return fmt.Errorf("IDR encoding only supports 8-bit, got %d", d)
+	}
+	if d := 8 + int(sps.BitDepthChromaMinus8); d != 8 {
+		return fmt.Errorf("IDR encoding only supports 8-bit chroma, got %d", d)
+	}
+	if sps.ChromaFormatIDC != 1 {
+		return fmt.Errorf("IDR encoding only supports chroma_format_idc 1 (4:2:0), got %d",
+			sps.ChromaFormatIDC)
+	}
+	// The quantizer here is flat, so a stream with scaling lists would be
+	// dequantized with weights this encoder never applied.
+	if sps.ScalingListEnabledFlag {
+		return fmt.Errorf("scaling_list_enabled_flag is not supported when coding residuals")
+	}
+	// These change how residual_coding is parsed or reconstructed.
+	if ext := sps.RangeExtension; ext != nil {
+		switch {
+		case ext.PersistentRiceAdaptationEnabledFlag:
+			return fmt.Errorf("persistent_rice_adaptation_enabled_flag is not supported")
+		case ext.CabacBypassAlignmentEnabledFlag:
+			return fmt.Errorf("cabac_bypass_alignment_enabled_flag is not supported")
+		case ext.ImplicitRdpcmEnabledFlag:
+			return fmt.Errorf("implicit_rdpcm_enabled_flag is not supported")
+		case ext.ExtendedPrecisionProcessingFlag:
+			return fmt.Errorf("extended_precision_processing_flag is not supported")
+		}
 	}
 	// IDR encoding only supports CTU size 16, with 16x16 CUs (minCb=16) or
 	// four 8x8 CUs per CTU (minCb=8)

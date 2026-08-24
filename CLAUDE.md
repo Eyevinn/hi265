@@ -5,12 +5,16 @@
 
 ## Project Status
 
-Pure Go HEVC/H.265 decoder for IDR and P-skip frames, plus a bitstream
+Pure Go HEVC/H.265 decoder for IDR/CRA and P-skip frames, plus a bitstream
 generator for producing valid HEVC test content from flat-color 16x16 CTU
 grid patterns. Pixel-perfect match with FFmpeg decoding across 16+ golden
 test cases (SAO, sign hiding, transform skip, deblocking, P-frames, varied QP).
 Tiles and wavefront parallel processing are supported on both sides; the two
-together are not, since no HEVC profile permits it.
+together are not, since no HEVC profile permits it. Scaling lists are supported
+for the default matrices. Everything the decoder cannot do — bit depth other than
+8, chroma other than 4:2:0, PCM, transquant bypass, explicit scaling lists, the
+range extension residual tools, inter pictures with motion — is refused with an
+error naming the tool rather than decoded into a plausible wrong picture.
 
 ### Dependencies
 - `github.com/Eyevinn/mp4ff` — VPS/SPS/PPS parsing, NAL extraction, MP4 container
