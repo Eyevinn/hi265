@@ -82,6 +82,7 @@ offsets in the PPS are all honoured; `weighted_pred_flag` and
 ```
 pkg/decoder/       — Public: top-level decoder API (DecodeAnnexB)
 pkg/encode/        — Public: bitstream generator API (GenerateIDR, GeneratePSkip, FrameEncoder)
+pkg/retile/        — Public: stitch N HEVC streams into one tiled picture by bitstream editing
 pkg/frame/         — Public: Frame type (decoded output)
 pkg/timecode/      — Public: SMPTE timecode arithmetic and text formatting
 internal/cabac/    — Internal: CABAC arithmetic decoder and encoder engines
@@ -96,6 +97,8 @@ internal/loopfilter/ — Internal: Tile/slice boundaries the loop filters stop a
 cmd/hi265dec/      — CLI: decode HEVC from Annex-B or MP4 to YUV/Y4M/PNG/JPEG
 cmd/hi265gen/      — CLI: generate HEVC bitstreams or raw images from grid patterns
 cmd/hi265gray/     — CLI: generate gray IDR/CRA frames from external VPS/SPS/PPS
+cmd/hi265retile/   — CLI: stitch several Annex-B streams into one tiled stream
+cmd/hi265inspect/  — CLI: dump VPS/SPS/PPS/slice-header fields of an Annex-B file
 testdata/          — Test bitstreams and golden references
 tools/             — Test generation scripts
 ```
