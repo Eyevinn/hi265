@@ -14,21 +14,25 @@ does not buy.
 
 ## Why now: a concrete caller
 
-`../hevc-retiler` stitches N independent HEVC streams into one tiled picture by
-bitstream editing — new SPS/PPS, one rewritten slice header per tile, CABAC
-payloads copied verbatim, no re-encode. It already depends on hi265 for
-`pkg/encode`'s `BitWriter` and `InsertEBSP`.
+`pkg/retile` and `hi265retile` stitch N independent HEVC streams into one tiled
+picture by bitstream editing — new SPS/PPS, one rewritten slice header per tile,
+CABAC payloads copied verbatim, no re-encode. When this document was written
+that tool was a separate repository, `../hevc-retiler`, depending on hi265 for
+`pkg/encode`'s `BitWriter` and `InsertEBSP`; it was moved in-repo once tiles
+decoded (roadmap Phase 6), and the paths below are from that period.
 
-Its correctness proof is `retile -verify` (`internal/verify/verify.go`): decode
-the merged stream and each input, then compare each tile's sub-rectangle against
-that input's standalone decode, every frame. A pass is the empirical statement
-that the inputs really were tileable. That check shells out to **ffmpeg** — the
-project's only external runtime dependency, and the only reason `retile -verify`
-cannot run in CI on a bare Go toolchain.
+Its correctness proof is `hi265retile -verify`: decode the merged stream and
+each input, then compare each tile's sub-rectangle against that input's
+standalone decode, every frame. A pass is the empirical statement that the
+inputs really were tileable. That check used to shell out to **ffmpeg** — the
+project's only external runtime dependency, and the only reason `-verify` could
+not run in CI on a bare Go toolchain.
 
 A tiles-capable `pkg/decoder` would replace `decodeYUV420`'s `exec.Command` with
 `decoder.New().DecodeAnnexB` plus `frame.YUV420Bytes()`. Both sides are Annex-B
-already, so no MP4 plumbing is involved.
+already, so no MP4 plumbing is involved. That is what `-decoder hi265` does
+today; ffmpeg remains available as the cross-check, and as the only option for
+inter content.
 
 Tiles are also worth having on their own account: they are how real 4K/8K and
 360-video streams are cut up, so this is the same class of "blocks most
@@ -36,7 +40,8 @@ real-world input" that motivated 0.9.
 
 ## Measured baseline (2026-08-22)
 
-Everything below was checked against `../hevc-retiler/out`, decoding with
+Everything below was checked against the stitcher's output, then in
+`../hevc-retiler/out`, decoding with
 `cmd/hi265dec` and comparing to `ffmpeg -f rawvideo -pix_fmt yuv420p`.
 
 | input | hi265 before T1–T3 |
@@ -82,7 +87,7 @@ grid: tile @256,256 256x256 == q3.265 OK (5 frames)
 ```
 
 Every tile's sub-rectangle of the merged picture equals that input's standalone
-decode, sample for sample. That is `retile -verify`'s entire test, and for
+decode, sample for sample. That is `hi265retile -verify`'s entire test, and for
 all-intra content it now runs on a bare Go toolchain.
 
 What remains outside the supported set is refused rather than mis-decoded:
@@ -99,11 +104,11 @@ header by 5 bits").
 
 ## The narrow target
 
-`hevc-retiler` emits a deliberately simple flavour of tiling. Supporting exactly
+`hi265retile` emits a deliberately simple flavour of tiling. Supporting exactly
 this is much less work than general tiles, and it is worth being explicit about
 where the line falls.
 
-| property | retiler's output | general HEVC |
+| property | the stitcher's output | general HEVC |
 |---|---|---|
 | `tiles_enabled_flag` | 1 | 1 |
 | spacing | uniform, or explicit `column_width_minus1` / `row_height_minus1` | same |
@@ -271,7 +276,7 @@ T1–T3 had just opened up would have been worse than the fix.
 
 With `loop_filter_across_tiles_enabled_flag = 0`, no deblocking or SAO may cross
 a tile edge. If hi265 filters across it, a merged decode will differ from the
-standalone decodes precisely at the tile seams — turning `retile -verify` into a
+standalone decodes precisely at the tile seams — turning `hi265retile -verify` into a
 generator of false mismatches.
 
 `deblock.Apply` builds edge flags on a 4x4 grid (`internal/deblock/deblock.go:45`);
@@ -312,7 +317,7 @@ presence was keyed on the SPS SAO flag rather than the two *slice* SAO flags, so
 a slice with SAO off and deblocking disabled would have read a bit that was
 never coded. It is now inferred from the PPS when absent, per spec 7.4.7.1.
 
-That per-slice flag is not decoration. In `hevc-retiler`'s `grid.265` it is 1 in
+That per-slice flag is not decoration. In the stitcher's `grid.265` it is 1 in
 pictures 1, 2 and 5 and 0 in pictures 3 and 4 — x265 varies it per frame, and it
 survives the stitch verbatim — so a decoder that assumed the PPS value would be
 using the wrong rule on three fifths of that stream.
@@ -357,8 +362,8 @@ The conformance harness from 0.2 is the right vehicle, with one addition: the
 generator cannot produce tiled streams, so the fixtures have to come from an
 encoder that can. **x265 cannot** — it offers WPP and slices, not tiles.
 **kvazaar can**, and `--tiles WxH --slices tiles` produces precisely the
-retiler shape (one independent segment per tile, no entry points), so the
-fixtures need not come from `hevc-retiler` at all:
+stitcher's shape (one independent segment per tile, no entry points), so the
+fixtures need not come from a stitched stream at all:
 
 ```
 kvazaar -i in.yuv --input-res 256x256 -n 3 -p 1 --preset veryfast \
@@ -371,8 +376,8 @@ kvazaar -i in.yuv --input-res 256x256 -n 3 -p 1 --preset veryfast \
   differ.
 - The same content with deblocking on, to pin T5. Until T5 lands the expected
   result is "equal except within 4 luma / 2 chroma samples of a tile seam".
-- A `hevc-retiler` output plus its inputs: assert each tile's crop equals the
-  input's standalone decode. This is `retile -verify`'s check, run inside
+- A stitched output plus its inputs: assert each tile's crop equals the
+  input's standalone decode. This is `hi265retile -verify`'s check, run inside
   hi265's own test suite — and it fails loudly if T4 or T5 is wrong.
 - A grid whose uniform spacing is not an equal division, to pin T2. 320x256 with
   a 64-luma CTB is 5 CTBs wide, so two uniform columns are 2 and 3 CTBs, not
@@ -393,8 +398,10 @@ this needs; the three unfiltered vectors stay green under that mutation, as they
 should. `internal/loopfilter` also has direct unit tests for the two rules,
 including that it is the *later* slice's flag which governs.
 
-Still to add: the `hevc-retiler` output plus its inputs, for the cross-project
-check in CI. A plain multi-slice, no-tiles vector turns out to be awkward to
+Added since, with the stitcher itself: `testdata/retile_*` holds five inputs,
+and `pkg/retile`'s tests stitch them and assert each tile's crop equals that
+input's standalone decode, in-process. That is the check this section wanted,
+and it no longer crosses a project boundary. A plain multi-slice, no-tiles vector turns out to be awkward to
 generate — x265 refuses `--slices` without WPP, and kvazaar's `--slices wpp`
 emits *dependent* segments — so both encoders here can only produce the
 multi-segment shapes this decoder refuses. The tiled vectors cover T1 anyway.
@@ -441,7 +448,7 @@ refused at the inter CU at (304,120) rather than at the first CTU of a
 misparsed header. That file is in the roadmap's 0.10 table as decoding
 "exact"; that claim was only ever true of its first picture.
 
-This matters more than it looks for `retile -verify`. Zero-motion copy is
+This matters more than it looks for `hi265retile -verify`. Zero-motion copy is
 translation-invariant within a tile, so a hi265 that ignores motion vectors
 would very likely report the merged and standalone decodes as *equal* on a
 genuinely non-motion-constrained stream — passing `demo.sh`'s scenario 5, the
@@ -451,11 +458,11 @@ until real motion compensation exists.
 ## What this buys — and what it does not
 
 **It buys the all-intra case, completely** — and as of T5 that is delivered,
-not projected. Every all-intra input in `hevc-retiler/out` and every merged
+not projected. Every all-intra input in the stitcher's output and every merged
 stream built from them decodes bit-exactly against ffmpeg, and each tile of a
 merged picture equals its input's standalone decode under hi265 alone. For a
-stream of I-frames stitched from x265 inputs, `retile -verify` can drop ffmpeg
-today: swap `decodeYUV420`'s `exec.Command` for `decoder.New().DecodeAnnexB`
+stream of I-frames stitched from x265 inputs, `hi265retile -verify` drops ffmpeg
+entirely, which is what `-decoder hi265` does: `decoder.New().DecodeAnnexB`
 plus `frame.YUV420Bytes()`.
 
 The differential check `verify` performs is in any case weaker than
@@ -477,13 +484,13 @@ makes the check pleasantly self-policing during bring-up.
 
 **It does not buy the inter case, which is the interesting one.** The MCTS
 question — do motion vectors and their interpolation footprints stay inside the
-tile — only arises for P/B inputs, and `hevc-retiler`'s `demo.sh` deliberately
+tile — only arises for P/B inputs, and `tools/retile_demo.sh` deliberately
 includes a negative scenario built from a non-motion-constrained encode that
 `verify` must reject. `pkg/decoder` reconstructs only zero-motion skip CUs, so
 kvazaar P-frames with real vectors are out of reach — measurably so, and
 and it says so as of T8 rather than returning a wrong picture. That matters for
 the caller: a decoder that ignored motion vectors could compare *equal* on a
-genuinely non-MCTS stream and pass `retile -verify`'s negative test for the
+genuinely non-MCTS stream and pass `hi265retile -verify`'s negative test for the
 wrong reason. It now refuses instead, which is the only safe answer until real
 motion compensation exists.
 
@@ -529,8 +536,8 @@ What is left, in the order that makes each step verifiable:
    after a byte-aligned flush — but `pkg/decoder` navigates by the entry point
    offsets, so it read the broken stream back bit-exactly and only FFmpeg's
    sequential path saw the damage.
-5. **T7's last fixture**, a committed `hevc-retiler` output with its inputs, for
-   the cross-project check in CI.
+5. **T7's last fixture** — done: `testdata/retile_*` plus `pkg/retile`'s tile-crop
+   comparison, which runs in-process and needs no external decoder.
 
 Tiles combined with WPP is the one shape deliberately left out, decoding and
 encoding alike: no profile permits it.

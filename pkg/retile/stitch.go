@@ -221,7 +221,7 @@ var levelTable = []struct {
 	{180, 35651584}, {183, 35651584}, {186, 35651584},
 }
 
-func pickLevelIDC(samples int, atLeast byte) byte {
+func pickLevelIDC(samples int, minIDC byte) byte {
 	chosen := levelTable[len(levelTable)-1].idc
 	for _, l := range levelTable {
 		if l.maxLumaPs >= samples {
@@ -229,8 +229,8 @@ func pickLevelIDC(samples int, atLeast byte) byte {
 			break
 		}
 	}
-	if chosen < atLeast {
-		chosen = atLeast
+	if chosen < minIDC {
+		chosen = minIDC
 	}
 	return chosen
 }

@@ -30,6 +30,8 @@ func main() {
 	out := flag.String("o", "merged.265", "output Annex-B file")
 	grid := flag.String("grid", "", "tile grid RxC (rows x cols), inputs row-major; default vertical Nx1")
 	doVerify := flag.Bool("verify", false, "after writing, decode and compare each tile to its source")
+	dec := flag.String("decoder", string(retile.DecoderAuto),
+		"verification decoder: auto, hi265 (in-process) or ffmpeg")
 	flag.Parse()
 	inputs := flag.Args()
 	if len(inputs) < 2 {
@@ -56,7 +58,7 @@ func main() {
 		float64(res.LevelIDC)/30, len(res.Data))
 
 	if *doVerify {
-		check(retile.Verify(res, os.Stdout))
+		check(retile.Verify(res, retile.DecoderKind(*dec), os.Stdout))
 		fmt.Println("verify: all tiles pixel-perfect")
 	}
 }
