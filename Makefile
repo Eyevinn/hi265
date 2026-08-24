@@ -5,7 +5,7 @@ LDFLAGS = -X github.com/Eyevinn/hi265/internal.commitVersion=$$(git describe --t
 
 all: check build test
 
-build: out/hi265dec out/hi265gen out/hi265gray
+build: out/hi265dec out/hi265gen out/hi265gray out/hi265retile
 
 out/hi265dec: $(shell find pkg cmd/hi265dec internal -name '*.go')
 	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265dec
@@ -15,6 +15,9 @@ out/hi265gen: $(shell find pkg cmd/hi265gen internal -name '*.go')
 
 out/hi265gray: $(shell find pkg cmd/hi265gray internal -name '*.go')
 	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265gray
+
+out/hi265retile: $(shell find pkg cmd/hi265retile internal -name '*.go')
+	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265retile
 
 test:
 	go test ./...
@@ -48,3 +51,4 @@ install:
 	go install -ldflags "$(LDFLAGS)" ./cmd/hi265dec
 	go install -ldflags "$(LDFLAGS)" ./cmd/hi265gen
 	go install -ldflags "$(LDFLAGS)" ./cmd/hi265gray
+	go install -ldflags "$(LDFLAGS)" ./cmd/hi265retile

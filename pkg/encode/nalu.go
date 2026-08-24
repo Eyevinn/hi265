@@ -69,6 +69,27 @@ func InsertEBSP(rbsp []byte) []byte {
 	return out
 }
 
+// RemoveEmulationPrevention converts EBSP back to RBSP, dropping the 0x03
+// that InsertEBSP added after a 0x00 0x00 run. The exact inverse of InsertEBSP.
+func RemoveEmulationPrevention(ebsp []byte) []byte {
+	out := make([]byte, 0, len(ebsp))
+	zeros := 0
+	for _, b := range ebsp {
+		if zeros >= 2 && b == 0x03 {
+			// Emulation-prevention byte: drop it, reset the run.
+			zeros = 0
+			continue
+		}
+		out = append(out, b)
+		if b == 0 {
+			zeros++
+		} else {
+			zeros = 0
+		}
+	}
+	return out
+}
+
 // FillerNALU returns a filler NALU of the exact given byte size (including start code).
 // Minimum size is 7 bytes (4 start code + 2 header + 1 trailing 0x80).
 func FillerNALU(size int) ([]byte, error) {
