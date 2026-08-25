@@ -7,8 +7,8 @@ import (
 )
 
 var (
-	commitVersion string = "v0.1.0"
-	commitDate    string = "1778544000"
+	commitVersion string = "v0.5.0" // May be updated using build flags
+	commitDate    string = "1787608800"
 )
 
 // GetVersion returns version and commitDate if available.

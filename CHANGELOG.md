@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-25
+
+Numbered 0.5.0 rather than 0.2.0: what landed since 0.1.0 is most of a codec —
+tiles and wavefront parallel processing on both sides, slice segments, real
+encoder output decoding bit-exactly, a tile stitcher, and a decoder that names
+the tool it cannot handle instead of guessing. A single minor bump would have
+understated it.
+
 ### Added
 
 #### Tile stitching (`hi265retile`, `pkg/retile`)
@@ -437,5 +445,6 @@ generator. Sister project to [hi264](https://github.com/Eyevinn/hi264).
 - Benchmark for gray IDR generation at 1920x1080 in three formats
   (4:2:0 8-bit, 4:2:0 10-bit, 4:2:2 10-bit)
 
-[Unreleased]: https://github.com/Eyevinn/hi265/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Eyevinn/hi265/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Eyevinn/hi265/compare/v0.1.0...v0.5.0
 [0.1.0]: https://github.com/Eyevinn/hi265/releases/tag/v0.1.0
