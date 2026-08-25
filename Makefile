@@ -26,11 +26,21 @@ out/hi265-mp4-extend: $(shell find pkg cmd/hi265-mp4-extend internal -name '*.go
 out/hi265inspect: $(shell find pkg cmd/hi265inspect internal -name '*.go')
 	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265inspect
 
+# The Python venv this Makefile creates lives inside the module, and pre-commit
+# ships an empty Go template in its resources — so './...' matches a package
+# under venv/ once 'make pre-commit' has run. It is an empty main(), so it does
+# not move the coverage percentage, but it appears as a phantom 0.0% package in
+# every report and would break the build outright if that template ever stopped
+# compiling. CI never sees it (venv/ is gitignored), so filter it here rather
+# than in the workflow.
+GOPKGS = go list ./... | grep -v '/venv/'
+
 test:
-	go test ./...
+	go test $$($(GOPKGS))
 
 coverage:
-	go test -coverpkg=./... -coverprofile=coverage.out ./...
+	pkgs=$$($(GOPKGS)); \
+	go test -coverpkg="$$(echo $$pkgs | tr ' ' ',')" -coverprofile=coverage.out $$pkgs
 	go tool cover -html=coverage.out -o coverage.html
 	go tool cover -func=coverage.out -o coverage.txt
 	@echo "Coverage report: coverage.html"
