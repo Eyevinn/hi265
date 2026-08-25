@@ -16,7 +16,6 @@ the tool it cannot handle instead of guessing. A single minor bump would have
 understated it.
 
 ### Added
-
 #### Tile stitching (`hi265retile`, `pkg/retile`)
 - `hevc-retiler` moves in-repo. It combines several HEVC videos into one tiled
   picture by bitstream editing: a merged SPS/PPS, one rewritten slice header per
@@ -60,50 +59,6 @@ understated it.
   QP 22, and none at QP 32 — the default 4x4 matrix is itself flat, so a coarsely
   quantized picture hides the whole feature. Explicit `scaling_list_data` is
   refused rather than ignored.
-
-### Changed
-
-- The decoder refuses the coding tools it does not implement instead of decoding
-  past them: bit depth other than 8, chroma formats other than 4:2:0,
-  `separate_colour_plane_flag`, PCM, transquant bypass, explicit scaling lists,
-  and the range extension tools that change residual parsing. Each produced a
-  picture before — `--lossless` came out as noise (12254 of 12288 samples wrong),
-  and a 10-bit stream came out three values off, which looks like a correct decode.
-  The encoder gained the matching refusals, per writer: the gray writer codes no
-  residual so bit depth, chroma format and scaling lists cannot affect it, while
-  `cu_transquant_bypass_flag` and `pcm_flag` are coding unit syntax and are refused
-  everywhere.
-
-### Fixed
-
-- Chroma QP offsets were ignored throughout, in the **decoder** as well as the
-  encoder. Spec 8.6.1 adds `pps_cb_qp_offset`/`pps_cr_qp_offset` and the slice-level
-  pair to the luma QP before Table 8-10 maps it to a chroma QP, and spec 8.7.2.5.5
-  folds the picture-level pair into the chroma deblocking edge; every chroma QP came
-  from the luma QP alone, and the slice-level offsets were parsed and discarded.
-  Both sides agreed with each other, so only a stream carrying a non-zero offset
-  showed it: on an x265 vector with `--cbqpoffs 6 --crqpoffs -6` the luma plane was
-  perfect and every chroma sample was wrong, by up to 71. `transform.ChromaQP` is
-  now the single derivation, including the clip that the ±24 an offset pair can
-  reach makes necessary. Chroma deblocking derives `tC` per component, since the two
-  offsets need not be equal. `chroma_qp_offset_list_enabled_flag`, the per-CU
-  variant, needs transform-unit syntax neither side handles and is refused rather
-  than decoded past.
-
-- A picture width that is not a multiple of the 16x16 CTU coded the wrong
-  samples. A grid cell is one CTU, so `yuv.BuildFrame` lays a grid out wider than
-  such a picture; the grid entry points handed those planes to the slice writers,
-  which index them at the picture width, so every row was read one CTU remainder
-  further along than the last and the encoder coded a sheared picture. The source
-  samples are now repacked at the picture's own stride — the same crop
-  `YUV420Bytes` applies — so a `.265` and a `.yuv` of one pattern agree.
-  `hi265gen -smpte -w 120 -h 80` differed from its own raw output on 14050 of
-  14400 samples at max delta 177; it now differs on 480 at max delta 1. Only the
-  width was affected, so 1920x1080 and 640x360 were never wrong, and widths that
-  are multiples of 16 are byte-identical to before. A grid too small for the
-  picture is now an error instead of a read past the buffer.
-
-### Added
 
 #### Sign data hiding (encoder)
 - `pkg/encode` honours `sign_data_hiding_enabled_flag`, which x265 sets by
@@ -305,7 +260,59 @@ understated it.
 - Tests needing FFmpeg or x265 skip cleanly when those are absent; override the
   binaries with `HI265_FFMPEG` and `HI265_X265`.
 
+### Changed
+- The decoder refuses the coding tools it does not implement instead of decoding
+  past them: bit depth other than 8, chroma formats other than 4:2:0,
+  `separate_colour_plane_flag`, PCM, transquant bypass, explicit scaling lists,
+  and the range extension tools that change residual parsing. Each produced a
+  picture before — `--lossless` came out as noise (12254 of 12288 samples wrong),
+  and a 10-bit stream came out three values off, which looks like a correct decode.
+  The encoder gained the matching refusals, per writer: the gray writer codes no
+  residual so bit depth, chroma format and scaling lists cannot affect it, while
+  `cu_transquant_bypass_flag` and `pcm_flag` are coding unit syntax and are refused
+  everywhere.
+
+- mp4ff bumped from v0.52.0 to v0.56.0, which is now the minimum: it carries the
+  spec 7.4.7.1 slice header inferences that `hi265-mp4-extend` depends on.
+- Generated bitstreams differ from v0.1.0 for non-flat content, deliberately: the
+  intra boundary filter and the MPM CTB rule both change what a conforming decoder
+  reads. Flat-colour output at multiple-of-16 dimensions is unchanged byte for
+  byte, pinned by a digest test.
+- `pkg/decoder` output is the conformance window rather than the coded picture.
+- `hi265dec` image output starts at the first decoded frame and writes one
+  numbered file per frame when there is more than one; it previously wrote the
+  last decoded frame to a single file.
+- Frame dimensions must be a multiple of 8 rather than 16, and sizes that cannot
+  be coded now return an error naming the nearest usable size instead of
+  panicking.
+
 ### Fixed
+- Chroma QP offsets were ignored throughout, in the **decoder** as well as the
+  encoder. Spec 8.6.1 adds `pps_cb_qp_offset`/`pps_cr_qp_offset` and the slice-level
+  pair to the luma QP before Table 8-10 maps it to a chroma QP, and spec 8.7.2.5.5
+  folds the picture-level pair into the chroma deblocking edge; every chroma QP came
+  from the luma QP alone, and the slice-level offsets were parsed and discarded.
+  Both sides agreed with each other, so only a stream carrying a non-zero offset
+  showed it: on an x265 vector with `--cbqpoffs 6 --crqpoffs -6` the luma plane was
+  perfect and every chroma sample was wrong, by up to 71. `transform.ChromaQP` is
+  now the single derivation, including the clip that the ±24 an offset pair can
+  reach makes necessary. Chroma deblocking derives `tC` per component, since the two
+  offsets need not be equal. `chroma_qp_offset_list_enabled_flag`, the per-CU
+  variant, needs transform-unit syntax neither side handles and is refused rather
+  than decoded past.
+
+- A picture width that is not a multiple of the 16x16 CTU coded the wrong
+  samples. A grid cell is one CTU, so `yuv.BuildFrame` lays a grid out wider than
+  such a picture; the grid entry points handed those planes to the slice writers,
+  which index them at the picture width, so every row was read one CTU remainder
+  further along than the last and the encoder coded a sheared picture. The source
+  samples are now repacked at the picture's own stride — the same crop
+  `YUV420Bytes` applies — so a `.265` and a `.yuv` of one pattern agree.
+  `hi265gen -smpte -w 120 -h 80` differed from its own raw output on 14050 of
+  14400 samples at max delta 177; it now differs on 480 at max delta 1. Only the
+  width was affected, so 1920x1080 and 640x360 were never wrong, and widths that
+  are multiples of 16 are byte-identical to before. A grid too small for the
+  picture is now an error instead of a read past the buffer.
 
 Twelve conformance defects. Each was invisible to the existing tests for the same
 reason: the generator emits flat colours, three intra modes and one transform
@@ -367,21 +374,6 @@ And one defect of a different kind, in a dependency rather than in the codec:
   `testdata/sincos_128x64.265`; nothing caught it because the other tests extend
   streams from our generator, which does not have that shape. Fixed upstream
   (Eyevinn/mp4ff#558) and pinned here by requiring mp4ff v0.56.0.
-
-### Changed
-- mp4ff bumped from v0.52.0 to v0.56.0, which is now the minimum: it carries the
-  spec 7.4.7.1 slice header inferences that `hi265-mp4-extend` depends on.
-- Generated bitstreams differ from v0.1.0 for non-flat content, deliberately: the
-  intra boundary filter and the MPM CTB rule both change what a conforming decoder
-  reads. Flat-colour output at multiple-of-16 dimensions is unchanged byte for
-  byte, pinned by a digest test.
-- `pkg/decoder` output is the conformance window rather than the coded picture.
-- `hi265dec` image output starts at the first decoded frame and writes one
-  numbered file per frame when there is more than one; it previously wrote the
-  last decoded frame to a single file.
-- Frame dimensions must be a multiple of 8 rather than 16, and sizes that cannot
-  be coded now return an error naming the nearest usable size instead of
-  panicking.
 
 ### Known limitations
 - Tiles are not supported: the entry point offsets parse, but tile scan order and
