@@ -376,15 +376,18 @@ And one defect of a different kind, in a dependency rather than in the codec:
   (Eyevinn/mp4ff#558) and pinned here by requiring mp4ff v0.56.0.
 
 ### Known limitations
-- Tiles are not supported: the entry point offsets parse, but tile scan order and
-  per-tile CABAC reset are not implemented.
-- P and B frames with real motion are out of scope; only zero-motion skip is
-  implemented, so inter pictures beyond a freeze are far off.
+- P and B pictures with real motion are out of scope: only zero-motion skip CUs
+  are reconstructed. Such a picture is refused with a message naming the CU that
+  stopped it, rather than decoded into a plausible wrong picture.
+- Decoding is 8-bit 4:2:0. `hi265gray` generates any chroma format and bit depth,
+  but the decoder refuses those streams, so its output can only be verified with
+  an external decoder.
+- PCM, transquant bypass (lossless), explicit `scaling_list_data` and the range
+  extension residual tools are refused rather than implemented; the default
+  scaling list matrices are supported.
 - Generated frame dimensions must be a multiple of 8. Finer sizes need a
   conformance window on the encoder side and are rejected with an error naming the
   nearest usable size.
-- Decoding is 8-bit 4:2:0. `hi265gray` generates any chroma format and bit depth,
-  but its output can only be verified with an external decoder.
 
 ## [0.1.0] - 2026-05-12
 
