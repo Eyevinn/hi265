@@ -28,9 +28,10 @@ cmd/**/*.y4m
 # Dependencies
 vendor/
 
-# IDE
+# IDE and agent scratch space
 .vscode/
 .DS_Store
+.claude/
 
 # Python virtual environments
 venv/
@@ -42,7 +43,6 @@ notes/
 # Debug/diagnostic tools (not part of the main project)
 cmd/bitstreamdump/
 cmd/cabactrace/
-cmd/debug_cus/
 cmd/findcoeff/
 cmd/qptest/
 cmd/spsdump/

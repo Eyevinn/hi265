@@ -10,28 +10,19 @@ generator for producing valid HEVC test content from flat-color 16x16 CTU
 grid patterns. Pixel-perfect match with FFmpeg decoding across 16+ golden
 test cases (SAO, sign hiding, transform skip, deblocking, P-frames, varied QP).
 Tiles and wavefront parallel processing are supported on both sides; the two
-together are not, since no HEVC profile permits it. Scaling lists are supported
+together are not, since no HEVC profile permits it. `hi265retile` stitches
+several streams into one tiled picture by bitstream editing, with no re-encode,
+and verifies the result with `pkg/decoder` in-process. Scaling lists are supported
 for the default matrices. Everything the decoder cannot do — bit depth other than
 8, chroma other than 4:2:0, PCM, transquant bypass, explicit scaling lists, the
 range extension residual tools, inter pictures with motion — is refused with an
 error naming the tool rather than decoded into a plausible wrong picture.
 
-### Dependencies
-- `github.com/Eyevinn/mp4ff` — VPS/SPS/PPS parsing, NAL extraction, MP4 container
-- `github.com/Eyevinn/hi264` — Grid/color/SMPTE utilities (`pkg/yuv`), frame type
-
 ### Key Reference Files
 - Standard: `references/ISO_IEC_DIS_23008-2_Ed5_2022.pdf`
 - Sister project: `../hi264` (H.264 encoder/decoder)
 
-## Build & Test
-
-```bash
-go build ./...
-go test ./...
-```
-
-### CLI
+## CLI
 
 ```bash
 # Decode HEVC Annex-B to raw YUV
@@ -54,51 +45,23 @@ go run ./cmd/hi265gray -f params.json -o gray.265
 
 # Generate a gray CRA refresh frame at a chosen POC (GDR splice point)
 go run ./cmd/hi265gray -f params.json -cra -poc 42 -o gray_cra.265
+
+# Stitch several streams into one tiled picture, and check every tile against
+# its own decode (-decoder auto|hi265|ffmpeg; inter content needs ffmpeg)
+go run ./cmd/hi265retile -grid 2x2 -verify -o merged.265 a.265 b.265 c.265 d.265
+
+# Dump the NAL/SPS/PPS/slice structure of any Annex-B file
+go run ./cmd/hi265inspect merged.265
 ```
 
-## Encoder API
+## Retiling API
 
-Grid-based functions that produce Annex-B HEVC NALUs from flat-color CTU patterns:
+`pkg/retile` stitches N Annex-B streams into one tiled picture: a merged
+SPS/PPS, one rewritten slice header per tile, CABAC payloads copied verbatim.
 
-- `GenerateVPSSPSPPS(p)` — VPS + SPS + PPS NALUs
-- `GenerateIDR(p, grid, colors)` — IDR slice NALU
-- `GeneratePSkip(p, poc)` — P-skip slice NALU
-
-External SPS/PPS support (for injecting frames into existing streams). Tiles,
-wavefront parallel processing, `cu_qp_delta`, `sign_data_hiding` and the chroma QP
-offsets in the PPS are all honoured; `weighted_pred_flag` and
-`chroma_qp_offset_list_enabled_flag` are refused with a clear error:
-
-- `EncodeIDRSliceFromSPSPPS(sps, pps, grid, colors)` — IDR slice compatible with external parameter sets
-- `EncodePSkipSliceFromSPSPPS(sps, pps, poc)` — P-skip slice compatible with external parameter sets
-- `EncodeGrayIDRSliceFromSPSPPS(sps, pps)` — Gray IDR slice (any chroma format/bit depth)
-- `EncodeCRASliceFromSPSPPS(sps, pps, grid, colors, poc)` — CRA slice at a chosen POC (no POC reset)
-- `EncodeGrayCRASliceFromSPSPPS(sps, pps, poc)` — Gray CRA slice, the GDR refresh primitive
-
-`FrameEncoder` wraps these functions with a struct-based API for convenience.
-
-## Architecture
-
-```
-pkg/decoder/       — Public: top-level decoder API (DecodeAnnexB)
-pkg/encode/        — Public: bitstream generator API (GenerateIDR, GeneratePSkip, FrameEncoder)
-pkg/retile/        — Public: stitch N HEVC streams into one tiled picture by bitstream editing
-pkg/frame/         — Public: Frame type (decoded output)
-pkg/timecode/      — Public: SMPTE timecode arithmetic and text formatting
-internal/cabac/    — Internal: CABAC arithmetic decoder and encoder engines
-internal/context/  — Internal: Context model initialization (170 contexts)
-internal/slice/    — Internal: Slice data parsing, CTU/CU/TU quadtree
-internal/tiles/    — Internal: Tile geometry and tile scan tables (spec 6.5.1)
-internal/transform/— Internal: Inverse quantization and transform (4x4, 8x8, 16x16)
-internal/pred/     — Internal: Intra prediction modes (planar, DC, angular)
-internal/deblock/  — Internal: Deblocking filter
-internal/sao/      — Internal: Sample Adaptive Offset
-internal/loopfilter/ — Internal: Tile/slice boundaries the loop filters stop at
-cmd/hi265dec/      — CLI: decode HEVC from Annex-B or MP4 to YUV/Y4M/PNG/JPEG
-cmd/hi265gen/      — CLI: generate HEVC bitstreams or raw images from grid patterns
-cmd/hi265gray/     — CLI: generate gray IDR/CRA frames from external VPS/SPS/PPS
-cmd/hi265retile/   — CLI: stitch several Annex-B streams into one tiled stream
-cmd/hi265inspect/  — CLI: dump VPS/SPS/PPS/slice-header fields of an Annex-B file
-testdata/          — Test bitstreams and golden references
-tools/             — Test generation scripts
-```
+Inputs must share every coding tool (only picture size and level may differ),
+be CTB-aligned, code one picture per slice segment, have tiles/WPP off and no
+conformance window; all of that is refused with a message naming the property.
+Inter inputs must additionally be motion-constrained (MCTS), which is not
+visible in the bitstream — `Verify` is the only proof of it, and it needs
+ffmpeg there, since `pkg/decoder` reconstructs only zero-motion skip CUs.

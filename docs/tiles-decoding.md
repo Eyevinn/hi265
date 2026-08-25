@@ -17,9 +17,9 @@ does not buy.
 `pkg/retile` and `hi265retile` stitch N independent HEVC streams into one tiled
 picture by bitstream editing — new SPS/PPS, one rewritten slice header per tile,
 CABAC payloads copied verbatim, no re-encode. When this document was written
-that tool was a separate repository, `../hevc-retiler`, depending on hi265 for
+that tool was a separate repository, `hevc-retiler`, depending on hi265 for
 `pkg/encode`'s `BitWriter` and `InsertEBSP`; it was moved in-repo once tiles
-decoded (roadmap Phase 6), and the paths below are from that period.
+decoded (roadmap Phase 6).
 
 Its correctness proof is `hi265retile -verify`: decode the merged stream and
 each input, then compare each tile's sub-rectangle against that input's
@@ -40,9 +40,9 @@ real-world input" that motivated 0.9.
 
 ## Measured baseline (2026-08-22)
 
-Everything below was checked against the stitcher's output, then in
-`../hevc-retiler/out`, decoding with
-`cmd/hi265dec` and comparing to `ffmpeg -f rawvideo -pix_fmt yuv420p`.
+Everything below was checked against the stitcher's output of the time,
+decoding with `cmd/hi265dec` and comparing to
+`ffmpeg -f rawvideo -pix_fmt yuv420p`.
 
 | input | hi265 before T1–T3 |
 |---|---|
