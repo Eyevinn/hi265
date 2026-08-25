@@ -5,7 +5,8 @@ LDFLAGS = -X github.com/Eyevinn/hi265/internal.commitVersion=$$(git describe --t
 
 all: check build test
 
-build: out/hi265dec out/hi265gen out/hi265gray out/hi265retile
+build: out/hi265dec out/hi265gen out/hi265gray out/hi265retile \
+       out/hi265-mp4-extend out/hi265inspect
 
 out/hi265dec: $(shell find pkg cmd/hi265dec internal -name '*.go')
 	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265dec
@@ -18,6 +19,12 @@ out/hi265gray: $(shell find pkg cmd/hi265gray internal -name '*.go')
 
 out/hi265retile: $(shell find pkg cmd/hi265retile internal -name '*.go')
 	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265retile
+
+out/hi265-mp4-extend: $(shell find pkg cmd/hi265-mp4-extend internal -name '*.go')
+	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265-mp4-extend
+
+out/hi265inspect: $(shell find pkg cmd/hi265inspect internal -name '*.go')
+	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265inspect
 
 test:
 	go test ./...
@@ -41,8 +48,19 @@ venv/bin/pre-commit venv/bin/codespell:
 	python3 -m venv venv
 	venv/bin/pip install pre-commit codespell
 
+# Paths that are data rather than prose. cmd/hi265gray/data is a gitignored
+# local scratch area of hex parameter sets and captures; it is not in the repo,
+# but skipping it keeps this target green where it does exist.
+CODESPELL_SKIP = venv,vendor,testdata,./cmd/hi265gray/data,coverage.html,*.y4m,*.yuv,*.265,*.hevc,*.mp4
+
+# Words to leave alone, all of them domain vocabulary or deliberate:
+#   trun, truns  the MP4 track run box, and mp4ff's Truns field holding them
+#   nd           the %Nd frame-number format spec documented in pkg/timecode
+#   unparseable  a variant spelling, used in a comment about a missing element
+CODESPELL_IGNORE = pich,localy,ue,trun,truns,nd,unparseable
+
 codespell: venv/bin/codespell
-	venv/bin/codespell -S venv,vendor,testdata,coverage.html,'*.y4m','*.265','*.hevc','*.mp4' -L pich,localy,ue
+	venv/bin/codespell -S '$(CODESPELL_SKIP)' -L '$(CODESPELL_IGNORE)'
 
 clean:
 	rm -rf out/ coverage.out coverage.html coverage.txt venv/
@@ -52,3 +70,5 @@ install:
 	go install -ldflags "$(LDFLAGS)" ./cmd/hi265gen
 	go install -ldflags "$(LDFLAGS)" ./cmd/hi265gray
 	go install -ldflags "$(LDFLAGS)" ./cmd/hi265retile
+	go install -ldflags "$(LDFLAGS)" ./cmd/hi265-mp4-extend
+	go install -ldflags "$(LDFLAGS)" ./cmd/hi265inspect

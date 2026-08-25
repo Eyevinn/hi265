@@ -82,6 +82,19 @@ need neither tool: their reference YUVs are committed under `testdata/golden/`.
 
 ## CLI Tools
 
+Six shipped commands. Each one links to its own section below.
+
+| tool | what it does |
+|---|---|
+| [`hi265dec`](#hi265dec--decode-hevc-to-raw-frames-or-images) | Decode Annex-B or MP4 to raw frames or images. The output extension picks the format: `.yuv`, `.y4m`, `.png`, `.jpg`. |
+| [`hi265gen`](#hi265gen--hevc-bitstream-generator-for-test-content) | Generate test bitstreams from flat-color grid patterns — color bars, frame counters, tiles, wavefront, timecode SEI — as Annex-B, fragmented MP4 or a raw image. |
+| [`hi265gray`](#hi265gray--gray-idrcra-frame-generator-for-gdr-streams) | Generate one mid-gray IDR or CRA frame from external VPS/SPS/PPS, to bootstrap a decoder into a GDR stream. Any chroma format and bit depth. |
+| [`hi265-mp4-extend`](#hi265-mp4-extend--extend-a-cmaf-segment-with-empty-frames) | Append frames to a fragmented MP4 media segment, reusing its parameter sets verbatim so the result splices unchanged. Freeze, or refresh with a gray CRA or IDR. |
+| [`hi265retile`](#hi265retile--stitch-hevc-streams-as-tiles) | Stitch several streams into one tiled picture by bitstream editing, with no re-encode, and check every tile against its own decode. |
+| [`hi265inspect`](#hi265inspect--dump-the-nal-structure-of-a-stream) | Print every NAL unit of an Annex-B file with the SPS, PPS and slice-header fields that decide how a picture is coded. |
+
+`make build` builds all six into `out/`, and `make install` installs them.
+
 ### hi265dec — Decode HEVC to raw frames or images
 
 Input is Annex-B (`.265`, `.hevc`, `.h265`) or MP4 (`.mp4`, `.m4v`, `.m4s`),
@@ -698,10 +711,12 @@ pkg/timecode/         — Public: SMPTE timecode arithmetic and text formatting
 internal/cabac/       — Internal: CABAC arithmetic decoder and encoder engines
 internal/context/     — Internal: Context model initialization (170 contexts)
 internal/slice/       — Internal: Slice data parsing, CTU/CU/TU quadtree, WPP substreams
+internal/tiles/       — Internal: Tile geometry and tile scan tables (spec 6.5.1)
 internal/transform/   — Internal: Inverse quantization and transform (4x4 to 32x32, DST-VII)
 internal/pred/        — Internal: Intra prediction modes (planar, DC, angular)
 internal/deblock/     — Internal: Deblocking filter
 internal/sao/         — Internal: Sample Adaptive Offset
+internal/loopfilter/  — Internal: Tile/slice boundaries the loop filters stop at
 cmd/hi265dec/         — CLI: decode HEVC from Annex-B or MP4 to YUV/Y4M/PNG/JPEG
 cmd/hi265gen/         — CLI: generate HEVC bitstreams or raw images from grid patterns
 cmd/hi265gray/        — CLI: generate gray IDR/CRA frames from external VPS/SPS/PPS
@@ -709,7 +724,7 @@ cmd/hi265-mp4-extend/ — CLI: extend a CMAF media segment with empty frames
 cmd/hi265retile/      — CLI: stitch several Annex-B streams into one tiled stream
 cmd/hi265inspect/     — CLI: dump VPS/SPS/PPS/slice-header fields of an Annex-B file
 examples/             — Example grid image files
-tools/                — Test generation scripts
+tools/                — Test generation scripts (see tools/README.md)
 testdata/             — Golden HEVC bitstreams for regression testing
 ```
 
