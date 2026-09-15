@@ -144,6 +144,59 @@ func GenerateIDR(p EncodeParams, grid *yuv.Grid, colors yuv.ColorMap) ([]byte, e
 	return buf.Bytes(), nil
 }
 
+// planeSource builds width x height picture source samples from a PlaneGrid — the
+// hi264 yuv.PlaneGrid, which holds one Y/Cb/Cr value per block instead of one per whole
+// 16x16 CTU (a "block" is 16px or 8px on a side, set by PlaneGrid.BlockSize). It mirrors
+// gridSource's grid-to-samples repacking (crop the expanded frame's own stride down to
+// the picture's width/height), but for block-resolution data: a BlockSize=8 PlaneGrid
+// carries four independent values per CTU, one per 8x8 quadrant, which is the finest
+// detail Use8x8CU's four 8x8 CUs can actually reproduce.
+func planeSource(pg *yuv.PlaneGrid, width, height int) (y, cb, cr []uint8, err error) {
+	f := yuv.BuildFrameFromPlaneGrid(pg)
+	if f.Width < width || f.Height < height {
+		return nil, nil, nil, fmt.Errorf(
+			"plane grid covers %dx%d samples, too small for a %dx%d picture",
+			f.Width, f.Height, width, height)
+	}
+	f.Width, f.Height = width, height
+
+	buf := f.YUV420Bytes()
+	lumaSize := width * height
+	chromaSize := (width / 2) * (height / 2)
+	return buf[:lumaSize],
+		buf[lumaSize : lumaSize+chromaSize],
+		buf[lumaSize+chromaSize : lumaSize+2*chromaSize],
+		nil
+}
+
+// GenerateIDRFromPlane returns Annex-B bytes containing an IDR slice NALU, sourced from
+// a PlaneGrid instead of a Grid+ColorMap. Unlike GenerateIDR — which can only paint one
+// flat color across an entire 16x16 CTU — a BlockSize=8 PlaneGrid supplies one value per
+// 8x8 quadrant, so content actually varies within a CTU. That is the only way to make
+// Use8x8CU's four 8x8 CUs decode to different pixels; on a flat-per-CTU Grid, all four
+// quadrants of a split CTU are byte-identical regardless of how finely it is partitioned.
+// A BlockSize=16 PlaneGrid behaves identically to the equivalent Grid+ColorMap.
+func GenerateIDRFromPlane(p EncodeParams, plane *yuv.PlaneGrid) ([]byte, error) {
+	if err := validateFrameDimensions(p.Width, p.Height); err != nil {
+		return nil, err
+	}
+	y, cb, cr, err := planeSource(plane, p.Width, p.Height)
+	if err != nil {
+		return nil, err
+	}
+
+	segs, err := p.segments()
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	for _, sg := range segs {
+		WriteNALU(&buf, naluIDRWRadl,
+			encodeIDRSlice(sg, p.Width, p.Height, p.qp(), p.Use8x8CU, y, cb, cr))
+	}
+	return buf.Bytes(), nil
+}
+
 // GeneratePSkip returns Annex-B bytes containing a P-skip slice NALU.
 // All CUs copy from the reference frame with zero motion.
 func GeneratePSkip(p EncodeParams, poc int) ([]byte, error) {
