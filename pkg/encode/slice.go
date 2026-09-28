@@ -1026,6 +1026,9 @@ type pSkipSliceParams struct {
 	spsTemporalMvpEnabled             bool
 	saoEnabled                        bool
 	cabacInitPresent                  bool
+	weightedPred                      bool // weighted_pred_flag: the header carries pred_weight_table()
+	numRefIdxL0Active                 int  // num_ref_idx_l0_default_active_minus1 + 1
+	chromaArrayType                   int
 	sliceChromaQpOffsetsPresent       bool
 	deblockingFilterControlPresent    bool
 	deblockingFilterOverrideEnabled   bool
@@ -1099,6 +1102,10 @@ func encodePSkipSliceWithParams(p pSkipSliceParams) []byte {
 		w.WriteBit(0) // cabac_init_flag = 0
 	}
 
+	if p.weightedPred {
+		writeDefaultPredWeightTable(w, p.numRefIdxL0Active, p.chromaArrayType)
+	}
+
 	// five_minus_max_num_merge_cand = 4 (maxMergeCand = 1)
 	w.WriteUE(4)
 
@@ -1144,6 +1151,32 @@ func encodePSkipSliceWithParams(p pSkipSliceParams) []byte {
 	}
 
 	return appendSubstreams(w.Bytes(), subs)
+}
+
+// writeDefaultPredWeightTable writes the pred_weight_table() (spec 7.3.6.3) a P
+// slice owes when the PPS sets weighted_pred_flag, signalling no weight for any
+// reference. Every weight then takes its default of 2^denominator with a zero
+// offset (spec 7.4.7.3), and explicit weighted prediction with those values is
+// the default prediction bit for bit (spec 8.5.3.3.4.3), so a skip CU still
+// copies its reference unchanged.
+//
+// The per-reference flags are conditioned on the reference being in another
+// layer or at another POC than the current picture. In a single-layer stream
+// without current-picture referencing a P picture's references are always at
+// another POC, so every flag is present.
+func writeDefaultPredWeightTable(w *BitWriter, numRefIdxL0Active, chromaArrayType int) {
+	w.WriteUE(0) // luma_log2_weight_denom
+	if chromaArrayType != 0 {
+		w.WriteSE(0) // delta_chroma_log2_weight_denom
+	}
+	for range numRefIdxL0Active {
+		w.WriteBit(0) // luma_weight_l0_flag
+	}
+	if chromaArrayType != 0 {
+		for range numRefIdxL0Active {
+			w.WriteBit(0) // chroma_weight_l0_flag
+		}
+	}
 }
 
 // encodePSkipSliceData encodes the CABAC slice data for a P-skip slice, as the

@@ -289,9 +289,6 @@ func validateSPSPPS(_ *hevc.SPS, pps *hevc.PPS) error {
 	if pps.EntropyCodingSyncEnabledFlag && pps.TilesEnabledFlag {
 		return fmt.Errorf("tiles combined with wavefront parallel processing is not supported")
 	}
-	if pps.WeightedPredFlag {
-		return fmt.Errorf("weighted prediction not supported")
-	}
 	// pps_cb_qp_offset and pps_cr_qp_offset are honoured, but a per-CU offset also
 	// needs cu_chroma_qp_offset_flag and cu_chroma_qp_offset_idx written into the
 	// transform unit (spec 7.3.8.10), which nothing here does.
@@ -371,6 +368,15 @@ func validateSPSPPSForIDR(sps *hevc.SPS, pps *hevc.PPS) error {
 	return nil
 }
 
+// chromaArrayType is ChromaArrayType (spec 7.4.3.2.1): chroma_format_idc, or 0
+// when the three colour planes are coded separately.
+func chromaArrayType(sps *hevc.SPS) int {
+	if sps.SeparateColourPlaneFlag {
+		return 0
+	}
+	return int(sps.ChromaFormatIDC)
+}
+
 func pSkipSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) pSkipSliceParams {
 	qp := 26 + int(pps.InitQpMinus26) // slice_qp_delta = 0
 	return pSkipSliceParams{
@@ -388,6 +394,9 @@ func pSkipSliceParamsFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) pSkipSlic
 		spsTemporalMvpEnabled:             sps.SpsTemporalMvpEnabledFlag,
 		saoEnabled:                        sps.SampleAdaptiveOffsetEnabledFlag,
 		cabacInitPresent:                  pps.CabacInitPresentFlag,
+		weightedPred:                      pps.WeightedPredFlag,
+		numRefIdxL0Active:                 int(pps.NumRefIdxL0DefaultActiveMinus1) + 1,
+		chromaArrayType:                   chromaArrayType(sps),
 		sliceChromaQpOffsetsPresent:       pps.SliceChromaQpOffsetsPresentFlag,
 		deblockingFilterControlPresent:    pps.DeblockingFilterControlPresentFlag,
 		deblockingFilterOverrideEnabled:   pps.DeblockingFilterOverrideEnabledFlag,
