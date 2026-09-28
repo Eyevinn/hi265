@@ -639,7 +639,9 @@ extended, err := encode.AppendEmptyFrames(annexB, 25)
 > combined with wavefront processing is refused since no profile permits it.
 > `sign_data_hiding_enabled_flag` (x265's default: the sign of a sub-block's
 > lowest-frequency significant coefficient carried by the parity of its levels) is
-> written correctly as well, and `weighted_pred_flag` is refused. Still **ignored
+> written correctly as well, and so is `weighted_pred_flag` (x265's default from
+> the veryfast preset up): a P-skip slice carries the `pred_weight_table()` it
+> owes, signalling no weight, which predicts exactly as unweighted. Still **ignored
 > rather than refused** by the grid IDR/CRA writer: nothing, as of the chroma QP
 > offset work — `pps_cb_qp_offset` and `pps_cr_qp_offset` are applied, and
 > `chroma_qp_offset_list_enabled_flag`, the per-CU variant, is refused because it
