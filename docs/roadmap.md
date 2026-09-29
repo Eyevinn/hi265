@@ -846,6 +846,43 @@ Fixtures: `testdata/scalinglist_q12_256x128.265` with its golden, coded at QP 12
 on purpose, since a coarse quantizer leaves too few large-block coefficients for
 the weights to matter — QP 32 passes with the lists ignored.
 
+### 0.23 P-skip against a weighted-prediction PPS (S) — **fixed**
+
+`EncodePSkipSliceFromSPSPPS` refused any PPS with `weighted_pred_flag` set: a P
+slice under that flag owes a `pred_weight_table()` (spec 7.3.6.3), and none was
+written. x265 sets the flag at every preset except ultrafast, so parameter sets
+from an ordinary x265 encode could not be extended with P-skips at all, and
+`AppendEmptyFrames` inherited the refusal. The table is now written signalling no
+weight — both denominators 0, and a zero luma and chroma flag per active
+reference. Each weight then defaults to 2^denominator with a zero offset (spec
+7.4.7.3), and explicit weighted prediction with those values is the default
+prediction bit for bit (spec 8.5.3.3.4.3), so a skip CU still copies its
+reference. The IDR and CRA writers stop refusing the flag too: an I slice has no
+table.
+
+**Review turned up an older gap right next to it.** The P-skip header writes
+`slice_temporal_mvp_enabled_flag = 1` whenever the SPS enables temporal MVP, which
+obliges `collocated_ref_idx` once list 0 has more than one entry (spec 7.3.6.1).
+It was never written. No fixture reached it, because x265 writes
+`num_ref_idx_l0_default_active_minus1 = 0` whatever `--ref` says; HM, among
+others, writes more. With that one PPS field rewritten to two references, FFmpeg
+dropped the P-skip and `pkg/decoder` misread its header, with weighted prediction
+and without it. `collocated_ref_idx = 0` is written now.
+
+Measured after: P-skips against `testdata/weightp_128x64.265`, and against it and
+`sincos_128x64.265` rewritten to two default references, decode to an exact copy
+of their IDR in both `pkg/decoder` and FFmpeg; so does a P-skip against stock x265
+output with deblocking on, in FFmpeg. Outside the suite, two 1280x720 x265
+captures, 8-bit Main and 10-bit Main 10, took three P-skips each identical to
+their IDR under `ffmpeg -xerror`. Dropping either the table or
+`collocated_ref_idx` fails the tests that cover it.
+
+**Not fixed: `pkg/decoder` does not reconstruct a deblocked P-skip bit-exactly.**
+Against x265 output with deblocking on, the P-skip decodes 132 of 12288 samples
+away from the IDR it references, by at most 2, where FFmpeg gives an exact copy.
+It reproduces on 0.5.0 without weighted prediction, so it is older than this
+entry. The committed vector has deblocking off for that reason.
+
 ### 0.10 Real-world content decoding (L) — **fixed**
 
 x265 output was not bit-exact, and got worse with detail and scale: a 720p
@@ -1275,6 +1312,11 @@ where it needs kvazaar rather than a large committed fixture.
 Everything through Phase 3 is done, plus 4.1, 4.3 and Phase 6. Remaining, smallest first:
 
 - **`hi265dec -no-deblock`** (S) — the only gap left in 4.1.
+- **Deblocked P-skip pictures** (in 0.23) — `pkg/decoder` decodes one up to 2
+  away from its reference in 132 samples of a 128x64 picture. Zero motion
+  against a single reference with no residual gives every edge a boundary
+  strength of 0, so the filter should leave such a picture untouched, as FFmpeg
+  does.
 - **4.2 `hi265gen`** (M) — PNG/JPEG image as background, and a committed PSNR
   command (there is an untracked `psnr` binary in the repo root but no `cmd/`).
 - **8x8 *content* in `hi265gen`** (in 4.3) — the library takes it through
