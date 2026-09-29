@@ -18,14 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cmfs`, `cmff`, `cmfl` in `styp`) instead of `dash`
 
 ### Fixed
-- `EncodePSkipSliceFromSPSPPS`, and `AppendEmptyFrames` through it, no longer
-  refuse a PPS with `weighted_pred_flag` set. A P slice under that flag owes a
-  `pred_weight_table()` (spec 7.3.6.3), which is now written with no weight
-  signalled; default weights predict bit for bit as unweighted prediction, so a
-  skip CU still copies its reference. x265 sets the flag at every preset except
-  ultrafast, so this was the common case for third-party parameter sets rather
-  than an edge. The IDR and CRA writers no longer refuse it either: an I slice
-  has no table to write.
+- `EncodePSkipSliceFromSPSPPS`, `AppendEmptyFrames` and the IDR and CRA writers
+  accept a PPS with `weighted_pred_flag` set, x265's default above ultrafast.
+- `EncodePSkipSliceFromSPSPPS` writes `collocated_ref_idx` when temporal MVP is on
+  and the PPS has several default references; the P-skip was undecodable without it.
 
 ## [0.5.0] - 2026-08-25
 
