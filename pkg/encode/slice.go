@@ -1102,6 +1102,14 @@ func encodePSkipSliceWithParams(p pSkipSliceParams) []byte {
 		w.WriteBit(0) // cabac_init_flag = 0
 	}
 
+	// collocated_ref_idx (spec 7.3.6.1) is owed once slice_temporal_mvp_enabled_flag
+	// is 1 and list 0 has more than one entry, since a P slice takes its collocated
+	// picture from list 0. Without it every later field, pred_weight_table included,
+	// is read one bit early.
+	if p.spsTemporalMvpEnabled && p.numRefIdxL0Active > 1 {
+		w.WriteUE(0) // collocated_ref_idx = 0
+	}
+
 	if p.weightedPred {
 		writeDefaultPredWeightTable(w, p.numRefIdxL0Active, p.chromaArrayType)
 	}
