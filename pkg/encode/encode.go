@@ -84,32 +84,46 @@ func GenerateVPSSPSPPS(p EncodeParams) ([]byte, error) {
 }
 
 // gridSource builds the source samples of a width x height picture from a grid,
-// packed at the picture's own width — which is the stride the slice writers index
-// the planes at.
-//
-// The repacking is the point. yuv.BuildFrame lays a grid out at grid.Width*16
-// samples per row, because a grid cell is one CTU, so a picture whose width is not
-// a multiple of 16 is narrower than the buffer holding it: its rightmost CTU is
-// only partly inside the picture. Handing those planes to a writer that indexes
-// them as src[y*width+x] shears the picture sideways by the remainder on every
-// row, and the encoder then faithfully codes the sheared version. Measured with
-// hi265gen -smpte at 120x80 before this existed: 14050 of 14400 samples differed
-// from the generator's own raw output, at a maximum delta of 177.
-//
-// The crop is YUV420Bytes', which is exactly what the raw output paths write, so a
-// .265 and a .yuv built from one grid describe the same picture.
+// one flat colour per 16x16 CTU, through planeSource.
 func gridSource(grid *yuv.Grid, colors yuv.ColorMap, width, height int) (y, cb, cr []uint8, err error) {
-	f, err := yuv.BuildFrame(grid, colors)
+	pg, err := yuv.GridToPlaneGrid(grid, colors)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if f.Width < width || f.Height < height {
-		return nil, nil, nil, fmt.Errorf(
-			"grid covers %dx%d samples, too small for a %dx%d picture",
-			f.Width, f.Height, width, height)
+	return planeSource(pg, width, height)
+}
+
+// planeSource builds the source samples of a width x height picture from a
+// PlaneGrid, one value per 16x16 or 8x8 block, packed at the picture's own width —
+// which is the stride the slice writers index the planes at.
+//
+// The repacking is the point. yuv.BuildFrameFromPlaneGrid lays the blocks out in a
+// frame of whole 16x16 blocks, so a picture whose width is not a multiple of 16 is
+// narrower than the buffer holding it: its rightmost CTU is only partly inside the
+// picture. Handing those planes to a writer that indexes them as src[y*width+x]
+// shears the picture sideways by the remainder on every row, and the encoder then
+// faithfully codes the sheared version. Measured with hi265gen -smpte at 120x80
+// before this existed: 14050 of 14400 samples differed from the generator's own
+// raw output, at a maximum delta of 177.
+//
+// The crop is YUV420Bytes', which is exactly what the raw output paths write, so a
+// .265 and a .yuv built from one grid describe the same picture.
+//
+// What the grid covers is counted in blocks rather than taken from that frame. An
+// odd number of 8x8 blocks does not fill its last 16x16 one, and the strip left
+// over is zero samples, not picture.
+func planeSource(pg *yuv.PlaneGrid, width, height int) (y, cb, cr []uint8, err error) {
+	if pg.BlockSize != 8 && pg.BlockSize != 16 {
+		return nil, nil, nil, fmt.Errorf("plane grid block size %d is not supported, want 8 or 16", pg.BlockSize)
 	}
+	if w, h := pg.Width*pg.BlockSize, pg.Height*pg.BlockSize; w < width || h < height {
+		return nil, nil, nil, fmt.Errorf(
+			"plane grid covers %dx%d samples, too small for a %dx%d picture",
+			w, h, width, height)
+	}
+	f := yuv.BuildFrameFromPlaneGrid(pg)
 	// Width and Height become the visible picture while the planes keep the
-	// grid's stride, which is the distinction YUV420Bytes crops on.
+	// frame's stride, which is the distinction YUV420Bytes crops on.
 	f.Width, f.Height = width, height
 
 	buf := f.YUV420Bytes()
@@ -124,58 +138,18 @@ func gridSource(grid *yuv.Grid, colors yuv.ColorMap, width, height int) (y, cb, 
 // GenerateIDR returns Annex-B bytes containing an IDR slice NALU.
 // The grid and colors define the per-CTU content (each grid cell is one 16x16 CTU).
 func GenerateIDR(p EncodeParams, grid *yuv.Grid, colors yuv.ColorMap) ([]byte, error) {
-	if err := validateFrameDimensions(p.Width, p.Height); err != nil {
-		return nil, err
-	}
-	y, cb, cr, err := gridSource(grid, colors, p.Width, p.Height)
+	pg, err := yuv.GridToPlaneGrid(grid, colors)
 	if err != nil {
 		return nil, err
 	}
-
-	segs, err := p.segments()
-	if err != nil {
-		return nil, err
-	}
-	var buf bytes.Buffer
-	for _, sg := range segs {
-		WriteNALU(&buf, naluIDRWRadl,
-			encodeIDRSlice(sg, p.Width, p.Height, p.qp(), p.Use8x8CU, y, cb, cr))
-	}
-	return buf.Bytes(), nil
+	return GenerateIDRFromPlane(p, pg)
 }
 
-// planeSource builds width x height picture source samples from a PlaneGrid — the
-// hi264 yuv.PlaneGrid, which holds one Y/Cb/Cr value per block instead of one per whole
-// 16x16 CTU (a "block" is 16px or 8px on a side, set by PlaneGrid.BlockSize). It mirrors
-// gridSource's grid-to-samples repacking (crop the expanded frame's own stride down to
-// the picture's width/height), but for block-resolution data: a BlockSize=8 PlaneGrid
-// carries four independent values per CTU, one per 8x8 quadrant, which is the finest
-// detail Use8x8CU's four 8x8 CUs can actually reproduce.
-func planeSource(pg *yuv.PlaneGrid, width, height int) (y, cb, cr []uint8, err error) {
-	f := yuv.BuildFrameFromPlaneGrid(pg)
-	if f.Width < width || f.Height < height {
-		return nil, nil, nil, fmt.Errorf(
-			"plane grid covers %dx%d samples, too small for a %dx%d picture",
-			f.Width, f.Height, width, height)
-	}
-	f.Width, f.Height = width, height
-
-	buf := f.YUV420Bytes()
-	lumaSize := width * height
-	chromaSize := (width / 2) * (height / 2)
-	return buf[:lumaSize],
-		buf[lumaSize : lumaSize+chromaSize],
-		buf[lumaSize+chromaSize : lumaSize+2*chromaSize],
-		nil
-}
-
-// GenerateIDRFromPlane returns Annex-B bytes containing an IDR slice NALU, sourced from
-// a PlaneGrid instead of a Grid+ColorMap. Unlike GenerateIDR — which can only paint one
-// flat color across an entire 16x16 CTU — a BlockSize=8 PlaneGrid supplies one value per
-// 8x8 quadrant, so content actually varies within a CTU. That is the only way to make
-// Use8x8CU's four 8x8 CUs decode to different pixels; on a flat-per-CTU Grid, all four
-// quadrants of a split CTU are byte-identical regardless of how finely it is partitioned.
-// A BlockSize=16 PlaneGrid behaves identically to the equivalent Grid+ColorMap.
+// GenerateIDRFromPlane returns Annex-B bytes containing an IDR slice NALU, with the
+// content taken from a PlaneGrid instead of a Grid and ColorMap. A grid cell is a
+// whole 16x16 CTU, so the four 8x8 CUs of a Use8x8CU picture all code the same
+// colour; a PlaneGrid with BlockSize 8 gives each of them its own. BlockSize 16 is
+// exactly GenerateIDR, which is built on it.
 func GenerateIDRFromPlane(p EncodeParams, plane *yuv.PlaneGrid) ([]byte, error) {
 	if err := validateFrameDimensions(p.Width, p.Height); err != nil {
 		return nil, err
