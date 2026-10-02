@@ -36,9 +36,9 @@ var quadrantColors = yuv.ColorMap{
 	'D': yuv.Color{Y: 145, Cb: 54, Cr: 34},   // green
 }
 
-// build8x8Planes renders a grid whose characters map to 8x8 blocks (the same
-// resolution hi264's "@8x8" gridimg directive produces) into full YUV planes.
-func build8x8Planes(t *testing.T, rows []string, colors yuv.ColorMap) (y, cb, cr []uint8, w, h int) {
+// build8x8Plane builds a PlaneGrid whose characters map to 8x8 blocks (the same
+// resolution hi264's "@8x8" gridimg directive produces).
+func build8x8Plane(t *testing.T, rows []string, colors yuv.ColorMap) *yuv.PlaneGrid {
 	t.Helper()
 
 	grid, err := yuv.ParseGrid(strings.Join(rows, ","))
@@ -49,26 +49,29 @@ func build8x8Planes(t *testing.T, rows []string, colors yuv.ColorMap) (y, cb, cr
 	if err != nil {
 		t.Fatalf("GridToPlaneGridBS: %v", err)
 	}
-	f := yuv.BuildFrameFromPlaneGrid(pg)
-	return f.Y, f.Cb, f.Cr, pg.PixelWidth(), pg.PixelHeight()
+	return pg
+}
+
+// planeYUV returns the picture a PlaneGrid describes as raw yuv420p bytes.
+func planeYUV(pg *yuv.PlaneGrid) []byte {
+	return yuv.BuildFrameFromPlaneGrid(pg).YUV420Bytes()
 }
 
 // encode8x8Stream builds a complete Annex-B stream (VPS+SPS+PPS+IDR, plus
-// optional P-skip frames) for the given planes using 8x8 coding granularity.
-func encode8x8Stream(t *testing.T, w, h, qp int, use8x8 bool, y, cb, cr []uint8, pSkips int) []byte {
+// optional P-skip frames) for the picture pg describes, through the public API.
+func encode8x8Stream(t *testing.T, pg *yuv.PlaneGrid, qp int, use8x8 bool, pSkips int) []byte {
 	t.Helper()
 
-	p := EncodeParams{Width: w, Height: h, QP: qp, Use8x8CU: use8x8}
+	p := EncodeParams{Width: pg.PixelWidth(), Height: pg.PixelHeight(), QP: qp, Use8x8CU: use8x8}
 	stream, err := GenerateVPSSPSPPS(p)
 	if err != nil {
 		t.Fatalf("GenerateVPSSPSPPS: %v", err)
 	}
-
-	var buf bytes.Buffer
-	lay := chooseCodingLayout(w, h, use8x8)
-	WriteNALU(&buf, naluIDRWRadl,
-		encodeIDRSlice(wholePicture(w, h, lay.ctuSize, false), w, h, qp, use8x8, y, cb, cr))
-	stream = append(stream, buf.Bytes()...)
+	idr, err := GenerateIDRFromPlane(p, pg)
+	if err != nil {
+		t.Fatalf("GenerateIDRFromPlane: %v", err)
+	}
+	stream = append(stream, idr...)
 
 	for i := 1; i <= pSkips; i++ {
 		ps, err := GeneratePSkip(p, i)
@@ -166,10 +169,11 @@ func cuIntendedYUV(y, cb, cr []uint8) []byte {
 // CTB above, while the two bottom CUs legitimately use the above CU's mode.
 // Both sides of that branch are exercised in every CTB of this frame.
 func TestEncode8x8QuadrantsMatchFFmpeg(t *testing.T) {
-	y, cb, cr, w, h := build8x8Planes(t, quadrantPattern, quadrantColors)
-	if w != 64 || h != 32 {
+	pg := build8x8Plane(t, quadrantPattern, quadrantColors)
+	if w, h := pg.PixelWidth(), pg.PixelHeight(); w != 64 || h != 32 {
 		t.Fatalf("unexpected frame size %dx%d", w, h)
 	}
+	want := planeYUV(pg)
 
 	// Tolerances against the intended pattern are pure quantization error, with
 	// roughly a factor two of headroom over the measured values.
@@ -190,7 +194,7 @@ func TestEncode8x8QuadrantsMatchFFmpeg(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run("qp"+strconv.Itoa(c.qp), func(t *testing.T) {
-			stream := encode8x8Stream(t, w, h, c.qp, true, y, cb, cr, 0)
+			stream := encode8x8Stream(t, pg, c.qp, true, 0)
 
 			ff := cuFFmpegDecode(t, stream)
 			own := cuHi265Decode(t, stream, 1)
@@ -202,7 +206,7 @@ func TestEncode8x8QuadrantsMatchFFmpeg(t *testing.T) {
 
 			// Both decodes must also reproduce the intended pattern within
 			// quantization error.
-			mean, maxDiff := cuPlaneDiff(t, own, cuIntendedYUV(y, cb, cr))
+			mean, maxDiff := cuPlaneDiff(t, own, want)
 			t.Logf("QP=%d vs intended pattern: mean=%.3f max=%d", c.qp, mean, maxDiff)
 			if maxDiff > c.maxDiff {
 				t.Errorf("max error %d vs intended pattern exceeds %d", maxDiff, c.maxDiff)
@@ -218,8 +222,8 @@ func TestEncode8x8QuadrantsMatchFFmpeg(t *testing.T) {
 // SPS says minCbSize = 8: the P-slice writes split_cu_flag = 0 at depth 0, so
 // each CTU stays one 16x16 skip CU that repeats the previous picture.
 func TestEncode8x8PSkipMatchesFFmpeg(t *testing.T) {
-	y, cb, cr, w, h := build8x8Planes(t, quadrantPattern, quadrantColors)
-	stream := encode8x8Stream(t, w, h, 26, true, y, cb, cr, 2)
+	pg := build8x8Plane(t, quadrantPattern, quadrantColors)
+	stream := encode8x8Stream(t, pg, 26, true, 2)
 
 	ff := cuFFmpegDecode(t, stream)
 	own := cuHi265Decode(t, stream, 3)
@@ -229,7 +233,7 @@ func TestEncode8x8PSkipMatchesFFmpeg(t *testing.T) {
 		t.Fatalf("hi265dec and FFmpeg disagree: mean=%.3f max=%d", mean, maxDiff)
 	}
 
-	frameSize := w*h + 2*(w/2)*(h/2)
+	frameSize := len(planeYUV(pg))
 	if len(own) != 3*frameSize {
 		t.Fatalf("decoded %d bytes, want %d", len(own), 3*frameSize)
 	}
@@ -247,13 +251,13 @@ func TestEncode16x16MatchesFFmpeg(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseGrid: %v", err)
 	}
-	f, err := yuv.BuildFrame(grid, quadrantColors)
+	pg, err := yuv.GridToPlaneGrid(grid, quadrantColors)
 	if err != nil {
-		t.Fatalf("BuildFrame: %v", err)
+		t.Fatalf("GridToPlaneGrid: %v", err)
 	}
-	w, h := grid.Width*16, grid.Height*16
+	want := planeYUV(pg)
 
-	stream := encode8x8Stream(t, w, h, 26, false, f.Y, f.Cb, f.Cr, 1)
+	stream := encode8x8Stream(t, pg, 26, false, 1)
 
 	ff := cuFFmpegDecode(t, stream)
 	own := cuHi265Decode(t, stream, 2)
@@ -262,8 +266,7 @@ func TestEncode16x16MatchesFFmpeg(t *testing.T) {
 		t.Fatalf("hi265dec and FFmpeg disagree: mean=%.3f max=%d", mean, maxDiff)
 	}
 
-	frameSize := w*h + 2*(w/2)*(h/2)
-	mean, maxDiff := cuPlaneDiff(t, own[:frameSize], cuIntendedYUV(f.Y, f.Cb, f.Cr))
+	mean, maxDiff := cuPlaneDiff(t, own[:len(want)], want)
 	t.Logf("16x16 path vs intended pattern: mean=%.3f max=%d", mean, maxDiff)
 	if maxDiff > 8 {
 		t.Errorf("max error %d vs intended pattern is too large", maxDiff)
