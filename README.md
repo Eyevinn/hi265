@@ -589,11 +589,19 @@ frames, err := dec.DecodeAnnexB(data)
 
 // Generate HEVC from grid pattern (each cell = one 16x16 CTU)
 grid, _ := yuv.ParseGrid("AB,CD")
-colors := yuv.ColorMap{'A': yuv.Color{16, 128, 128}, 'B': yuv.Color{128, 128, 128}}
+colors := yuv.ColorMap{'A': yuv.Color{16, 128, 128}, 'B': yuv.Color{128, 128, 128},
+    'C': yuv.Color{81, 90, 240}, 'D': yuv.Color{145, 54, 34}}
 p := encode.EncodeParams{Width: 32, Height: 32, QP: 26}
 vpsSPSPPS, _ := encode.GenerateVPSSPSPPS(p)
 idrSlice, _ := encode.GenerateIDR(p, grid, colors)
 annexB := append(vpsSPSPPS, idrSlice...)
+
+// Finer content: a PlaneGrid can hold one value per 8x8 block, and with Use8x8CU
+// each of a CTU's four 8x8 CUs then codes its own. Here "AB,CD" is one 16x16 CTU.
+// The parameter sets have to come from the same EncodeParams.
+pg, _ := yuv.GridToPlaneGridBS(grid, colors, 8)
+p8 := encode.EncodeParams{Width: 16, Height: 16, QP: 26, Use8x8CU: true}
+idr8x8, _ := encode.GenerateIDRFromPlane(p8, pg)
 
 // Generate a P-skip frame (copies IDR content unchanged)
 pSkip, _ := encode.GeneratePSkip(p, 1)

@@ -1138,11 +1138,20 @@ Doing it surfaced four more conformance bugs, all now fixed:
 Instrumenting all 18 golden streams found exactly **one** 4x4 block that takes a
 mode-dependent scan, which is why none of this was constrained before.
 
-Still to do: `-8x8` changes the coding structure, not the content. Wiring 8x8
-*pixels* through needs `PlaneGrid` threaded into `GenerateIDR` and all four raw
-output paths, or `-8x8` would mean different pixels for `.265` than for `.yuv`.
-The vendored hi264 does support the `@8x8` gridimg directive, so the helpers are
-there.
+**The library half of 8x8 content has landed** (PR #11): `GenerateIDRFromPlane`
+takes a `PlaneGrid`, which can hold one value per 8x8 block, and `GenerateIDR` is
+built on it, so the two cannot drift apart. The conformance tests above now go
+through it. Its size check counts what the grid covers in blocks: hi264's frame
+is rounded up to whole 16x16 blocks, so an odd number of 8x8 blocks leaves an
+unpainted strip of zero samples, which a check against the frame let through as
+picture. Block sizes other than 8 and 16 are refused too; 32 used to panic
+inside hi264.
+
+Still to do: the CLI. `-8x8` changes the coding structure, not the content.
+Wiring 8x8 *pixels* through needs `hi265gen` to build a `PlaneGrid` and all four
+raw output paths to write from it, or `-8x8` would mean different pixels for
+`.265` than for `.yuv`. The vendored hi264 does support the `@8x8` gridimg
+directive, so the helpers are there.
 
 ---
 
@@ -1266,11 +1275,11 @@ Everything through Phase 3 is done, plus 4.1, 4.3 and Phase 6. Remaining, smalle
 - **`hi265dec -no-deblock`** (S) — the only gap left in 4.1.
 - **4.2 `hi265gen`** (M) — PNG/JPEG image as background, and a committed PSNR
   command (there is an untracked `psnr` binary in the repo root but no `cmd/`).
-- **8x8 *content*** (in 4.3) — `-8x8` changes the coding structure today, not the
-  pixels. Wiring 8x8 pixels through needs `PlaneGrid` threaded into
-  `GenerateIDR` and all four raw output paths, or `-8x8` would mean different
-  pixels for `.265` than for `.yuv`. The vendored hi264 does support the `@8x8`
-  gridimg directive, so the helpers exist.
+- **8x8 *content* in `hi265gen`** (in 4.3) — the library takes it through
+  `GenerateIDRFromPlane`, but `-8x8` still changes only the coding structure.
+  Wiring the pixels through needs a `PlaneGrid` built in `hi265gen` and all four
+  raw output paths writing from it, or `-8x8` would mean different pixels for
+  `.265` than for `.yuv`.
 - **`hi265gen -cra-interval`** (in 1.3) — CRA keyframes instead of IDR, with POC
   running continuously. The slice encoding it needs is already there.
 - **A dependent slice segment beginning mid-row** (in 0.14) — the resume-from-

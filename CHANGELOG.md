@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `encode.GenerateIDRFromPlane` encodes an IDR from a `yuv.PlaneGrid`, so with
+  `Use8x8CU` each 8x8 CU of a CTU can carry its own content.
+
 ## [0.5.0] - 2026-08-25
 
 Numbered 0.5.0 rather than 0.2.0: what landed since 0.1.0 is most of a codec —
