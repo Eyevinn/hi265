@@ -19,7 +19,7 @@ import (
 
 // makeInitAndSegment generates a fragmented MP4 with hi265gen and splits it
 // into an init segment and a media segment, the two inputs this tool takes.
-func makeInitAndSegment(t *testing.T, dir string, frames int) (initPath, segPath string) {
+func makeInitAndSegment(t testing.TB, dir string, frames int) (initPath, segPath string) {
 	t.Helper()
 
 	src := filepath.Join(dir, "src.mp4")
@@ -70,7 +70,7 @@ func makeInitAndSegment(t *testing.T, dir string, frames int) (initPath, segPath
 	return initPath, segPath
 }
 
-func mustWD(t *testing.T) string {
+func mustWD(t testing.TB) string {
 	t.Helper()
 	wd, err := os.Getwd()
 	if err != nil {
