@@ -39,16 +39,14 @@ func ceilDiv(a, b uint) uint { return (a + b - 1) / b }
 // SplitAnnexB parses an Annex-B byte stream into NAL units (2-byte header plus
 // EBSP payload), stripping start codes and any trailing zero padding.
 //
-// mp4ff's avc.ExtractNalusFromByteStream does the splitting; the extra trim
-// here covers the final NAL, whose trailing_zero_8bits mp4ff leaves attached.
-// That matters because a slice payload is copied verbatim into the output, so
-// stray zero bytes would end up inside the restitched NAL.
+// mp4ff's avc.ExtractNalusFromByteStream does the splitting, and since v0.58.0
+// it also drops the trailing_zero_8bits after the final NAL. That matters
+// because a slice payload is copied verbatim into the output, so stray zero
+// bytes would end up inside the restitched NAL.
 func SplitAnnexB(data []byte) [][]byte {
-	var out [][]byte
-	for _, n := range avc.ExtractNalusFromByteStream(data) {
-		for len(n) > 0 && n[len(n)-1] == 0 {
-			n = n[:len(n)-1]
-		}
+	nalus := avc.ExtractNalusFromByteStream(data)
+	out := nalus[:0]
+	for _, n := range nalus {
 		if len(n) >= 2 {
 			out = append(out, n)
 		}

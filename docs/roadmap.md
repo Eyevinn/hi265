@@ -1211,11 +1211,13 @@ became `hi265inspect`, which does what `spsdump` does but on a file given as an
 argument. The old `anb.Split` is gone in favour of the same
 `avc.ExtractNalusFromByteStream` that `pkg/decoder` already uses, trimming the
 trailing zeros mp4ff leaves attached to the last NAL — a slice payload is copied
-verbatim, so stray bytes would land inside the restitched NAL.
+verbatim, so stray bytes would land inside the restitched NAL. mp4ff v0.58.0
+drops those zeros itself (Eyevinn/mp4ff#622), and the trim here is gone.
 
 The mp4ff `replace` directive the old repo needed is gone with it: it pointed at
 master for the slice-header inference fixes of Eyevinn/mp4ff#558, which shipped
-in v0.56.0 — the version this repo already required. Do not lower it.
+in v0.56.0. The floor is now v0.58.0, which `SplitAnnexB` relies on. Do not
+lower it.
 
 ### 6.2 An API, and refusing what cannot tile (M) — **done**
 
