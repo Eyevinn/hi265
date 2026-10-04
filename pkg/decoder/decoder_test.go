@@ -177,6 +177,22 @@ func TestDecodeGray2Frames128x64(t *testing.T) {
 		"../../testdata/golden/gray_2frames_128x64.yuv", 128, 64, 2)
 }
 
+// An IDR and a P picture of skip CUs from x265 at its defaults, so with
+// deblocking, SAO and weighted prediction on. An edge between two zero-motion
+// skip CUs has boundary strength 0 and must not be filtered; filtering it as an
+// intra edge put 754 samples of the P picture up to 7 away from FFmpeg's. Made
+// with x265 4.3 from two copies of one frame:
+//
+//	ffmpeg -f lavfi -i testsrc2=size=128x64:rate=1:duration=1 \
+//	  -pix_fmt yuv420p -f rawvideo one.yuv
+//	cat one.yuv one.yuv > two.yuv
+//	x265 --input two.yuv --input-res 128x64 --fps 25 --frames 2 --no-info \
+//	  --output testdata/pskip_deblock_128x64.265
+func TestDecodePSkipDeblock128x64(t *testing.T) {
+	testGoldenFrames(t, "../../testdata/pskip_deblock_128x64.265",
+		"../../testdata/golden/pskip_deblock_128x64.yuv", 128, 64, 2)
+}
+
 // Tiled pictures, one slice segment per tile — the shape kvazaar's
 // "--tiles WxH --slices tiles" produces and the one `hevc-retiler` stitches.
 // Both loop filters are off in these vectors so that tile geometry, tile scan

@@ -11,9 +11,8 @@ import (
 
 // weightpVector is one IDR from x265 at its default preset, which enables
 // weighted prediction (every preset but ultrafast does), so its PPS sets
-// weighted_pred_flag. Deblocking is off because pkg/decoder does not yet
-// reconstruct a deblocked P-skip picture bit-exactly, with or without weighted
-// prediction; FFmpeg is the check on that case. Made with:
+// weighted_pred_flag. Deblocking is off, so that weighted prediction is the one
+// thing under test; pskipDeblockVector has it on. Made with:
 //
 //	ffmpeg -f lavfi -i testsrc2=size=128x64:rate=25 -frames:v 1 -c:v libx265 \
 //	  -x265-params no-info=1:no-deblock=1 -f hevc testdata/weightp_128x64.265
@@ -128,30 +127,32 @@ func withNumRefIdxL0DefaultActive(t *testing.T, annexB []byte, n int) []byte {
 	return out.Bytes()
 }
 
-// TestEncodePSkipFromSPSPPS_WeightedPredDeblocked is the same check on stock
-// x265 output with deblocking on, the shape a real feed has, decoded by FFmpeg.
-func TestEncodePSkipFromSPSPPS_WeightedPredDeblocked(t *testing.T) {
-	ffmpeg := ffmpegBin(t)
-	x265 := x265Bin(t)
-	const w, h = 128, 64
-	idr := encodeRealWithX265(t, x265, lavfiSource(t, ffmpeg, "testsrc2", w, h), w, h, nil)
-	sps, pps := parseSPSPPS(t, idr)
-	if !pps.WeightedPredFlag {
-		t.Fatal("x265's default output does not set weighted_pred_flag, so this test would not cover it")
-	}
+// pskipDeblockVector is an IDR and a P picture from x265 at its defaults, so
+// with deblocking and SAO on as well; TestDecodePSkipDeblock128x64 in
+// pkg/decoder has the recipe.
+const pskipDeblockVector = "../../testdata/pskip_deblock_128x64.265"
 
-	pSkip, err := EncodePSkipSliceFromSPSPPS(sps, pps, 1)
+// TestEncodePSkipFromSPSPPS_WeightedPredDeblocked is the same check on stock
+// x265 output, the shape a real feed has: our P-skip in place of x265's own P
+// picture. Every CU edge of the P-skip has boundary strength 0, so deblocking
+// must leave it a copy of the IDR.
+func TestEncodePSkipFromSPSPPS_WeightedPredDeblocked(t *testing.T) {
+	stream, err := readTestFile(pskipDeblockVector)
 	if err != nil {
-		t.Fatalf("EncodePSkipSliceFromSPSPPS: %v", err)
+		t.Fatalf("read %s: %v", pskipDeblockVector, err)
 	}
-	ff := decodeWithFFmpeg(t, ffmpeg, append(append([]byte{}, idr...), pSkip...))
-	frameSize := w*h + 2*(w/2)*(h/2)
-	if len(ff) != 2*frameSize {
-		t.Fatalf("FFmpeg decoded %d bytes, want two %dx%d frames", len(ff), w, h)
+	var idr []byte
+	for _, nalu := range avc.ExtractNalusFromByteStream(stream) {
+		idr = append(append(idr, 0, 0, 0, 1), nalu...)
+		if typ := hevc.GetNaluType(nalu[0]); typ == hevc.NALU_IDR_W_RADL || typ == hevc.NALU_IDR_N_LP {
+			break
+		}
 	}
-	if !bytes.Equal(ff[:frameSize], ff[frameSize:]) {
-		t.Error("FFmpeg: the P-skip does not decode to the picture it references")
+	sps, pps := parseSPSPPS(t, idr)
+	if !pps.WeightedPredFlag || pps.DeblockingFilterDisabledFlag {
+		t.Fatalf("%s must set weighted_pred_flag and deblock for this test to cover it", pskipDeblockVector)
 	}
+	checkPSkipCopiesReference(t, idr, sps, pps)
 }
 
 func parseSPSPPS(t *testing.T, annexB []byte) (*hevc.SPS, *hevc.PPS) {

@@ -877,11 +877,23 @@ captures, 8-bit Main and 10-bit Main 10, took three P-skips each identical to
 their IDR under `ffmpeg -xerror`. Dropping either the table or
 `collocated_ref_idx` fails the tests that cover it.
 
-**Not fixed: `pkg/decoder` does not reconstruct a deblocked P-skip bit-exactly.**
-Against x265 output with deblocking on, the P-skip decodes 132 of 12288 samples
-away from the IDR it references, by at most 2, where FFmpeg gives an exact copy.
-It reproduces on 0.5.0 without weighted prediction, so it is older than this
-entry. The committed vector has deblocking off for that reason.
+**Also fixed: `pkg/decoder` did not reconstruct a deblocked P picture
+bit-exactly.** Against x265 output with deblocking on, the P-skip decoded 132 of
+12288 samples away from the IDR it references, by at most 2, where FFmpeg gives
+an exact copy. It reproduced on 0.5.0 without weighted prediction, so it is
+older than this entry. `internal/deblock` gave every TU and CU edge a boundary
+strength of 2, the value for an intra edge. Between two zero-motion skip CUs
+with no residual, spec 8.7.2.4 gives 0, and the edge is not filtered. Bs is now
+2 where either side is intra and 0 otherwise, which is exact for skip CUs, the
+only inter CUs the decoder reconstructs.
+
+It was not only our P-skips. x265's own P picture of skip CUs, coded at its
+defaults from two copies of one frame, decoded up to 8 away from FFmpeg in all
+11 streams tried: `testsrc2`, `smptebars`, `testsrc` and `rgbtestsrc` at 128x64,
+256x128 and 416x240, less one that carries motion and is refused. All 11 now
+match FFmpeg exactly. `testdata/pskip_deblock_128x64.265` pins it with an FFmpeg
+golden (754 samples off before the fix), and its IDR replaces the x265 run in
+the deblocked P-skip test, which therefore no longer needs x265 or FFmpeg.
 
 ### 0.10 Real-world content decoding (L) — **fixed**
 
@@ -1312,11 +1324,6 @@ where it needs kvazaar rather than a large committed fixture.
 Everything through Phase 3 is done, plus 4.1, 4.3 and Phase 6. Remaining, smallest first:
 
 - **`hi265dec -no-deblock`** (S) — the only gap left in 4.1.
-- **Deblocked P-skip pictures** (in 0.23) — `pkg/decoder` decodes one up to 2
-  away from its reference in 132 samples of a 128x64 picture. Zero motion
-  against a single reference with no residual gives every edge a boundary
-  strength of 0, so the filter should leave such a picture untouched, as FFmpeg
-  does.
 - **4.2 `hi265gen`** (M) — PNG/JPEG image as background, and a committed PSNR
   command (there is an untracked `psnr` binary in the repo root but no `cmd/`).
 - **8x8 *content* in `hi265gen`** (in 4.3) — the library takes it through
