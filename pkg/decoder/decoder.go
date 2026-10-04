@@ -2,7 +2,6 @@
 package decoder
 
 import (
-	"bytes"
 	"fmt"
 
 	"github.com/Eyevinn/mp4ff/avc"
@@ -569,7 +568,7 @@ func finishSliceHeader(r *bits.EBSPReader, sps *hevc.SPS, pps *hevc.PPS) ([]int,
 }
 
 func (d *Decoder) parseIRAPSegment(nalu []byte, isCRA bool) (*sliceSegment, error) {
-	r := bits.NewEBSPReader(bytes.NewReader(nalu))
+	r := bits.NewEBSPReaderFromSlice(nalu)
 
 	// Skip 2-byte NALU header
 	r.Read(16)
@@ -728,7 +727,7 @@ func (d *Decoder) parseIRAPSegment(nalu []byte, isCRA bool) (*sliceSegment, erro
 // parseTrailSegment parses the header of a trailing (non-IRAP) slice segment,
 // which carries a P or B slice.
 func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
-	r := bits.NewEBSPReader(bytes.NewReader(nalu))
+	r := bits.NewEBSPReaderFromSlice(nalu)
 
 	// Skip 2-byte NALU header
 	r.Read(16)
