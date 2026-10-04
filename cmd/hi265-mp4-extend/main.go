@@ -11,6 +11,7 @@ import (
 	"os"
 
 	"github.com/Eyevinn/mp4ff/avc"
+	"github.com/Eyevinn/mp4ff/bits"
 	"github.com/Eyevinn/mp4ff/hevc"
 	"github.com/Eyevinn/mp4ff/mp4"
 
@@ -241,12 +242,11 @@ func writeSegment(outPath string, init *mp4.InitSegment, segParsed *mp4.File,
 	if err != nil {
 		return fmt.Errorf("create fragment: %w", err)
 	}
-	for _, s := range inputSamples {
-		frag.AddFullSample(s)
-	}
-	for _, s := range newSamples {
-		frag.AddFullSample(s)
-	}
+	// AddFullSamples refers to the sample data instead of copying it into the
+	// mdat. The input samples are views of the parsed input segment, which
+	// nothing changes before the fragment is written.
+	frag.AddFullSamples(inputSamples)
+	frag.AddFullSamples(newSamples)
 	seg := mp4.NewMediaSegment()
 	seg.AddFragment(frag)
 	if err := seg.Encode(out); err != nil {
@@ -289,7 +289,7 @@ func decodeFile(path string) (*mp4.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	return mp4.DecodeFile(bytes.NewReader(data))
+	return mp4.DecodeFileSR(bits.NewFixedSliceReader(data))
 }
 
 // hvcCParamSets returns the VPS, SPS and PPS NALUs of the first HEVC track.
@@ -330,11 +330,11 @@ func allSamples(file *mp4.File) ([]mp4.FullSample, error) {
 	var samples []mp4.FullSample
 	for _, seg := range file.Segments {
 		for _, frag := range seg.Fragments {
-			got, err := frag.GetFullSamples(nil)
+			var err error
+			samples, err = frag.AppendFullSamples(samples, nil)
 			if err != nil {
 				return nil, fmt.Errorf("read input samples: %w", err)
 			}
-			samples = append(samples, got...)
 		}
 	}
 	return samples, nil

@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `encode.GenerateIDRFromPlane` encodes an IDR from a `yuv.PlaneGrid`, so with
   `Use8x8CU` each 8x8 CU of a CTU can carry its own content.
 
+### Changed
+- mp4ff v0.58.0 is now the minimum. `encode.LastFrameState` makes half as many allocations and runs
+  about 15% faster, and `hi265-mp4-extend` no longer copies the input samples into its output segment
+- MP4 output from `hi265gen` and `hi265-mp4-extend` lists CMAF brands (`cmfc` in `ftyp`;
+  `cmfs`, `cmff`, `cmfl` in `styp`) instead of `dash`
+
 ## [0.5.0] - 2026-08-25
 
 Numbered 0.5.0 rather than 0.2.0: what landed since 0.1.0 is most of a codec —
