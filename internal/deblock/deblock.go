@@ -34,8 +34,8 @@ func clip3(lo, hi, val int) int {
 	return val
 }
 
-// Apply applies the HEVC deblocking filter to the reconstructed frame.
-// For I-slices, Bs = 2 at all TU/CU boundary edges.
+// Apply applies the HEVC deblocking filter to the reconstructed frame, at the
+// TU and CU edges whose boundary strength boundaryStrength finds above 0.
 //
 // bounds carries the picture's tile and slice structure: which edges may not be
 // filtered at all, which slices have deblocking disabled, and each slice's beta
@@ -56,21 +56,23 @@ func Apply(f *frame.Frame, cus []slice.CodingUnit, sliceQPY int,
 	gridH := (picH + 3) / 4
 	edgeFlags := make([]byte, gridW*gridH)
 
-	// Build per-4x4-block QP map
+	// Build per-4x4-block QP and intra maps
 	qpMap := make([]int, gridW*gridH)
 	for i := range qpMap {
 		qpMap[i] = sliceQPY
 	}
+	intraMap := make([]bool, gridW*gridH)
 
 	for _, cu := range cus {
 		cuSize := 1 << cu.Log2CbSize
 
-		// The QP map is filled even for a CU whose slice disables deblocking:
+		// The maps are filled even for a CU whose slice disables deblocking:
 		// an edge on the boundary with an enabled slice averages the QPs of both
-		// sides, so this block's QP is still needed.
+		// sides and takes its strength from both, so this block is still needed.
 		for y := cu.Y0 / 4; y < (cu.Y0+cuSize)/4 && y < gridH; y++ {
 			for x := cu.X0 / 4; x < (cu.X0+cuSize)/4 && x < gridW; x++ {
 				qpMap[y*gridW+x] = cu.QpY
+				intraMap[y*gridW+x] = cu.PredMode == 1
 			}
 		}
 
@@ -90,10 +92,29 @@ func Apply(f *frame.Frame, cus []slice.CodingUnit, sliceQPY int,
 	clearBoundaryEdges(edgeFlags, gridW, gridH, bounds)
 
 	// Pass 1: Filter vertical edges (left-to-right, top-to-bottom)
-	filterEdges(f, edgeFlags, gridW, gridH, qpMap, chromaQPOffsets, bounds, true)
+	filterEdges(f, edgeFlags, gridW, gridH, qpMap, intraMap, chromaQPOffsets, bounds, true)
 
 	// Pass 2: Filter horizontal edges (top-to-bottom, left-to-right)
-	filterEdges(f, edgeFlags, gridW, gridH, qpMap, chromaQPOffsets, bounds, false)
+	filterEdges(f, edgeFlags, gridW, gridH, qpMap, intraMap, chromaQPOffsets, bounds, false)
+}
+
+// boundaryStrength returns bS (spec 8.7.2.4) for the edge between the 4x4 block
+// at (gx, gy) and its left neighbour, or its upper one when vertical is false.
+//
+// An intra block on either side gives 2. Otherwise both blocks are in skip CUs,
+// the only inter CUs this decoder reconstructs: zero motion from the same
+// reference picture and no residual, which gives 0, so the edge is left alone.
+// Filtering the CU edges of a skip picture as if they were intra edges changed
+// its samples next to every one of them.
+func boundaryStrength(intraMap []bool, gridW, gx, gy int, vertical bool) int {
+	p := gy*gridW + gx - 1
+	if !vertical {
+		p = (gy-1)*gridW + gx
+	}
+	if intraMap[gy*gridW+gx] || intraMap[p] {
+		return 2
+	}
+	return 0
 }
 
 // clearBoundaryEdges removes the edges no filter may reach across: spec 8.7.2
@@ -143,7 +164,7 @@ func markEdges(edgeFlags []byte, gridW, gridH, x0, y0, w, h, _, _ int) {
 // filterEdges filters all edges in one direction.
 func filterEdges(
 	f *frame.Frame, edgeFlags []byte, gridW, gridH int,
-	qpMap []int, chromaQPOffsets transform.ChromaQPOffsets,
+	qpMap []int, intraMap []bool, chromaQPOffsets transform.ChromaQPOffsets,
 	bounds *loopfilter.Boundaries, vertical bool,
 ) {
 	picW := f.Width
@@ -175,8 +196,10 @@ func filterEdges(
 				continue
 			}
 
-			// For I-slice, Bs = 2
-			bs := 2
+			bs := boundaryStrength(intraMap, gridW, gx, gy, vertical)
+			if bs == 0 {
+				continue
+			}
 
 			// QP is average of P and Q blocks
 			qpQ := qpMap[gy*gridW+gx]
@@ -232,7 +255,11 @@ func filterEdges(
 				continue
 			}
 
-			bs := 2
+			// Chroma edges are filtered only where bS is 2 (spec 8.7.2.5.5).
+			bs := boundaryStrength(intraMap, gridW, gx, gy, vertical)
+			if bs != 2 {
+				continue
+			}
 			qpQ := qpMap[gy*gridW+gx]
 			var qpP int
 			if vertical {

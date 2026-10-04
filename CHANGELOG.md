@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accept a PPS with `weighted_pred_flag` set, x265's default above ultrafast.
 - `EncodePSkipSliceFromSPSPPS` writes `collocated_ref_idx` when temporal MVP is on
   and the PPS has several default references; the P-skip was undecodable without it.
+- `pkg/decoder` no longer deblocks the edges between skip CUs as intra edges, so
+  deblocked P pictures, x265's included, decode exactly instead of up to 8 off.
 
 ## [0.5.0] - 2026-08-25
 
