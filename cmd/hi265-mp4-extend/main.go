@@ -87,7 +87,7 @@ func run(args []string) error {
 		return err
 	}
 	if opts.version {
-		fmt.Printf("%s %s\n", appName, internal.GetVersion())
+		fmt.Printf("%s %s\n", appName, internal.Version())
 		return nil
 	}
 	if fs.NArg() != 3 {

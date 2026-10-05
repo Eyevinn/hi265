@@ -1,30 +1,20 @@
 .PHONY: all build test coverage check pre-commit pre-commit-install codespell clean install
 
-LDFLAGS = -X github.com/Eyevinn/hi265/internal.commitVersion=$$(git describe --tags HEAD 2>/dev/null || echo dev-$$(git rev-parse --short HEAD)) \
-          -X github.com/Eyevinn/hi265/internal.commitDate=$$(git log -1 --format=%ct)
+CMDS = hi265dec hi265gen hi265gray hi265retile hi265-mp4-extend hi265inspect
+BINARIES = $(addprefix out/,$(CMDS))
 
 all: check build test
 
-build: out/hi265dec out/hi265gen out/hi265gray out/hi265retile \
-       out/hi265-mp4-extend out/hi265inspect
+build: $(BINARIES)
 
-out/hi265dec: $(shell find pkg cmd/hi265dec internal -name '*.go')
-	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265dec
-
-out/hi265gen: $(shell find pkg cmd/hi265gen internal -name '*.go')
-	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265gen
-
-out/hi265gray: $(shell find pkg cmd/hi265gray internal -name '*.go')
-	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265gray
-
-out/hi265retile: $(shell find pkg cmd/hi265retile internal -name '*.go')
-	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265retile
-
-out/hi265-mp4-extend: $(shell find pkg cmd/hi265-mp4-extend internal -name '*.go')
-	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265-mp4-extend
-
-out/hi265inspect: $(shell find pkg cmd/hi265inspect internal -name '*.go')
-	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/hi265inspect
+# Binaries are built as packages, not as main.go files, so that they carry the
+# version Go embeds from the git tag and commit (see internal/buildinfo.go).
+# They are .PHONY because that version is not a file prerequisite: a binary
+# built before a commit or a tag would be kept, still naming the old one. The
+# build cache makes the rebuild cheap.
+.PHONY: $(BINARIES)
+$(BINARIES): out/%:
+	go build -o $@ ./cmd/$*
 
 # The Python venv this Makefile creates lives inside the module, and pre-commit
 # ships an empty Go template in its resources — so './...' matches a package
@@ -76,9 +66,4 @@ clean:
 	rm -rf out/ coverage.out coverage.html coverage.txt venv/
 
 install:
-	go install -ldflags "$(LDFLAGS)" ./cmd/hi265dec
-	go install -ldflags "$(LDFLAGS)" ./cmd/hi265gen
-	go install -ldflags "$(LDFLAGS)" ./cmd/hi265gray
-	go install -ldflags "$(LDFLAGS)" ./cmd/hi265retile
-	go install -ldflags "$(LDFLAGS)" ./cmd/hi265-mp4-extend
-	go install -ldflags "$(LDFLAGS)" ./cmd/hi265inspect
+	go install $(addprefix ./cmd/,$(CMDS))

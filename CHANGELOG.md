@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about 15% faster, and `hi265-mp4-extend` no longer copies the input samples into its output segment
 - MP4 output from `hi265gen` and `hi265-mp4-extend` lists CMAF brands (`cmfc` in `ftyp`;
   `cmfs`, `cmff`, `cmfl` in `styp`) instead of `dash`
+- `-version` reports the version Go embeds from the git tag and commit, also for `go install` and a
+  plain `go build`; `internal/version.go` and the Makefile `-ldflags` are gone
 
 ### Fixed
 - `EncodePSkipSliceFromSPSPPS`, `AppendEmptyFrames` and the IDR and CRA writers
