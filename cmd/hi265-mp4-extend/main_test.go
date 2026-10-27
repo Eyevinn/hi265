@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/Eyevinn/mp4ff/avc"
@@ -241,6 +242,43 @@ func TestRunArgValidation(t *testing.T) {
 	}
 	if err := run([]string{appName, "-frames", "2", "only-one-arg"}); err == nil {
 		t.Error("expected an error for too few positional arguments")
+	}
+}
+
+// An init segment whose track lacks its stsd or tkhd has to give an error, and
+// no output. mp4ff decodes such a segment, and this tool walked down to the
+// boxes itself and panicked. Renamed to free, the box is skipped like any other
+// free box.
+func TestExtendSegmentRefusesMissingBoxes(t *testing.T) {
+	dir := t.TempDir()
+	initPath, segPath := makeInitAndSegment(t, dir, 4)
+	data, err := os.ReadFile(initPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct{ box, want string }{
+		{"stsd", "no HEVC video track found"},
+		{"tkhd", "no tkhd box"},
+	} {
+		t.Run(tc.box, func(t *testing.T) {
+			brokenInit := filepath.Join(dir, "init_no_"+tc.box+".mp4")
+			broken := bytes.Replace(data, []byte(tc.box), []byte("free"), 1)
+			if err := os.WriteFile(brokenInit, broken, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			outPath := filepath.Join(dir, "out_"+tc.box+".m4s")
+			err := run([]string{appName, "-frames", "2", brokenInit, segPath, outPath})
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the error should say %q, got: %v", tc.want, err)
+			}
+			if _, err := os.Stat(outPath); err == nil {
+				t.Error("an output segment was written")
+			}
+		})
 	}
 }
 

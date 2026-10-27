@@ -115,6 +115,10 @@ func extendSegment(initPath, inSegPath, outSegPath string, opts *options) error 
 	if err != nil {
 		return fmt.Errorf("read parameter sets from init: %w", err)
 	}
+	trackID, err := defaultTrackID(initParsed.Init)
+	if err != nil {
+		return err
+	}
 
 	segParsed, err := decodeFile(inSegPath)
 	if err != nil {
@@ -200,7 +204,7 @@ func extendSegment(initPath, inSegPath, outSegPath string, opts *options) error 
 		nextDecodeTime += uint64(sampleDur)
 	}
 
-	if err := writeSegment(outSegPath, initParsed.Init, segParsed, inputSamples, newSamples); err != nil {
+	if err := writeSegment(outSegPath, trackID, segParsed, inputSamples, newSamples); err != nil {
 		return err
 	}
 
@@ -229,7 +233,7 @@ func fullSample(annexB []byte, flags, dur uint32, decodeTime uint64) mp4.FullSam
 	}
 }
 
-func writeSegment(outPath string, init *mp4.InitSegment, segParsed *mp4.File,
+func writeSegment(outPath string, trackID uint32, segParsed *mp4.File,
 	inputSamples, newSamples []mp4.FullSample) error {
 
 	out, err := os.Create(outPath)
@@ -238,7 +242,7 @@ func writeSegment(outPath string, init *mp4.InitSegment, segParsed *mp4.File,
 	}
 	defer out.Close()
 
-	frag, err := mp4.CreateFragment(firstSeqNum(segParsed), defaultTrackID(init))
+	frag, err := mp4.CreateFragment(firstSeqNum(segParsed), trackID)
 	if err != nil {
 		return fmt.Errorf("create fragment: %w", err)
 	}
@@ -298,8 +302,11 @@ func hvcCParamSets(init *mp4.InitSegment) ([][]byte, error) {
 		return nil, errors.New("no moov in init segment")
 	}
 	for _, trak := range init.Moov.Traks {
-		stsd := trak.Mdia.Minf.Stbl.Stsd
-		for _, child := range stsd.Children {
+		mdia := trak.Mdia
+		if mdia == nil || mdia.Minf == nil || mdia.Minf.Stbl == nil || mdia.Minf.Stbl.Stsd == nil {
+			continue
+		}
+		for _, child := range mdia.Minf.Stbl.Stsd.Children {
 			e, ok := child.(*mp4.VisualSampleEntryBox)
 			if !ok || e.HvcC == nil {
 				continue
@@ -370,14 +377,15 @@ func firstSeqNum(file *mp4.File) uint32 {
 	return 1
 }
 
-func defaultTrackID(init *mp4.InitSegment) uint32 {
-	if init == nil || init.Moov == nil {
-		return 1
+func defaultTrackID(init *mp4.InitSegment) (uint32, error) {
+	if init == nil || init.Moov == nil || len(init.Moov.Traks) == 0 {
+		return 1, nil
 	}
-	for _, t := range init.Moov.Traks {
-		return t.Tkhd.TrackID
+	tkhd := init.Moov.Traks[0].Tkhd
+	if tkhd == nil {
+		return 0, errors.New("init segment track has no tkhd box")
 	}
-	return 1
+	return tkhd.TrackID, nil
 }
 
 func mediaTimescale(init *mp4.InitSegment) uint32 {

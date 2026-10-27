@@ -909,6 +909,22 @@ mp4ff v0.61.0 refuses both at the SPS (Eyevinn/mp4ff#671), and is now the floor.
 `sincos_128x64.265`: on v0.58.0 the first panics and the second times out, on
 v0.61.0 both are refused with an error naming CtbLog2SizeY.
 
+### 0.25 MP4 tracks without their sample description (S) — **fixed**
+
+mp4ff v0.61.0 no longer panics on a track that lacks the boxes down to its
+sample entry, and leaves the check to the caller. `hi265dec` and
+`hi265-mp4-extend` followed the chain from the track to `stsd` unchecked, and
+read the track ID from `tkhd` the same way, so an MP4 without `minf`, `stbl`,
+`stsd` or `tkhd` still panicked them. Each box is now checked, and the error
+names it. `hi265-mp4-extend` reads the track ID before it creates its output, so
+a broken init leaves no empty segment behind.
+
+Measured by renaming each box to `free` in turn: 57 cases over a progressive
+and a fragmented MP4 for `hi265dec`, and an init and a media segment for
+`hi265-mp4-extend`. 9 panicked before, none after. `TestRunRefusesMissingBoxes`
+and `TestExtendSegmentRefusesMissingBoxes` cover every place that panicked, and
+fail without the fix.
+
 ### 0.10 Real-world content decoding (L) — **fixed**
 
 x265 output was not bit-exact, and got worse with detail and scale: a 720p
