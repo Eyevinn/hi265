@@ -4,4 +4,4 @@ go 1.24
 
 require github.com/Eyevinn/mp4ff v0.61.0
 
-require github.com/Eyevinn/hi264 v0.10.0
+require github.com/Eyevinn/hi264 v0.12.1
