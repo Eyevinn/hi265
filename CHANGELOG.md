@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- hi264 v0.12.1 is now the minimum.
+
 ### Fixed
 - mp4ff v0.61.0 is now the minimum, so `pkg/decoder` and `hi265dec` refuse an SPS whose coding
   tree block is outside 16x16..64x64 instead of panicking or hanging.
