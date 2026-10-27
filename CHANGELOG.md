@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-27
+
 ### Changed
 - hi264 v0.12.1 is now the minimum.
 
@@ -471,7 +473,8 @@ generator. Sister project to [hi264](https://github.com/Eyevinn/hi264).
 - Benchmark for gray IDR generation at 1920x1080 in three formats
   (4:2:0 8-bit, 4:2:0 10-bit, 4:2:2 10-bit)
 
-[Unreleased]: https://github.com/Eyevinn/hi265/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/Eyevinn/hi265/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/Eyevinn/hi265/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Eyevinn/hi265/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Eyevinn/hi265/compare/v0.1.0...v0.5.0
 [0.1.0]: https://github.com/Eyevinn/hi265/releases/tag/v0.1.0
