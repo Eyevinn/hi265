@@ -217,7 +217,11 @@ func decodeMP4(path string, n int) ([]*frame.Frame, error) {
 
 // hvcCParamSets returns the VPS, SPS and PPS NALUs carried in the track's hvcC box.
 func hvcCParamSets(videoTrack *mp4.TrakBox) ([][]byte, error) {
-	stsd := videoTrack.Mdia.Minf.Stbl.Stsd
+	mdia := videoTrack.Mdia
+	if mdia == nil || mdia.Minf == nil || mdia.Minf.Stbl == nil || mdia.Minf.Stbl.Stsd == nil {
+		return nil, errors.New("video track has no stsd box")
+	}
+	stsd := mdia.Minf.Stbl.Stsd
 	if stsd.HvcX == nil {
 		return nil, errors.New("no HEVC sample entry found (not an HEVC track)")
 	}
@@ -271,6 +275,9 @@ func decodeProgressive(mp4File *mp4.File, videoTrack *mp4.TrakBox, f *os.File,
 func decodeFragmented(mp4File *mp4.File, videoTrack *mp4.TrakBox, f *os.File,
 	paramSets [][]byte, dec *decoder.Decoder, n int) ([]*frame.Frame, error) {
 
+	if videoTrack.Tkhd == nil {
+		return nil, errors.New("video track has no tkhd box")
+	}
 	trackID := videoTrack.Tkhd.TrackID
 	var trex *mp4.TrexBox
 	if mp4File.Moov.Mvex != nil {

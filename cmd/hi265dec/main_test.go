@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"os"
 	"path/filepath"
@@ -129,5 +130,39 @@ func TestRunRefusesRealInterPicture(t *testing.T) {
 
 	if err := run([]string{appName, "-n", "1", in, "-o", filepath.Join(dir, "first.yuv")}); err != nil {
 		t.Errorf("the IDR picture on its own should decode: %v", err)
+	}
+}
+
+// An MP4 that lacks a box on the way to the parameter sets, or the track header
+// a fragmented file is read by, has to give an error. mp4ff decodes such a file,
+// and this tool walked down to the boxes itself and panicked. Renamed to free,
+// the box is skipped like any other free box.
+func TestRunRefusesMissingBoxes(t *testing.T) {
+	in := filepath.Join("..", "..", "testdata", "hevc_1idr_1p.mp4")
+	data, err := os.ReadFile(in)
+	if err != nil {
+		t.Skipf("test bitstream not available: %v", err)
+	}
+	dir := t.TempDir()
+
+	for _, tc := range []struct{ box, want string }{
+		{"minf", "no stsd box"},
+		{"stbl", "no stsd box"},
+		{"stsd", "no stsd box"},
+		{"tkhd", "no tkhd box"},
+	} {
+		t.Run(tc.box, func(t *testing.T) {
+			path := filepath.Join(dir, "no_"+tc.box+".mp4")
+			if err := os.WriteFile(path, bytes.Replace(data, []byte(tc.box), []byte("free"), 1), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := run([]string{appName, "-n", "1", path, "-o", filepath.Join(dir, tc.box+".yuv")})
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the error should say %q, got: %v", tc.want, err)
+			}
+		})
 	}
 }

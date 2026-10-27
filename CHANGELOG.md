@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - mp4ff v0.61.0 is now the minimum, so `pkg/decoder` and `hi265dec` refuse an SPS whose coding
   tree block is outside 16x16..64x64 instead of panicking or hanging.
+- `hi265dec` and `hi265-mp4-extend` give an error instead of panicking on an MP4 track without
+  the boxes down to its `stsd`, or without its `tkhd`.
 
 ## [0.6.0] - 2026-10-06
 
