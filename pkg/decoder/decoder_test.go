@@ -1,11 +1,13 @@
 package decoder
 
 import (
+	"bytes"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/Eyevinn/mp4ff/avc"
+	"github.com/Eyevinn/mp4ff/bits"
 	"github.com/Eyevinn/mp4ff/hevc"
 
 	"github.com/Eyevinn/hi265/pkg/frame"
@@ -473,4 +475,81 @@ func TestSupportedStreamsStillDecode(t *testing.T) {
 			t.Errorf("%s should decode: %v", path, err)
 		}
 	}
+}
+
+// A coding tree block outside 16x16..64x64, the range every profile in Annex A
+// allows, has to be refused at the SPS. Fuzzing found both shapes below: a
+// CtbLog2SizeY of 64 shifts the CTB size to 0, and decoding panicked with a
+// division by zero; a 2^30 minimum coding block made the decoder hang. The check
+// is mp4ff's (Eyevinn/mp4ff#671, in v0.61.0), since the SPS comes from its
+// parser, so this pins that the version go.mod requires still makes it.
+func TestCodingTreeBlockOutsideProfilesIsRefused(t *testing.T) {
+	data, err := os.ReadFile("../../testdata/sincos_128x64.265")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name                              string
+		log2MinCbMinus3, log2DiffMaxMinCb uint
+	}{
+		{"CTB 2^64", 0, 61},
+		{"MinCb 2^30", 27, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sps := codedSPS(128, 64, tc.log2MinCbMinus3, tc.log2DiffMaxMinCb)
+			var nalus [][]byte
+			for _, nalu := range avc.ExtractNalusFromByteStream(data) {
+				if len(nalu) >= 2 && hevc.GetNaluType(nalu[0]) == hevc.NALU_SPS {
+					nalu = sps
+				}
+				nalus = append(nalus, nalu)
+			}
+			frames, err := New().DecodeNALUs(nalus)
+			if err == nil {
+				t.Fatalf("expected the SPS to be refused, got %d frames", len(frames))
+			}
+			if !strings.Contains(err.Error(), "CtbLog2SizeY") {
+				t.Errorf("the error should name CtbLog2SizeY, got: %v", err)
+			}
+		})
+	}
+}
+
+// codedSPS writes an 8-bit 4:2:0 Main SPS NAL unit with the given picture size
+// and coding block fields, and every optional tool off.
+func codedSPS(width, height, log2MinCbMinus3, log2DiffMaxMinCb uint) []byte {
+	var buf bytes.Buffer
+	w := bits.NewEBSPWriter(&buf)
+	w.Write(0x4201, 16)     // nal_unit_header: SPS, nuh_layer_id 0, nuh_temporal_id_plus1 1
+	w.Write(0, 4)           // sps_video_parameter_set_id
+	w.Write(0, 3)           // sps_max_sub_layers_minus1
+	w.Write(1, 1)           // sps_temporal_id_nesting_flag
+	w.Write(1, 8)           // general_profile_space, general_tier_flag, general_profile_idc (Main)
+	w.Write(0x60000000, 32) // general_profile_compatibility_flags
+	w.Write(0, 24)          // general constraint flags, first half
+	w.Write(0, 24)          // general constraint flags, second half
+	w.Write(93, 8)          // general_level_idc
+	w.WriteExpGolomb(0)     // sps_seq_parameter_set_id
+	w.WriteExpGolomb(1)     // chroma_format_idc
+	w.WriteExpGolomb(width)
+	w.WriteExpGolomb(height)
+	w.Write(0, 1)       // conformance_window_flag
+	w.WriteExpGolomb(0) // bit_depth_luma_minus8
+	w.WriteExpGolomb(0) // bit_depth_chroma_minus8
+	w.WriteExpGolomb(4) // log2_max_pic_order_cnt_lsb_minus4
+	w.Write(1, 1)       // sps_sub_layer_ordering_info_present_flag
+	w.WriteExpGolomb(1) // sps_max_dec_pic_buffering_minus1
+	w.WriteExpGolomb(0) // sps_max_num_reorder_pics
+	w.WriteExpGolomb(0) // sps_max_latency_increase_plus1
+	w.WriteExpGolomb(log2MinCbMinus3)
+	w.WriteExpGolomb(log2DiffMaxMinCb)
+	w.WriteExpGolomb(0) // log2_min_luma_transform_block_size_minus2
+	w.WriteExpGolomb(2) // log2_diff_max_min_luma_transform_block_size
+	w.WriteExpGolomb(0) // max_transform_hierarchy_depth_inter
+	w.WriteExpGolomb(0) // max_transform_hierarchy_depth_intra
+	w.Write(0, 4)       // scaling_list_enabled_flag, amp, sample_adaptive_offset, pcm_enabled_flag
+	w.WriteExpGolomb(0) // num_short_term_ref_pic_sets
+	w.Write(0, 5)       // long_term_ref_pics, temporal_mvp, strong_intra_smoothing, vui, extension
+	w.WriteRbspTrailingBits()
+	return buf.Bytes()
 }
