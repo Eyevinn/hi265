@@ -895,6 +895,20 @@ match FFmpeg exactly. `testdata/pskip_deblock_128x64.265` pins it with an FFmpeg
 golden (754 samples off before the fix), and its IDR replaces the x265 run in
 the deblocked P-skip test, which therefore no longer needs x265 or FFmpeg.
 
+### 0.24 A coding tree block no profile allows (S) — **fixed**
+
+Fuzzing found SPSs that crash or hang `pkg/decoder`. Nothing here bounds
+CtbLog2SizeY: the SPS comes straight from mp4ff's parser, which read both coding
+block fields unchecked. With `log2_diff_max_min_luma_coding_block_size` 61 the
+CTB size shifts to 0 and `tiles.PicSizeInCtbs` divides by zero. With a 2^30
+minimum coding block, `hi265dec` had not finished a 64x64 picture after three
+minutes. Every profile in Annex A limits CtbLog2SizeY to 4..6.
+
+mp4ff v0.61.0 refuses both at the SPS (Eyevinn/mp4ff#671), and is now the floor.
+`TestCodingTreeBlockOutsideProfilesIsRefused` puts both SPSs into
+`sincos_128x64.265`: on v0.58.0 the first panics and the second times out, on
+v0.61.0 both are refused with an error naming CtbLog2SizeY.
+
 ### 0.10 Real-world content decoding (L) — **fixed**
 
 x265 output was not bit-exact, and got worse with detail and scale: a 720p
@@ -1265,8 +1279,8 @@ drops those zeros itself (Eyevinn/mp4ff#622), and the trim here is gone.
 
 The mp4ff `replace` directive the old repo needed is gone with it: it pointed at
 master for the slice-header inference fixes of Eyevinn/mp4ff#558, which shipped
-in v0.56.0. The floor is now v0.58.0, which `SplitAnnexB` relies on. Do not
-lower it.
+in v0.56.0. `SplitAnnexB` relies on v0.58.0, and the floor is v0.61.0 since
+0.24. Do not lower it.
 
 ### 6.2 An API, and refusing what cannot tile (M) — **done**
 
