@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/Eyevinn/hi264/pkg/yuv"
+	"github.com/Eyevinn/hi265/internal/transform"
 	"github.com/Eyevinn/mp4ff/hevc"
 )
 
@@ -12,7 +13,7 @@ import (
 type EncodeParams struct {
 	Width    int  // must be a multiple of 8
 	Height   int  // must be a multiple of 8
-	QP       int  // 0-51, default 26
+	QP       int  // 1-51, or 0 for the default 26; anything else is refused
 	Use8x8CU bool // code each 16x16 CTU as four 8x8 CUs
 	// TileCols and TileRows cut the picture into a uniform tile grid, each tile
 	// coded as its own independent slice segment with no filtering across the
@@ -61,6 +62,17 @@ func (p EncodeParams) validateParallelism() error {
 	return nil
 }
 
+// validateQP refuses a QP no PPS can carry: init_qp_minus26 is bounded to
+// −26..25 for 8-bit video (spec 7.4.3.3.1), so the QP to 0..51. A QP outside that
+// made a PPS FFmpeg refuses, and one below zero also panicked the forward
+// quantizer.
+func (p EncodeParams) validateQP() error {
+	if p.QP < 0 || p.QP > 51 {
+		return fmt.Errorf("QP %d is outside 0..51", p.QP)
+	}
+	return nil
+}
+
 func (p EncodeParams) qp() int {
 	if p.QP == 0 {
 		return 26
@@ -71,6 +83,9 @@ func (p EncodeParams) qp() int {
 // GenerateVPSSPSPPS returns Annex-B bytes containing VPS + SPS + PPS NALUs.
 func GenerateVPSSPSPPS(p EncodeParams) ([]byte, error) {
 	if err := validateFrameDimensions(p.Width, p.Height); err != nil {
+		return nil, err
+	}
+	if err := p.validateQP(); err != nil {
 		return nil, err
 	}
 	if err := p.validateParallelism(); err != nil {
@@ -154,6 +169,9 @@ func GenerateIDRFromPlane(p EncodeParams, plane *yuv.PlaneGrid) ([]byte, error) 
 	if err := validateFrameDimensions(p.Width, p.Height); err != nil {
 		return nil, err
 	}
+	if err := p.validateQP(); err != nil {
+		return nil, err
+	}
 	y, cb, cr, err := planeSource(plane, p.Width, p.Height)
 	if err != nil {
 		return nil, err
@@ -175,6 +193,9 @@ func GenerateIDRFromPlane(p EncodeParams, plane *yuv.PlaneGrid) ([]byte, error) 
 // All CUs copy from the reference frame with zero motion.
 func GeneratePSkip(p EncodeParams, poc int) ([]byte, error) {
 	if err := validateFrameDimensions(p.Width, p.Height); err != nil {
+		return nil, err
+	}
+	if err := p.validateQP(); err != nil {
 		return nil, err
 	}
 	segs, err := p.segments()
@@ -281,7 +302,17 @@ func EncodePSkipSliceFromSPSPPS(sps *hevc.SPS, pps *hevc.PPS, poc int) ([]byte, 
 	return buf.Bytes(), nil
 }
 
-func validateSPSPPS(_ *hevc.SPS, pps *hevc.PPS) error {
+func validateSPSPPS(sps *hevc.SPS, pps *hevc.PPS) error {
+	// Every slice is written with slice_qp_delta 0, so the PPS's initial QP is the
+	// slice QP, and the residual writers quantize at it. The chroma offsets of the
+	// PPS are applied as well.
+	if err := transform.CheckInitQP(int(pps.InitQpMinus26), 8+int(sps.BitDepthLumaMinus8)); err != nil {
+		return err
+	}
+	if err := transform.CheckChromaQPOffsets(transform.ChromaQPOffsets{
+		Cb: int(pps.CbQpOffset), Cr: int(pps.CrQpOffset)}, transform.ChromaQPOffsets{}); err != nil {
+		return err
+	}
 	// Tiles are supported, emitted as one independent slice segment per tile, and
 	// so is wavefront parallel processing, as one substream per CTB row of a
 	// single segment. The two together are not: no HEVC profile permits the

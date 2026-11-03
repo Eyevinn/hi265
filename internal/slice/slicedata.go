@@ -8,6 +8,7 @@ import (
 	"github.com/Eyevinn/hi265/internal/cabac"
 	"github.com/Eyevinn/hi265/internal/context"
 	"github.com/Eyevinn/hi265/internal/tiles"
+	"github.com/Eyevinn/hi265/internal/transform"
 )
 
 // CodingUnit holds the decoded data for a single CU.
@@ -982,9 +983,15 @@ func decodeTransformTree(dec *cabac.Decoder, ctx []cabac.CtxState,
 	// Decode cu_qp_delta if enabled and not yet coded for this QG
 	if p.CuQpDeltaEnabled && !qps.isCuQpDeltaCoded && (tu.CbfLuma || cbfCb || cbfCr) {
 		delta := decodeCuQpDelta(dec, ctx)
+		// The slice data is 8-bit only; the decoder refuses other bit depths
+		// before it gets here.
+		if err := transform.CheckCuQpDelta(delta, 8); err != nil {
+			return nil, err
+		}
 		// QpY = ( ( qPY_PRED + CuQpDeltaVal + 52 ) % 52 ) for 8-bit, which wraps
-		// rather than clamping.
-		qps.currentQP = ((qps.qpYPred+delta+52)%52 + 52) % 52
+		// rather than clamping. qPY_PRED is a QP already in 0..51, so with the
+		// delta in range the sum is never negative.
+		qps.currentQP = (qps.qpYPred + delta + 52) % 52
 		qps.isCuQpDeltaCoded = true
 	}
 
