@@ -567,6 +567,39 @@ func finishSliceHeader(r *bits.EBSPReader, sps *hevc.SPS, pps *hevc.PPS) ([]int,
 	return entryPoints, nil
 }
 
+// parseSliceQP reads slice_qp_delta and, when the PPS puts them in the slice
+// header, slice_cb_qp_offset and slice_cr_qp_offset. It returns SliceQpY (spec
+// equation 7-54) and the chroma QP offsets the slice quantizes with: the picture-
+// level pair plus the slice-level one.
+//
+// Both are refused when outside the range the standard allows, including the PPS
+// fields they are built from. A slice QP below zero used to panic in the
+// dequantizer, and other out-of-range values decoded into a picture no conforming
+// decoder produces.
+func parseSliceQP(r *bits.EBSPReader, sps *hevc.SPS, pps *hevc.PPS) (
+	int, transform.ChromaQPOffsets, error) {
+
+	qpDelta := r.ReadSignedGolomb()
+	ppsOffsets := transform.ChromaQPOffsets{Cb: int(pps.CbQpOffset), Cr: int(pps.CrQpOffset)}
+	var sliceOffsets transform.ChromaQPOffsets
+	if pps.SliceChromaQpOffsetsPresentFlag {
+		sliceOffsets.Cb = r.ReadSignedGolomb()
+		sliceOffsets.Cr = r.ReadSignedGolomb()
+	}
+
+	bitDepth := 8 + int(sps.BitDepthLumaMinus8)
+	if err := transform.CheckSliceQP(int(pps.InitQpMinus26), qpDelta, bitDepth); err != nil {
+		return 0, transform.ChromaQPOffsets{}, err
+	}
+	if err := transform.CheckChromaQPOffsets(ppsOffsets, sliceOffsets); err != nil {
+		return 0, transform.ChromaQPOffsets{}, err
+	}
+	return 26 + int(pps.InitQpMinus26) + qpDelta, transform.ChromaQPOffsets{
+		Cb: ppsOffsets.Cb + sliceOffsets.Cb,
+		Cr: ppsOffsets.Cr + sliceOffsets.Cr,
+	}, nil
+}
+
 func (d *Decoder) parseIRAPSegment(nalu []byte, isCRA bool) (*sliceSegment, error) {
 	r := bits.NewEBSPReaderFromSlice(nalu)
 
@@ -630,17 +663,10 @@ func (d *Decoder) parseIRAPSegment(nalu []byte, isCRA bool) (*sliceSegment, erro
 	// I-slice: no num_ref_idx, no pred_weight_table, no mvd_l1_zero_flag,
 	// no cabac_init_flag, no collocated, no five_minus_max_num_merge_cand
 
-	// slice_qp_delta
-	qpDelta := r.ReadSignedGolomb()
-
-	// slice_cb_qp_offset, slice_cr_qp_offset
-	chromaQPOffsets := transform.ChromaQPOffsets{
-		Cb: int(pps.CbQpOffset),
-		Cr: int(pps.CrQpOffset),
-	}
-	if pps.SliceChromaQpOffsetsPresentFlag {
-		chromaQPOffsets.Cb += int(r.ReadSignedGolomb())
-		chromaQPOffsets.Cr += int(r.ReadSignedGolomb())
+	// slice_qp_delta, slice_cb_qp_offset, slice_cr_qp_offset
+	sliceQPY, chromaQPOffsets, err := parseSliceQP(r, sps, pps)
+	if err != nil {
+		return nil, err
 	}
 
 	// Deblocking filter parameters: start with PPS defaults
@@ -704,7 +730,7 @@ func (d *Decoder) parseIRAPSegment(nalu []byte, isCRA bool) (*sliceSegment, erro
 		chromaQPOffsets:    chromaQPOffsets,
 		params: slice.Params{
 			SliceType:                       context.SliceTypeI,
-			SliceQPY:                        26 + int(pps.InitQpMinus26) + qpDelta,
+			SliceQPY:                        sliceQPY,
 			PicWidth:                        int(sps.PicWidthInLumaSamples),
 			PicHeight:                       int(sps.PicHeightInLumaSamples),
 			Log2CtbSize:                     log2Ctb,
@@ -845,17 +871,10 @@ func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
 	fiveMinusMerge := int(r.ReadExpGolomb())
 	maxNumMergeCand := 5 - fiveMinusMerge
 
-	// slice_qp_delta
-	qpDelta := r.ReadSignedGolomb()
-
-	// slice_cb_qp_offset, slice_cr_qp_offset
-	chromaQPOffsets := transform.ChromaQPOffsets{
-		Cb: int(pps.CbQpOffset),
-		Cr: int(pps.CrQpOffset),
-	}
-	if pps.SliceChromaQpOffsetsPresentFlag {
-		chromaQPOffsets.Cb += int(r.ReadSignedGolomb())
-		chromaQPOffsets.Cr += int(r.ReadSignedGolomb())
+	// slice_qp_delta, slice_cb_qp_offset, slice_cr_qp_offset
+	sliceQPY, chromaQPOffsets, err := parseSliceQP(r, sps, pps)
+	if err != nil {
+		return nil, err
 	}
 
 	// Deblocking filter parameters
@@ -915,7 +934,7 @@ func (d *Decoder) parseTrailSegment(nalu []byte) (*sliceSegment, error) {
 		chromaQPOffsets:    chromaQPOffsets,
 		params: slice.Params{
 			SliceType:                       sliceType,
-			SliceQPY:                        26 + int(pps.InitQpMinus26) + qpDelta,
+			SliceQPY:                        sliceQPY,
 			PicWidth:                        int(sps.PicWidthInLumaSamples),
 			PicHeight:                       int(sps.PicHeightInLumaSamples),
 			Log2CtbSize:                     log2Ctb,

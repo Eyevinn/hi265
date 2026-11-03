@@ -6,6 +6,7 @@ import (
 
 	"github.com/Eyevinn/hi265/internal/cabac"
 	"github.com/Eyevinn/hi265/internal/context"
+	"github.com/Eyevinn/hi265/internal/transform"
 	"github.com/Eyevinn/mp4ff/hevc"
 )
 
@@ -169,7 +170,9 @@ func validateGraySPSPPS(sps *hevc.SPS, pps *hevc.PPS) error {
 	if sps.PCMEnabledFlag {
 		return fmt.Errorf("pcm_enabled_flag is not supported")
 	}
-	return nil
+	// The slice QP does reach the slice header, which is written with
+	// slice_qp_delta 0 and so carries the PPS's initial QP as its own.
+	return transform.CheckInitQP(int(pps.InitQpMinus26), 8+int(sps.BitDepthLumaMinus8))
 }
 
 // encodeGrayIDRSlice generates the complete IRAP slice RBSP for a gray frame.

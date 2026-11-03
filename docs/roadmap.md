@@ -925,6 +925,50 @@ and a fragmented MP4 for `hi265dec`, and an init and a media segment for
 and `TestExtendSegmentRefusesMissingBoxes` cover every place that panicked, and
 fail without the fix.
 
+### 0.26 Quantization parameters outside the standard's range (S) — **fixed**
+
+Fuzzing found a PPS that panics `pkg/decoder`, and hi265's own encoder wrote it
+on request. Nothing bounded the slice QP, 26 + `init_qp_minus26` +
+`slice_qp_delta`: mp4ff stores the PPS fields unchecked, and the decoder used the
+sum as it came. Spec 7.4.7.1 bounds SliceQpY to −QpBdOffsetY..51, 0..51 at 8
+bits. Below zero, any QP that is not a multiple of 6 indexes `LevelScale` at −1
+in `transform.Dequantize`. Every other value outside the range decoded without
+error: an IDR coded at QP 26 and decoded against a PPS saying −6 or 52 came out
+flat 128 for a source of 200. FFmpeg refuses all of these streams and returns no
+frames. A P-skip slice was refused too, but only because CABAC initialised at
+the wrong QP misread its skip CUs, so the error named motion compensation.
+
+The encoder side had the same gap. `EncodeParams{QP: -1}` wrote
+`init_qp_minus26` = −27, and `GenerateIDR` then panicked in the forward
+quantizer. Only `hi265gen` checked the range. An external PPS reached the same
+panic through `EncodeIDRSliceFromSPSPPS`.
+
+`internal/transform/qprange.go` now holds the bounds, shared by both sides.
+- SliceQpY must be in −QpBdOffsetY..51, and `init_qp_minus26` in
+  −(26 + QpBdOffsetY)..25 (spec 7.4.3.3.1).
+- Each chroma QP offset, picture-level or slice-level, must be in ±12, and so
+  must the sum of the two for a component (7.4.3.3.1, 7.4.7.1). `ChromaQP`
+  clipped an offset outside that range without any error.
+- CuQpDeltaVal must be in −(26 + QpBdOffsetY/2)..+(25 + QpBdOffsetY/2) (7.4.9.14).
+  It wrapped modulo 52 and could not panic, but a stream outside that range does
+  not conform either.
+
+The decoder checks SliceQpY and the chroma offsets in one helper that both slice
+header paths call, and checks `cu_qp_delta` where it is read. The error names
+the QP and every term that adds up to it, since the fault can be in the PPS or
+in the slice header. The generators refuse an `EncodeParams.QP` outside 0..51.
+The writers that take an external PPS refuse an `init_qp_minus26` out of range,
+at the SPS's bit depth, and the residual writers also refuse picture-level
+chroma offsets out of range. The gray writers check only the QP, since a gray
+picture has no residual.
+
+`pkg/encode/qprange_test.go` covers all of it, both slice paths included. Every
+test fails on the previous main: by panicking, by decoding, or by accepting the
+QP.
+
+Not covered: mp4ff reads `init_qp_minus26` and the PPS chroma offsets into `int8`,
+so a value far outside the range can wrap back into it before hi265 sees it.
+
 ### 0.10 Real-world content decoding (L) — **fixed**
 
 x265 output was not bit-exact, and got worse with detail and scale: a 720p
