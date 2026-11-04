@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- hi264 v0.12.2 is now the minimum.
+
 ### Fixed
 - `pkg/decoder` refuses a slice whose QP, chroma QP offsets or `cu_qp_delta` are outside the
   standard's range, instead of panicking or returning a wrong picture.
