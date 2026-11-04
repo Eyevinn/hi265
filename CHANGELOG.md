@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   standard's range, instead of panicking or returning a wrong picture.
 - The `encode` generators refuse an `EncodeParams.QP` outside 0..51, and the writers that take an
   external PPS refuse one with QP fields out of range, instead of panicking.
+- mp4ff v0.62.0 is now the minimum, so `pkg/decoder`, `encode.LastFrameState`, `hi265inspect` and
+  `hi265retile` refuse short-term reference picture sets out of range instead of hanging or panicking.
 
 ## [0.6.1] - 2026-10-27
 

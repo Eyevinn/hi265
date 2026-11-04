@@ -2,7 +2,9 @@ package encode
 
 import (
 	"bytes"
+	"encoding/hex"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/Eyevinn/hi264/pkg/yuv"
@@ -71,6 +73,53 @@ func TestLastFrameState(t *testing.T) {
 	}
 	if state.POC != 3 {
 		t.Errorf("POC = %d, want 3 (one step per appended picture)", state.POC)
+	}
+}
+
+// TestLastFrameStateRefusesRPSPredictedFromMissingSet checks that a slice whose
+// inline short-term RPS is predicted from a set the SPS does not have is
+// refused. The SPS has one set, so the inline RPS has stRpsIdx 1 and
+// delta_idx_minus1 must be 0 (7.4.8); 1 points before set 0. Up to v0.61.0,
+// mp4ff's slice header parser then indexed the sets at 255 and panicked.
+// v0.62.0 refuses delta_idx_minus1, and LastFrameState takes the slice header
+// from that parser, so this pins that the version go.mod requires still does.
+func TestLastFrameStateRefusesRPSPredictedFromMissingSet(t *testing.T) {
+	var spsHex, ppsHex string
+	for _, tc := range craHeaderCases {
+		if tc.name == "422_10bit" { // the set with num_short_term_ref_pic_sets = 1
+			spsHex, ppsHex = tc.sps, tc.pps
+		}
+	}
+	sps, _ := hex.DecodeString(spsHex)
+	pps, _ := hex.DecodeString(ppsHex)
+
+	w := NewBitWriter()
+	w.WriteBit(1)     // first_slice_segment_in_pic_flag
+	w.WriteUE(0)      // slice_pic_parameter_set_id
+	w.WriteUE(1)      // slice_type = P
+	w.WriteBits(1, 4) // slice_pic_order_cnt_lsb
+	w.WriteBit(0)     // short_term_ref_pic_set_sps_flag = 0: inline, stRpsIdx 1
+	w.WriteBit(1)     // inter_ref_pic_set_prediction_flag
+	w.WriteUE(1)      // delta_idx_minus1
+	w.WriteBit(0)     // delta_rps_sign
+	w.WriteUE(0)      // abs_delta_rps_minus1
+	w.WriteBits(3, 2) // used_by_curr_pic_flag for each picture of set 0, and the one deltaRps away
+	w.WriteBit(1)     // rbsp_stop_one_bit
+	w.AlignToByte()
+
+	var stream bytes.Buffer
+	for _, nalu := range [][]byte{sps, pps} {
+		stream.Write([]byte{0, 0, 0, 1})
+		stream.Write(nalu)
+	}
+	WriteNALU(&stream, int(hevc.NALU_TRAIL_R), w.Bytes())
+
+	_, err := LastFrameState(stream.Bytes())
+	if err == nil {
+		t.Fatal("expected the slice header to be refused")
+	}
+	if !strings.Contains(err.Error(), "delta_idx_minus1") {
+		t.Errorf("the error should name delta_idx_minus1, got: %v", err)
 	}
 }
 
