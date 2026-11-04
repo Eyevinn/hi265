@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Eyevinn/mp4ff/avc"
 	"github.com/Eyevinn/mp4ff/bits"
@@ -496,7 +497,7 @@ func TestCodingTreeBlockOutsideProfilesIsRefused(t *testing.T) {
 		{"MinCb 2^30", 27, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sps := codedSPS(128, 64, tc.log2MinCbMinus3, tc.log2DiffMaxMinCb)
+			sps := codedSPS(128, 64, tc.log2MinCbMinus3, tc.log2DiffMaxMinCb, nil)
 			var nalus [][]byte
 			for _, nalu := range avc.ExtractNalusFromByteStream(data) {
 				if len(nalu) >= 2 && hevc.GetNaluType(nalu[0]) == hevc.NALU_SPS {
@@ -515,9 +516,69 @@ func TestCodingTreeBlockOutsideProfilesIsRefused(t *testing.T) {
 	}
 }
 
+// An SPS may carry at most 64 short-term reference picture sets (7.4.3.2.1).
+// This one chains 225: set 0 lists 32 pictures, and each later set is predicted
+// from the one before it and adds one, so set 223 lists 255. Up to v0.61.0,
+// mp4ff counted the pictures of the reference set in a byte, so predicting set
+// 224 from set 223 never ended, and neither did decoding. mp4ff v0.62.0 refuses
+// the count at the SPS, since the SPS comes from its parser, so this pins that
+// the version go.mod requires still does.
+func TestShortTermRefPicSetCountOutsideRangeIsRefused(t *testing.T) {
+	data, err := os.ReadFile("../../testdata/sincos_128x64.265")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sps := codedSPS(128, 64, 0, 1, func(w *bits.EBSPWriter) {
+		const numSets = 225
+		w.WriteExpGolomb(numSets) // num_short_term_ref_pic_sets
+		w.WriteExpGolomb(16)      // set 0: num_negative_pics
+		w.WriteExpGolomb(16)      // set 0: num_positive_pics
+		for range 32 {
+			w.WriteExpGolomb(0) // delta_poc_s0_minus1 or delta_poc_s1_minus1
+			w.Write(1, 1)       // used_by_curr_pic_s0_flag or used_by_curr_pic_s1_flag
+		}
+		for idx := 1; idx < numSets; idx++ {
+			w.Write(1, 1)       // inter_ref_pic_set_prediction_flag
+			w.Write(0, 1)       // delta_rps_sign
+			w.WriteExpGolomb(0) // abs_delta_rps_minus1
+			// used_by_curr_pic_flag = 1 for the 32+idx-1 pictures of set idx-1,
+			// and for the one deltaRps away.
+			for range 32 + idx {
+				w.Write(1, 1)
+			}
+		}
+	})
+	var nalus [][]byte
+	for _, nalu := range avc.ExtractNalusFromByteStream(data) {
+		if len(nalu) >= 2 && hevc.GetNaluType(nalu[0]) == hevc.NALU_SPS {
+			nalu = sps
+		}
+		nalus = append(nalus, nalu)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := New().DecodeNALUs(nalus)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected the SPS to be refused")
+		}
+		if !strings.Contains(err.Error(), "num_short_term_ref_pic_sets") {
+			t.Errorf("the error should name num_short_term_ref_pic_sets, got: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the decoder had not returned after 10 s")
+	}
+}
+
 // codedSPS writes an 8-bit 4:2:0 Main SPS NAL unit with the given picture size
-// and coding block fields, and every optional tool off.
-func codedSPS(width, height, log2MinCbMinus3, log2DiffMaxMinCb uint) []byte {
+// and coding block fields, and every optional tool off. writeShortTermRPSs, if
+// not nil, writes num_short_term_ref_pic_sets and the sets; nil writes no sets.
+func codedSPS(width, height, log2MinCbMinus3, log2DiffMaxMinCb uint,
+	writeShortTermRPSs func(w *bits.EBSPWriter)) []byte {
 	var buf bytes.Buffer
 	w := bits.NewEBSPWriter(&buf)
 	w.Write(0x4201, 16)     // nal_unit_header: SPS, nuh_layer_id 0, nuh_temporal_id_plus1 1
@@ -548,8 +609,12 @@ func codedSPS(width, height, log2MinCbMinus3, log2DiffMaxMinCb uint) []byte {
 	w.WriteExpGolomb(0) // max_transform_hierarchy_depth_inter
 	w.WriteExpGolomb(0) // max_transform_hierarchy_depth_intra
 	w.Write(0, 4)       // scaling_list_enabled_flag, amp, sample_adaptive_offset, pcm_enabled_flag
-	w.WriteExpGolomb(0) // num_short_term_ref_pic_sets
-	w.Write(0, 5)       // long_term_ref_pics, temporal_mvp, strong_intra_smoothing, vui, extension
+	if writeShortTermRPSs != nil {
+		writeShortTermRPSs(w)
+	} else {
+		w.WriteExpGolomb(0) // num_short_term_ref_pic_sets
+	}
+	w.Write(0, 5) // long_term_ref_pics, temporal_mvp, strong_intra_smoothing, vui, extension
 	w.WriteRbspTrailingBits()
 	return buf.Bytes()
 }

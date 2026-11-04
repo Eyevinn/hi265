@@ -969,6 +969,32 @@ QP.
 Not covered: mp4ff reads `init_qp_minus26` and the PPS chroma offsets into `int8`,
 so a value far outside the range can wrap back into it before hi265 sees it.
 
+### 0.27 Short-term reference picture sets out of range (S) — **fixed**
+
+Up to v0.61.0, mp4ff parsed the short-term reference picture sets (RPSs) of an
+SPS and of a slice header without checking them. Every SPS hi265 reads comes
+from that parser, and so does every slice header except the decoder's own. Two
+hand-built cases broke it:
+
+- An SPS that chains 225 sets, each predicted from the one before it with one
+  picture more. Set 223 lists 255 pictures, and mp4ff counted the pictures of
+  the reference set in a byte, so predicting set 224 never ended. `hi265dec`,
+  `hi265inspect` and `hi265retile` were still running when killed after 15 s.
+  An SPS may carry at most 64 sets (spec 7.4.3.2.1).
+- A P slice whose inline RPS, at stRpsIdx 1, has `delta_idx_minus1` 1, so it is
+  predicted from a set before set 0; the value must be below stRpsIdx (7.4.8).
+  mp4ff indexed the sets at 255, which panicked `encode.LastFrameState`,
+  `hi265inspect` and `hi265retile`. `pkg/decoder` parses its own slice header,
+  and refuses any predicted inline RPS.
+
+mp4ff v0.62.0 refuses both, and is now the floor.
+`TestShortTermRefPicSetCountOutsideRangeIsRefused` decodes the SPS in
+`sincos_128x64.265`, and `TestLastFrameStateRefusesRPSPredictedFromMissingSet`
+reads the slice. On v0.61.0 the first is stopped after 10 s and the second
+panics; on v0.62.0 both errors name the field. The same release leaves a start
+code that ends a stream, and the zero bytes after a NAL unit, out of the NAL
+units it splits. `hi265gen` writes the same bytes with either version.
+
 ### 0.10 Real-world content decoding (L) — **fixed**
 
 x265 output was not bit-exact, and got worse with detail and scale: a 720p
@@ -1339,8 +1365,8 @@ drops those zeros itself (Eyevinn/mp4ff#622), and the trim here is gone.
 
 The mp4ff `replace` directive the old repo needed is gone with it: it pointed at
 master for the slice-header inference fixes of Eyevinn/mp4ff#558, which shipped
-in v0.56.0. `SplitAnnexB` relies on v0.58.0, and the floor is v0.61.0 since
-0.24. Do not lower it.
+in v0.56.0. `SplitAnnexB` relies on v0.58.0, and the floor is v0.62.0 since
+0.27. Do not lower it.
 
 ### 6.2 An API, and refusing what cannot tile (M) — **done**
 
